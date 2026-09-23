@@ -1,0 +1,33 @@
+{
+  "book": {
+    "id": "demo-book",
+    "title": "识别与排版示例",
+    "filename": "demo.pdf",
+    "status": "ready",
+    "page_count": 1,
+    "completed_pages": 1,
+    "error": null,
+    "created_at": "2026-09-21T00:00:00+08:00",
+    "usage": {
+      "input_tokens": 1234,
+      "output_tokens": 567,
+      "total_tokens": 1801,
+      "complete": true
+    }
+  },
+  "pages": [
+    {
+      "number": 1,
+      "status": "ready",
+      "error": null,
+      "text": "# 第一章 示例\n\n这是正文，用来说明页面 Markdown 和固定用量契约。\n\n> 可靠的排版应保留来源文字。\n\n**实例：** 先校对原文，再导出 HTML。\n\n公式：$E = mc^2$。\n\n| 阶段 | 结果 |\n| --- | --- |\n| 提取 | 保留页面文字 |\n| 校对 | 保存人工修改 |\n\n页脚：示例页面。",
+      "usage": {
+        "input_tokens": 1234,
+        "output_tokens": 567,
+        "total_tokens": 1801,
+        "complete": true
+      },
+      "attempts": 1
+    }
+  ]
+}
