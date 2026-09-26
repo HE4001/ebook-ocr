@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 
 SectionType = Literal[
@@ -34,11 +34,19 @@ class Book(BaseModel):
     usage: Usage
 
 
+class MarginSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["text", "page_number"]
+    text: str = Field(max_length=50_000)
+
+
 class Page(BaseModel):
     number: int
     status: PageStatus
     error: str | None
     text: str
+    header_segments: list[MarginSegment]
+    footer_segments: list[MarginSegment]
     usage: Usage
     attempts: int
 
@@ -129,6 +137,17 @@ class ProcessResult(BaseModel):
     started: bool
 
 
+class ProcessRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    pages: list[StrictInt] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_pages(self) -> "ProcessRequest":
+        if "pages" in self.model_fields_set and self.pages is None:
+            raise ValueError("pages 必须是非空页码列表")
+        return self
+
+
 class PauseResult(BaseModel):
     requested: bool
 
@@ -146,5 +165,21 @@ class PageResult(BaseModel):
     @model_validator(mode="after")
     def validate_length(self) -> "PageResult":
         if sum(len(section.text) for section in self.sections) > 1_000_000:
+            raise ValueError("页面文本过长")
+        return self
+
+
+class StructuredPageResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    header_segments: list[MarginSegment] = Field(max_length=100)
+    body_markdown: str = Field(max_length=1_000_000)
+    footer_segments: list[MarginSegment] = Field(max_length=100)
+
+    @model_validator(mode="after")
+    def validate_length(self) -> "StructuredPageResult":
+        total = len(self.body_markdown) + sum(
+            len(segment.text) for segment in self.header_segments + self.footer_segments
+        )
+        if total > 1_000_000:
             raise ValueError("页面文本过长")
         return self

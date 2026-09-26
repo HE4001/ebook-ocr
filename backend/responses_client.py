@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
+from pydantic import ValidationError
+
+from .models import StructuredPageResult
+from .prompts import PAGE_RESPONSE_SCHEMA
 
 
 MAX_RESPONSE_BYTES = 2_000_000
@@ -22,7 +28,7 @@ class ResponsesConfig:
     base_url: str
     responses_path: str
     api_key: str
-    structured_output: bool  # 兼容旧设置；Markdown 请求不使用 JSON Schema。
+    structured_output: bool  # 兼容旧设置；页面请求固定使用 JSON Schema。
     timeout_seconds: int
     max_output_tokens: int
     reasoning_effort: str = ""
@@ -39,23 +45,35 @@ class ResponsesClient:
     def __init__(self, config: ResponsesConfig):
         self.config = config
 
-    async def request_markdown(
+    async def request_page(
         self,
         model: str,
         input_value: list[dict[str, Any]],
         on_attempt_start: Callable[[], int] | None = None,
         on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
-    ) -> str:
+    ) -> StructuredPageResult:
+        output_format: dict[str, Any] = {
+            "type": "json_schema",
+            "name": "page_transcription",
+            "schema": PAGE_RESPONSE_SCHEMA,
+        }
+        if urlsplit(self.config.base_url).hostname != "api.deepseek.com":
+            output_format["strict"] = True
         payload: dict[str, Any] = {
             "model": model,
             "input": input_value,
             "store": False,
             "max_output_tokens": self.config.max_output_tokens,
+            "text": {"format": output_format},
         }
         if self.config.reasoning_effort:
             payload["reasoning"] = {"effort": self.config.reasoning_effort}
         data = await self._post(payload, on_attempt_start, on_attempt_end)
-        return self.extract_output_text(data, allow_empty=True)
+        response_text = self.extract_output_text(data)
+        try:
+            return StructuredPageResult.model_validate(json.loads(response_text))
+        except (ValueError, ValidationError) as exc:
+            raise ModelServiceError("模型返回的页面结构无效") from exc
 
     async def test_connection(self, model: str) -> None:
         payload = {

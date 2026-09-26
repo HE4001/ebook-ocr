@@ -37,9 +37,13 @@ export type Page = {
   status: Status
   error: string | null
   text: string
+  header_segments: MarginSegment[]
+  footer_segments: MarginSegment[]
   usage: Usage
   attempts: number
 }
+
+export type MarginSegment = { kind: 'text' | 'page_number'; text: string }
 
 export type BookDetail = { book: Book; pages: Page[] }
 export type Notice = { kind: 'success' | 'error' | 'info'; text: string } | null

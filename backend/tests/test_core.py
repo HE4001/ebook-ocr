@@ -29,7 +29,96 @@ def png_bytes() -> bytes:
 
 
 class BackendTests(unittest.TestCase):
-    def test_pause_finishes_current_page_and_resumes_remaining_pages(self) -> None:
+    def test_selected_pages_and_whole_book_reruns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, TestClient(create_app(Path(directory))) as client:
+            storage = client.app.state.storage
+            book_id = str(uuid4())
+            book_dir = storage.books_root / book_id
+            book_dir.mkdir()
+            for number in (1, 2, 3):
+                (book_dir / f"page-{number:04d}.png").write_bytes(png_bytes())
+            storage.create_book(book_id, "三页", "three.png", [
+                (number, 32, 24, f"page-{number:04d}.png") for number in (1, 2, 3)
+            ])
+            storage.save_manual_text(book_id, 1, "旧一")
+            storage.save_manual_text(book_id, 2, "旧二")
+            client.put("/api/settings", json={"api_key": "secret", "extraction_model": "vision"})
+
+            def wait_finished() -> None:
+                deadline = time.monotonic() + 5
+                while book_id in client.app.state.running and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertNotIn(book_id, client.app.state.running)
+
+            for body in ({"pages": []}, {"pages": None},
+                         {"pages": ["1"]}, {"pages": [True]}):
+                self.assertEqual(client.post(f"/api/books/{book_id}/process", json=body).status_code, 422)
+            for numbers in ([0], [1, 99]):
+                self.assertEqual(client.post(f"/api/books/{book_id}/process", json={
+                    "pages": numbers,
+                }).status_code, 400)
+            self.assertEqual([page.text for page in storage.get_pages(book_id)],
+                             ["旧一", "旧二", ""])
+            self.assertNotIn(book_id, client.app.state.running)
+
+            called: list[int] = []
+            second_started = threading.Event()
+            release_second = threading.Event()
+            block_second = False
+
+            async def fake_run(_self, _book_id, number, *_args):
+                called.append(number)
+                attempt = storage.begin_attempt(book_id, number)
+                storage.finish_attempt(book_id, number, attempt, (1, 2, 3), True)
+                if block_second and number == 2:
+                    second_started.set()
+                    self.assertTrue(await asyncio.to_thread(release_second.wait, 5))
+                return f"新{number}"
+
+            with patch("backend.pipeline.PageAgent.run", fake_run):
+                self.assertEqual(client.post(f"/api/books/{book_id}/process", json={
+                    "pages": [2, 1, 2],
+                }).json(), {"started": True})
+                wait_finished()
+                self.assertEqual(called, [1, 2])
+                self.assertEqual([page.text for page in storage.get_pages(book_id)],
+                                 ["新1", "新2", ""])
+                self.assertEqual(storage.get_book(book_id).status, "uploaded")
+                self.assertIsNone(storage.get_book(book_id).error)
+
+                block_second = True
+                self.assertEqual(client.post(f"/api/books/{book_id}/process", json={}).json(),
+                                 {"started": True})
+                self.assertTrue(second_started.wait(5))
+                active = storage.get_book(book_id)
+                self.assertEqual(active.status, "processing")
+                self.assertEqual(active.completed_pages, 1)
+                self.assertEqual(storage.get_pages(book_id)[1].text, "新2")
+                release_second.set()
+                wait_finished()
+
+            self.assertEqual(called, [1, 2, 1, 2, 3])
+            self.assertEqual(storage.get_book(book_id).status, "ready")
+            self.assertEqual([page.attempts for page in storage.get_pages(book_id)], [2, 2, 1])
+            self.assertEqual([page.usage.total_tokens for page in storage.get_pages(book_id)],
+                             [6, 6, 3])
+
+            async def failing_run(_self, _book_id, number, *_args):
+                attempt = storage.begin_attempt(book_id, number)
+                storage.finish_attempt(book_id, number, attempt, (1, 2, 3), True)
+                raise ModelServiceError("识别失败")
+
+            with patch("backend.pipeline.PageAgent.run", failing_run):
+                self.assertEqual(client.post(f"/api/books/{book_id}/process", json={
+                    "pages": [1],
+                }).json(), {"started": True})
+                wait_finished()
+            first = storage.get_pages(book_id)[0]
+            self.assertEqual((first.status, first.text, first.attempts,
+                              first.usage.total_tokens), ("failed", "新1", 3, 9))
+            self.assertEqual(storage.get_book(book_id).status, "failed")
+
+    def test_pause_finishes_current_page_then_processes_new_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory, TestClient(create_app(Path(directory))) as client:
             storage = client.app.state.storage
             book_id = str(uuid4())
@@ -84,7 +173,9 @@ class BackendTests(unittest.TestCase):
                     "text": "已校对的第 1 页",
                 }).status_code, 200)
                 self.assertEqual(storage.get_book(book_id).status, "paused")
-                self.assertEqual(client.post(f"/api/books/{book_id}/process").json(), {
+                self.assertEqual(client.post(f"/api/books/{book_id}/process", json={
+                    "pages": [2],
+                }).json(), {
                     "started": True,
                 })
                 wait_for_status("ready")
@@ -105,7 +196,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(sections_to_markdown(result),
                          f"$$\n{formula}\n$$\n\n{multiline}\n\n正文 $x^2$ 继续\n\n旧公式说明")
 
-    def test_markdown_response_and_usage_across_retries(self) -> None:
+    def test_structured_page_response_and_usage_across_retries(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as directory:
                 storage = Storage(Path(directory))
@@ -127,7 +218,11 @@ class BackendTests(unittest.TestCase):
                                 "type": "reasoning_text", "text": "不应出现在OCR正文中的推理"
                             }]},
                             {"type": "message", "content": [{
-                                "type": "output_text", "text": '# 标题\n\n正文 **原文**'
+                                "type": "output_text", "text": json.dumps({
+                                    "header_segments": [{"kind": "text", "text": "原书页眉"}],
+                                    "body_markdown": "# 标题\n\n正文 **原文**",
+                                    "footer_segments": [{"kind": "page_number", "text": "12"}],
+                                }, ensure_ascii=False),
                             }]},
                         ],
                     }),
@@ -161,13 +256,17 @@ class BackendTests(unittest.TestCase):
                     await BookProcessor(storage).process(book_id, settings, "secret")
                 page = storage.get_pages(book_id)[0]
                 self.assertEqual(page.text, "# 标题\n\n正文 **原文**")
+                self.assertEqual(page.header_segments[0].text, "原书页眉")
+                self.assertEqual(page.footer_segments[0].kind, "page_number")
+                self.assertEqual(page.footer_segments[0].text, "12")
                 self.assertEqual(page.attempts, 2)
                 self.assertEqual(sent_urls[0], "https://api.deepseek.com/responses")
                 self.assertEqual(sent_payloads[0]["reasoning"], {"effort": "high"})
                 self.assertEqual(sent_payloads[0]["max_output_tokens"], 24_000)
                 self.assertEqual(sent_payloads[0]["model"], "deepseek-flash")
-                self.assertNotIn("text", sent_payloads[0])
-                self.assertIn("直接输出", sent_payloads[0]["input"][0]["content"][0]["text"])
+                self.assertEqual(sent_payloads[0]["text"]["format"]["type"], "json_schema")
+                self.assertNotIn("strict", sent_payloads[0]["text"]["format"])
+                self.assertIn("手写批注", sent_payloads[0]["input"][0]["content"][0]["text"])
                 image = sent_payloads[0]["input"][1]["content"][1]
                 self.assertEqual(image["type"], "input_image")
                 self.assertEqual(image["detail"], "high")
@@ -212,13 +311,17 @@ class BackendTests(unittest.TestCase):
                     "status": "completed", "usage": {
                         "input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
                     "output": [{"type": "message", "content": [{
-                        "type": "output_text", "text": ""}]}],
+                        "type": "output_text", "text": json.dumps({
+                            "header_segments": [], "body_markdown": "", "footer_segments": [],
+                        })}]}],
                 }))
                 with patch("backend.responses_client.httpx.AsyncClient", FakeClient):
                     await BookProcessor(storage).process(book_id, settings, "secret")
                 page = storage.get_pages(book_id)[0]
                 self.assertEqual(page.status, "ready")
                 self.assertEqual(page.text, "")
+                self.assertEqual(page.header_segments, [])
+                self.assertEqual(page.footer_segments, [])
 
                 with self.assertRaisesRegex(ModelServiceError, "内容过滤器"):
                     ResponsesClient.extract_output_text({
@@ -267,7 +370,6 @@ class BackendTests(unittest.TestCase):
             self.assertIn("销售表", page.text)
             self.assertIn("一 | 二", page.text)
             self.assertIn("x^2", page.text)
-            self.assertEqual(storage.get_unfinished_page_records(book_id), [])
             self.assertEqual(page.attempts, 0)
             self.assertIsNone(page.usage.total_tokens)
             with storage._connect() as connection:
@@ -354,21 +456,31 @@ class BackendTests(unittest.TestCase):
             book_id = uploaded.json()["id"]
             detail = client.get(f"/api/books/{book_id}").json()
             self.assertEqual(set(detail["pages"][0]), {
-                "number", "status", "error", "text", "usage", "attempts"})
+                "number", "status", "error", "text", "header_segments",
+                "footer_segments", "usage", "attempts"})
             saved = client.put(f"/api/books/{book_id}/pages/1", json={
                 "text": "**人工校对**"})
             self.assertEqual(saved.status_code, 200)
             self.assertEqual(saved.json()["text"], "**人工校对**")
             self.assertEqual(saved.json()["attempts"], 0)
-            self.assertEqual(client.post(f"/api/books/{book_id}/process").json(), {
-                "started": False})
+            async def fake_run(_self, *_args):
+                return "**重新识别**"
+
+            with patch("backend.pipeline.PageAgent.run", fake_run):
+                self.assertEqual(client.post(f"/api/books/{book_id}/process").json(), {
+                    "started": True})
+                deadline = time.monotonic() + 5
+                while book_id in client.app.state.running and time.monotonic() < deadline:
+                    time.sleep(0.02)
+            self.assertEqual(client.get(f"/api/books/{book_id}").json()["pages"][0]["text"],
+                             "**重新识别**")
             export = client.get(f"/api/books/{book_id}/export").json()
-            self.assertEqual(export["pages"][0]["text"], "**人工校对**")
+            self.assertEqual(export["pages"][0]["text"], "**重新识别**")
             markdown = client.get(f"/api/books/{book_id}/export.md")
             self.assertEqual(markdown.status_code, 200)
             self.assertIn("text/markdown", markdown.headers["content-type"])
             self.assertIn('.md"', markdown.headers["content-disposition"])
-            self.assertEqual(markdown.text, "# page\n\n## 第 1 页\n\n**人工校对**\n")
+            self.assertEqual(markdown.text, "# page\n\n## 第 1 页\n\n**重新识别**\n")
 
     def test_api_key_persistence_lifecycle_and_failed_save(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

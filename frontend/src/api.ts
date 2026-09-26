@@ -10,7 +10,7 @@ function detailMessage(value: unknown, fallback: string): string {
   return fallback
 }
 
-async function request<T>(path: string, init?: RequestInit, responseType: 'json' | 'text' = 'json'): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const requestPath = `${API_PREFIX}${path}`
   let response: Response
   try {
@@ -31,7 +31,6 @@ async function request<T>(path: string, init?: RequestInit, responseType: 'json'
     throw new Error(`本地接口 ${requestPath} 请求失败（HTTP ${response.status}）${suffix}`)
   }
   if (response.status === 204) return undefined as T
-  if (responseType === 'text') return response.text() as Promise<T>
   return response.json() as Promise<T>
 }
 
@@ -44,9 +43,11 @@ export const api = {
     form.append('file', file)
     return request<Book>('/books', { method: 'POST', body: form })
   },
-  processBook: (id: string) =>
+  processBook: (id: string, pages?: number[]) =>
     request<{ started: boolean }>(`/books/${encodeURIComponent(id)}/process`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pages === undefined ? {} : { pages }),
     }),
   pauseBook: (id: string) =>
     request<{ requested: boolean }>(`/books/${encodeURIComponent(id)}/pause`, {
@@ -81,5 +82,4 @@ export const api = {
     }),
   testSettings: () => request<{ ok: boolean; message: string }>('/settings/test', { method: 'POST' }),
   exportBook: (id: string) => request<BookDetail>(`/books/${encodeURIComponent(id)}/export`),
-  exportMarkdown: (id: string) => request<string>(`/books/${encodeURIComponent(id)}/export.md`, undefined, 'text'),
 }

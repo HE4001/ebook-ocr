@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
-import { BookContent, Markdown } from './Markdown'
+import { BookContent, MarginContent, Markdown } from './Markdown'
 import { buildStandaloneHtml, downloadText, safeFilename } from './exportHtml'
 import type { Book, BookDetail, Notice, Page, Settings, Usage } from './types'
 
@@ -158,7 +158,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
         <label><span>API 根地址</span><input value={settings.base_url} onChange={(event) => update('base_url', event.target.value)} placeholder="https://api.openai.com/v1" /><small>包含协议和 API 版本；接入路径留空时，此地址就是完整请求地址。</small></label>
         <label><span>Responses 接入路径</span><input value={settings.responses_path} onChange={(event) => update('responses_path', event.target.value)} placeholder="/responses" /><small>可留空，或填写自定义相对路径。</small></label>
         <div className="endpoint-preview"><span>实际 POST 地址</span><code>{endpoint(settings.base_url, settings.responses_path)}</code>{settings.responses_path.trim() === '' && <small>接入路径为空，API 根地址会直接作为完整请求地址。</small>}{settings.responses_path.trim() === '/' && <small>当前路径为 /，请求会发到 API 根地址。</small>}</div>
-        <label><span>页面代理模型</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} /><small>每页直接返回排版好的 Markdown，不要求 JSON。</small></label>
+        <label><span>页面代理模型</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} /><small>每页返回结构化页眉、正文 Markdown 和页脚。</small></label>
         <label><span>模型推理程度</span><input value={settings.reasoning_effort} onChange={(event) => update('reasoning_effort', event.target.value)} placeholder="例如 low、medium、high" /><small>手动填写模型供应商支持的值；留空则使用服务默认值。</small></label>
         <label className="number-field"><span>最大输出 token</span><input type="number" min={1} step={1} value={settings.max_output_tokens} onChange={(event) => update('max_output_tokens', Number(event.target.value))} /><small>包含推理和正文；识别与连接测试均使用。提高额度可能增加用量。</small></label>
         <label><span className="field-title">API 密钥 <span className={settings.has_api_key ? 'key-state saved' : 'key-state missing'}>{settings.has_api_key ? '已保存到本机' : '未配置'}</span></span><input type="password" autoComplete="new-password" value={settings.api_key ?? ''} onChange={(event) => update('api_key', event.target.value)} placeholder={settings.has_api_key ? '已保存；留空保留' : '输入密钥'} disabled={clearKey} /><small>已保存密钥不会回显；留空保留，输入新密钥替换。密钥以明文保存在本机 SQLite 数据库中，重启后自动读取，不保存在浏览器中。</small></label>
@@ -182,6 +182,8 @@ export default function App() {
   const [selectedBookId, setSelectedBookId] = useState<string | null>(null)
   const [detail, setDetail] = useState<BookDetail | null>(null)
   const [selectedPageNumber, setSelectedPageNumber] = useState(1)
+  const [processScope, setProcessScope] = useState<'current' | 'selected' | 'all'>('current')
+  const [processPages, setProcessPages] = useState<number[]>([])
   const [draftText, setDraftText] = useState('')
   const [dirty, setDirty] = useState(false)
   const [notice, setNotice] = useState<Notice>(null)
@@ -229,6 +231,9 @@ export default function App() {
     if (!selectedBookId) { setDetail(null); return }
     setDirty(false)
     setDetail(null)
+    setProcessScope('current')
+    setProcessPages([])
+    setSelectedPageNumber(1)
     void loadDetail(selectedBookId)
   }, [selectedBookId, loadDetail])
   useEffect(() => {
@@ -241,6 +246,7 @@ export default function App() {
   useEffect(() => { if (!dirty) setDraftText(sourcePage?.text ?? '') }, [sourcePage, dirty])
 
   const choosePage = (page: Page) => {
+    if (actionBusy) return
     if (page.number === selectedPageNumber) return
     if (dirty && !window.confirm('本页有未保存修改，确定切换并放弃吗？')) return
     setSelectedPageNumber(page.number)
@@ -249,7 +255,7 @@ export default function App() {
   }
 
   const chooseBook = (id: string) => {
-    if (deleting) return
+    if (deleting || actionBusy) return
     if (id === selectedBookId) return
     if (dirty && !window.confirm('当前页有未保存修改，确定切换书籍并放弃吗？')) return
     setDirty(false)
@@ -278,12 +284,22 @@ export default function App() {
   }
 
   const processBook = async () => {
-    if (!selectedBookId) return
+    if (!detail || actionBusy || saving || uploading || deleting || ['processing', 'pausing'].includes(detail.book.status)) return
+    const bookId = detail.book.id
+    const pages = processScope === 'all' ? undefined : processScope === 'current' ? [selectedPageNumber] : [...processPages].sort((a, b) => a - b)
+    if (pages?.length === 0) return
+    const targets = pages === undefined ? detail.pages : detail.pages.filter((page) => pages.includes(page.number))
+    if ((targets.some((page) => Boolean(page.text || page.header_segments.length || page.footer_segments.length)) || dirty)
+      && !window.confirm(`这次处理会产生新的模型用量，成功后会覆盖所选页面已有的识别或校对文本。${dirty ? '当前未保存修改也会被放弃。' : ''}确定继续吗？`)) return
     setActionBusy(true)
     try {
-      const result = await api.processBook(selectedBookId)
+      const result = await api.processBook(bookId, pages)
+      if (result.started) {
+        setDirty(false)
+        setDraftText(sourcePage?.text ?? '')
+      }
       setNotice({ kind: 'success', text: result.started ? '处理已开始，将逐页更新状态。' : '当前没有需要处理的页面。' })
-      await loadDetail(selectedBookId, true)
+      await loadDetail(bookId, true)
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
     } finally {
@@ -321,6 +337,8 @@ export default function App() {
       setSelectedPageNumber(1)
       setDraftText('')
       setDirty(false)
+      setProcessScope('current')
+      setProcessPages([])
       setView('workspace')
       setNotice({ kind: 'success', text: `已删除《${book.title}》。` })
     } catch (error) {
@@ -346,15 +364,10 @@ export default function App() {
     }
   }
 
-  const exportData = async (kind: 'json' | 'html' | 'md') => {
+  const exportData = async (kind: 'json' | 'html') => {
     if (!detail) return
     setActionBusy(true)
     try {
-      if (kind === 'md') {
-        downloadText(safeFilename(detail.book.title) + '.md', await api.exportMarkdown(detail.book.id), 'text/markdown;charset=utf-8')
-        setNotice({ kind: 'success', text: 'Markdown 已下载。' })
-        return
-      }
       const data = await api.exportBook(detail.book.id)
       const name = safeFilename(data.book.title)
       if (kind === 'json') downloadText(name + '.json', JSON.stringify(data, null, 2), 'application/json;charset=utf-8')
@@ -369,11 +382,14 @@ export default function App() {
 
   const printBook = () => { setView('preview'); window.setTimeout(() => window.print(), 80) }
   const isRunning = detail?.book.status === 'processing' || detail?.book.status === 'pausing'
-  const editLocked = isRunning || deleting || sourcePage?.status === 'processing'
+  const processLocked = isRunning || actionBusy || saving || uploading || deleting
+  const editLocked = isRunning || actionBusy || deleting || sourcePage?.status === 'processing'
   const progress = detail?.book.page_count ? Math.round(detail.book.completed_pages / detail.book.page_count * 100) : 0
   const oldBackendContract = Boolean(detail && (
-    !detail.book.usage || detail.pages.some((page) => typeof page.text !== 'string' || !page.usage)
+    !detail.book.usage || detail.pages.some((page) => typeof page.text !== 'string' || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage)
   ))
+  const bookControlsVisible = Boolean(view === 'workspace' && selectedBookId && !detailLoading && detail?.book.id === selectedBookId && !oldBackendContract)
+  const noticeView = notice && <div className={'notice ' + notice.kind + ' no-print'} role="status"><span>{notice.text}</span><button onClick={() => setNotice(null)} aria-label="关闭提示">×</button></div>
 
   return (
     <div className="app-shell">
@@ -385,15 +401,15 @@ export default function App() {
           <button className={view === 'settings' ? 'nav-active' : ''} onClick={() => setView('settings')}>设置</button>
         </nav>
       </header>
-      {notice && <div className={'notice ' + notice.kind + ' no-print'} role="status"><span>{notice.text}</span><button onClick={() => setNotice(null)} aria-label="关闭提示">×</button></div>}
+      {!bookControlsVisible && noticeView}
       {view === 'settings' ? <SettingsView onNotice={showNotice} /> : (
         <div className="layout">
           <aside className="library no-print">
-            <div className="library-heading"><div><p className="eyebrow">本地项目</p><h2>书库</h2></div><button className="compact-button" onClick={() => fileInput.current?.click()} disabled={uploading || deleting}>{uploading ? '导入中…' : '＋ 导入'}</button></div>
+            <div className="library-heading"><div><p className="eyebrow">本地项目</p><h2>书库</h2></div><button className="compact-button" onClick={() => fileInput.current?.click()} disabled={uploading || deleting || actionBusy}>{uploading ? '导入中…' : '＋ 导入'}</button></div>
             <input ref={fileInput} className="visually-hidden" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={upload} />
             {initialLoading ? <p className="sidebar-state">正在读取书库…</p> : books.length === 0 ? <div className="library-empty"><p>还没有书籍</p><span>导入 PDF、PNG 或 JPEG 开始。</span></div> : (
               <div className="book-list">{books.map((book) => (
-                <button className={book.id === selectedBookId ? 'book-item selected' : 'book-item'} onClick={() => chooseBook(book.id)} disabled={deleting} key={book.id}>
+                <button className={book.id === selectedBookId ? 'book-item selected' : 'book-item'} onClick={() => chooseBook(book.id)} disabled={deleting || actionBusy} key={book.id}>
                   <span className="book-item-title">{book.title}</span>
                   <span className="book-item-meta"><span className={statusClass(book.status)}>{STATUS_LABEL[book.status] ?? book.status}</span><span>{book.page_count} 页</span></span>
                 </button>
@@ -403,12 +419,12 @@ export default function App() {
           <main className="main-panel">
             {!selectedBookId ? <div className="welcome-state"><span className="welcome-icon">文</span><h1>从纸页到可读书稿</h1><p>导入扫描 PDF 或图片，逐页提取并校对 Markdown 文本。</p><button className="primary" onClick={() => fileInput.current?.click()}>导入第一本书</button></div>
               : detailLoading || !detail || detail.book.id !== selectedBookId ? <div className="center-state">正在读取书籍…</div>
-              : oldBackendContract ? <div className="center-state"><h2>后端仍在运行旧版本</h2><p>请使用 stop.bat 和 start.bat 重启后端，以加载逐页代理与文本接口。</p></div>
+              : oldBackendContract ? <div className="center-state"><h2>后端仍在运行旧版本</h2><p>请使用 stop.bat 和 start.bat 重启后端，以加载结构化页面接口。</p></div>
               : view === 'preview' ? (
                 <>
                   <div className="preview-toolbar no-print">
                     <div><p className="eyebrow">整书预览</p><h1>{detail.book.title}</h1><p>按源页顺序显示文本，保留页眉、页脚、页码及 Markdown 格式。</p><UsageView usage={detail.book.usage} /></div>
-                    <div className="button-row"><button onClick={() => void exportData('json')} disabled={actionBusy}>下载 JSON</button><button onClick={() => void exportData('md')} disabled={actionBusy}>下载 Markdown</button><button onClick={() => void exportData('html')} disabled={actionBusy}>下载独立 HTML</button><button className="primary" onClick={printBook} disabled={actionBusy}>打印 / 存为 PDF</button></div>
+                    <div className="button-row"><button onClick={() => void exportData('json')} disabled={actionBusy}>下载 JSON</button><button onClick={() => void exportData('html')} disabled={actionBusy}>下载独立 HTML</button><button className="primary" onClick={printBook} disabled={actionBusy}>打印 / 存为 PDF</button></div>
                     <p className="export-limit">独立 HTML 不加载远程资源，公式以 MathML 保存，离线显示取决于浏览器数学字体。</p>
                   </div>
                   <BookContent detail={detail} />
@@ -416,20 +432,35 @@ export default function App() {
               ) : (
                 <>
                   <header className="book-header">
-                    <div className="book-heading"><p className="eyebrow">{detail.book.filename}</p><h1>{detail.book.title}</h1><div className="book-summary"><span className={statusClass(detail.book.status)}>{STATUS_LABEL[detail.book.status] ?? detail.book.status}</span><span>{detail.book.completed_pages} / {detail.book.page_count} 页</span></div><UsageView usage={detail.book.usage} /></div>
-                    <div className="book-actions"><button onClick={processBook} className="primary" disabled={actionBusy || isRunning || deleting}>{isRunning ? '处理中…' : detail.book.status === 'ready' ? '处理未完成页' : detail.book.status === 'paused' ? '继续处理' : '开始 / 继续处理'}</button>{isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}<button onClick={() => setView('preview')} disabled={deleting}>整书预览</button><button className="danger-action" onClick={deleteBook} disabled={isRunning || actionBusy || saving || uploading || deleting}>{deleting ? '删除中…' : '删除此书'}</button></div>
+                    <div className="book-heading"><p className="eyebrow">{detail.book.filename}</p><h1>{detail.book.title}</h1><div className="book-summary"><span className={statusClass(detail.book.status)}>{STATUS_LABEL[detail.book.status] ?? detail.book.status}</span><span>全书已完成 {detail.book.completed_pages} / {detail.book.page_count} 页</span></div><UsageView usage={detail.book.usage} /></div>
+                    <div className="book-controls">
+                      {detail.pages.length > 1 && <fieldset className="process-scope" disabled={processLocked}>
+                        <legend>处理范围</legend>
+                        <div className="scope-options">
+                          <label><input type="radio" name="process-scope" checked={processScope === 'current'} onChange={() => setProcessScope('current')} />当前页（第 {selectedPageNumber} 页）</label>
+                          <label><input type="radio" name="process-scope" checked={processScope === 'selected'} onChange={() => setProcessScope('selected')} />选择页面</label>
+                          <label><input type="radio" name="process-scope" checked={processScope === 'all'} onChange={() => setProcessScope('all')} />整本</label>
+                        </div>
+                        {processScope === 'selected' && <div className="process-page-picker" role="group" aria-label="选择处理页面">
+                          <span>已选 {processPages.length} 页</span>
+                          <div className="process-page-list">{detail.pages.map((page) => <label key={page.number}><input type="checkbox" checked={processPages.includes(page.number)} onChange={(event) => setProcessPages((current) => event.target.checked ? [...current, page.number] : current.filter((number) => number !== page.number))} />第 {page.number} 页 <span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></label>)}</div>
+                        </div>}
+                      </fieldset>}
+                      <div className="book-actions"><button onClick={processBook} className="primary" disabled={processLocked || (processScope === 'selected' && processPages.length === 0)}>{isRunning ? '处理中…' : '处理'}</button>{isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}<button className="danger-action" onClick={deleteBook} disabled={isRunning || actionBusy || saving || uploading || deleting}>{deleting ? '删除中…' : '删除此书'}</button></div>
+                      {noticeView}
+                    </div>
                   </header>
-                  <div className="progress-track" aria-label={'处理进度 ' + progress + '%'}><span style={{ width: progress + '%' }} /></div>
+                  <div className="progress-track" aria-label={'全书已完成比例 ' + progress + '%'}><span style={{ width: progress + '%' }} /></div>
                   {detail.book.error && <div className="error-panel"><strong>处理失败</strong><span>{detail.book.error}</span></div>}
                   <div className="workspace-grid">
-                    <aside className="page-rail" aria-label="页面列表">{detail.pages.map((page) => <button key={page.number} className={page.number === selectedPageNumber ? 'page-link selected' : 'page-link'} onClick={() => choosePage(page)} disabled={deleting}><span>第 {page.number} 页</span><span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></button>)}</aside>
+                    <aside className="page-rail" aria-label="查看页面">{detail.pages.map((page) => <button key={page.number} className={page.number === selectedPageNumber ? 'page-link selected' : 'page-link'} onClick={() => choosePage(page)} disabled={deleting || actionBusy}><span>第 {page.number} 页</span><span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></button>)}</aside>
                     {sourcePage ? (
                       <div className="proofing-area">
                         <div className="page-heading"><div><p className="eyebrow">逐页结果</p><h2>第 {sourcePage.number} 页</h2><span className={statusClass(sourcePage.status)}>{STATUS_LABEL[sourcePage.status] ?? sourcePage.status}</span></div><UsageView usage={sourcePage.usage} attempts={sourcePage.attempts} /></div>
                         {sourcePage.error && <div className="page-error">{sourcePage.error}</div>}
                         <div className="proofing-grid">
-                          <section className="text-panel"><div className="panel-title"><strong>Markdown 源文本</strong><button className="primary" onClick={savePage} disabled={!dirty || saving || editLocked}>{saving ? '保存中…' : '保存本页'}</button></div>{editLocked && <div className="lock-note">{deleting ? '删除中，本页暂不可编辑。' : '处理运行中，本页暂不可编辑。'}</div>}<textarea aria-label="本页 Markdown 源文本" value={draftText} onChange={(event) => { setDraftText(event.target.value); setDirty(true) }} disabled={editLocked} spellCheck={false} placeholder="本页暂无文本" /></section>
-                          <section className="render-panel"><div className="panel-title"><strong>预览</strong><span>按 Markdown 显示</span></div><div className="page-render">{draftText ? <Markdown text={draftText} /> : <p className="empty-page">本页暂无文本</p>}</div></section>
+                          <section className="text-panel"><div className="panel-title"><strong>正文 Markdown 源文本</strong><button className="primary" onClick={savePage} disabled={!dirty || saving || editLocked}>{saving ? '保存中…' : '保存本页'}</button></div>{editLocked && <div className="lock-note">{deleting ? '删除中，本页暂不可编辑。' : '处理运行中，本页暂不可编辑。'}</div>}<textarea aria-label="本页正文 Markdown 源文本" value={draftText} onChange={(event) => { setDraftText(event.target.value); setDirty(true) }} disabled={editLocked} spellCheck={false} placeholder="本页暂无正文" /></section>
+                          <section className="render-panel"><div className="panel-title"><strong>预览</strong><span>正文按 Markdown 显示</span></div><div className="page-render">{sourcePage.header_segments.length > 0 && <><p className="margin-caption">原书页眉</p><MarginContent segments={sourcePage.header_segments} placement="header" /></>}{draftText ? <Markdown text={draftText} /> : <p className="empty-page">本页暂无正文</p>}{sourcePage.footer_segments.length > 0 && <><p className="margin-caption">原书页脚</p><MarginContent segments={sourcePage.footer_segments} placement="footer" /></>}</div></section>
                         </div>
                       </div>
                     ) : <div className="center-state">暂无页面。</div>}

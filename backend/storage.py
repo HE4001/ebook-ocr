@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import Book, Page, Usage
+from .models import Book, MarginSegment, Page, StructuredPageResult, Usage
 from .prompts import legacy_blocks_to_markdown
 
 
@@ -18,7 +18,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "extraction_model": "",
     "reasoning_effort": "",
     "classification_model": "",  # 兼容旧设置；页面代理不会调用它。
-    "structured_output": False,  # 兼容旧设置；页面代理始终直接请求 Markdown。
+    "structured_output": False,  # 兼容旧设置；页面代理固定请求结构化结果。
     "timeout_seconds": 120,
     "max_output_tokens": 12_000,
 }
@@ -53,6 +53,8 @@ class Storage:
                     image_name TEXT NOT NULL, status TEXT NOT NULL, error TEXT,
                     extraction_text TEXT NOT NULL DEFAULT '', extraction_json TEXT,
                     blocks_json TEXT NOT NULL DEFAULT '[]', text TEXT NOT NULL DEFAULT '',
+                    header_segments_json TEXT NOT NULL DEFAULT '[]',
+                    footer_segments_json TEXT NOT NULL DEFAULT '[]',
                     usage_unknown INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (book_id, number)
                 );
@@ -91,6 +93,14 @@ class Storage:
                         "UPDATE pages SET text = ? WHERE book_id = ? AND number = ?",
                         (text, row["book_id"], row["number"]),
                     )
+            if "header_segments_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE pages ADD COLUMN header_segments_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "footer_segments_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE pages ADD COLUMN footer_segments_json TEXT NOT NULL DEFAULT '[]'"
+                )
             if not connection.execute("SELECT 1 FROM settings WHERE id = 1").fetchone():
                 connection.execute(
                     "INSERT INTO settings(id, value) VALUES (1, ?)",
@@ -231,11 +241,10 @@ class Storage:
             ).fetchone()
         return dict(row) if row else None
 
-    def get_unfinished_page_records(self, book_id: str) -> list[dict[str, Any]]:
+    def get_page_records(self, book_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM pages WHERE book_id = ? AND status != 'ready' ORDER BY number",
-                (book_id,),
+                "SELECT * FROM pages WHERE book_id = ? ORDER BY number", (book_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -255,14 +264,13 @@ class Storage:
     def pause_book(self, book_id: str) -> None:
         with self._connect() as connection:
             counts = connection.execute(
-                "SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready "
+                "SELECT SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready "
                 "FROM pages WHERE book_id = ?", (book_id,),
             ).fetchone()
             ready = int(counts["ready"] or 0)
-            total = int(counts["total"] or 0)
             connection.execute(
-                "UPDATE books SET status = ?, completed_pages = ?, error = NULL WHERE id = ?",
-                ("ready" if ready == total else "paused", ready, book_id),
+                "UPDATE books SET status = 'paused', completed_pages = ?, error = NULL WHERE id = ?",
+                (ready, book_id),
             )
 
     def set_page_status(self, book_id: str, number: int, status: str) -> None:
@@ -271,6 +279,7 @@ class Storage:
                 "UPDATE pages SET status = ?, error = NULL WHERE book_id = ? AND number = ?",
                 (status, book_id, number),
             )
+        self.refresh_book(book_id, processing=True)
 
     def begin_attempt(self, book_id: str, number: int) -> int:
         with self._connect() as connection:
@@ -297,12 +306,24 @@ class Storage:
                 (int(returned), *usage, book_id, number, attempt),
             )
 
-    def save_page_result(self, book_id: str, number: int, text: str) -> None:
+    def save_page_result(
+        self, book_id: str, number: int, result: StructuredPageResult | str,
+    ) -> None:
+        if isinstance(result, str):
+            result = StructuredPageResult(
+                header_segments=[], body_markdown=result, footer_segments=[]
+            )
         with self._connect() as connection:
             connection.execute(
-                "UPDATE pages SET status = 'ready', error = NULL, text = ?, extraction_json = NULL "
+                "UPDATE pages SET status = 'ready', error = NULL, text = ?, "
+                "header_segments_json = ?, footer_segments_json = ?, extraction_json = NULL "
                 "WHERE book_id = ? AND number = ?",
-                (text, book_id, number),
+                (
+                    result.body_markdown,
+                    json.dumps([segment.model_dump() for segment in result.header_segments], ensure_ascii=False),
+                    json.dumps([segment.model_dump() for segment in result.footer_segments], ensure_ascii=False),
+                    book_id, number,
+                ),
             )
         self.refresh_book(book_id, processing=True)
 
@@ -312,6 +333,7 @@ class Storage:
                 "UPDATE pages SET status = 'failed', error = ? WHERE book_id = ? AND number = ?",
                 (message[:1000], book_id, number),
             )
+        self.refresh_book(book_id, processing=True)
 
     def interrupt_page(self, book_id: str, number: int) -> None:
         with self._connect() as connection:
@@ -339,22 +361,27 @@ class Storage:
             counts = connection.execute(
                 "SELECT COUNT(*) AS total, "
                 "SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) AS ready, "
-                "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed "
+                "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed, "
+                "SUM(CASE WHEN status='interrupted' THEN 1 ELSE 0 END) AS interrupted "
                 "FROM pages WHERE book_id = ?", (book_id,),
             ).fetchone()
             total = int(counts["total"] or 0)
             ready = int(counts["ready"] or 0)
             failed = int(counts["failed"] or 0)
-            if ready == total:
+            interrupted = int(counts["interrupted"] or 0)
+            if processing:
+                status = "pausing" if current is not None and current["status"] == "pausing" else "processing"
+                error = None
+            elif ready == total:
                 status, error = "ready", None
-            elif processing:
-                status, error = "processing", None
             elif current is not None and current["status"] == "paused":
                 status, error = "paused", None
             elif failed:
                 status, error = "failed", f"{failed} 页处理失败"
-            else:
+            elif interrupted:
                 status, error = "interrupted", "仍有页面未完成"
+            else:
+                status, error = "uploaded", None
             connection.execute(
                 "UPDATE books SET status = ?, completed_pages = ?, error = ? WHERE id = ?",
                 (status, ready, error, book_id),
@@ -405,6 +432,11 @@ class Storage:
             status = "interrupted"
         return Page(
             number=row["number"], status=status, error=row["error"],
-            text=row["text"], usage=cls._usage(attempts, bool(row["usage_unknown"])),
+            text=row["text"],
+            header_segments=[MarginSegment.model_validate(value) for value in
+                             json.loads(row["header_segments_json"])],
+            footer_segments=[MarginSegment.model_validate(value) for value in
+                             json.loads(row["footer_segments_json"])],
+            usage=cls._usage(attempts, bool(row["usage_unknown"])),
             attempts=len(attempts),
         )

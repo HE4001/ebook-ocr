@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .importers import ensure_pdf_pages
+from .models import StructuredPageResult
 from .prompts import PAGE_AGENT_PROMPT, page_context
 from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig
 from .storage import Storage
@@ -21,7 +22,7 @@ class PageAgent:
     async def run(
         self, book_id: str, number: int, total: int, filename: str,
         model: str, image_path: Path,
-    ) -> str:
+    ) -> StructuredPageResult:
         image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
         input_value = [
             {"role": "system", "content": [{"type": "input_text", "text": PAGE_AGENT_PROMPT}]},
@@ -31,7 +32,7 @@ class PageAgent:
                  "detail": "high"},
             ]},
         ]
-        return await self.client.request_markdown(
+        return await self.client.request_page(
             model, input_value,
             on_attempt_start=lambda: self.storage.begin_attempt(book_id, number),
             on_attempt_end=lambda attempt, usage, returned: self.storage.finish_attempt(
@@ -47,6 +48,7 @@ class BookProcessor:
     async def process(
         self, book_id: str, settings: dict[str, Any], api_key: str,
         pause_requested: asyncio.Event | None = None,
+        records: list[dict[str, Any]] | None = None,
     ) -> None:
         client = ResponsesClient(ResponsesConfig(
             base_url=settings["base_url"],
@@ -59,11 +61,13 @@ class BookProcessor:
         ))
         if pause_requested is None or not pause_requested.is_set():
             self.storage.begin_book(book_id)
-        records = self.storage.get_unfinished_page_records(book_id)
+        if records is None:
+            records = self.storage.get_page_records(book_id)
         book = self.storage.get_book(book_id)
         assert book is not None
         current_number: int | None = None
         try:
+            completed = 0
             for record in records:
                 if pause_requested is not None and pause_requested.is_set():
                     break
@@ -75,14 +79,15 @@ class BookProcessor:
                         single_page = book_dir / f"page-{current_number:04d}.pdf"
                         if not single_page.is_file():
                             await asyncio.to_thread(ensure_pdf_pages, book_dir, [current_number])
-                    markdown = await PageAgent(client, self.storage).run(
+                    result = await PageAgent(client, self.storage).run(
                         book_id, current_number, book.page_count, book.filename,
                         settings["extraction_model"], book_dir / record["image_name"],
                     )
-                    self.storage.save_page_result(book_id, current_number, markdown)
+                    self.storage.save_page_result(book_id, current_number, result)
                 except (ModelServiceError, ValueError, OSError) as exc:
                     self.storage.fail_page(book_id, current_number, _safe_error(exc))
-            if pause_requested is not None and pause_requested.is_set():
+                completed += 1
+            if pause_requested is not None and pause_requested.is_set() and completed < len(records):
                 self.storage.pause_book(book_id)
             else:
                 self.storage.finish_book(book_id)

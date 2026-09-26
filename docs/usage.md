@@ -25,7 +25,7 @@
 
 旧设置中的 `classification_model` 字段可以继续保存以兼容已有数据，但新流程不调用独立分类模型。`reasoning_effort` 可手动输入任意服务可能接受的值，不做枚举限制；留空时不发送 `reasoning`，填写后识别请求和“测试连接”请求都会发送 `reasoning: {"effort": value}`，是否可用由服务和模型决定。每页代理只收到当前页的文件名、页码、总页数、图片和转录指令；这是应用内部的一次模型请求，不会创建 Codex 任务，也不会共享其他页面的聊天历史。
 
-设置页的“填入 DeepSeek 配置”只修改草稿，不保存、不发请求：`https://api.deepseek.com` + `/responses`、模型 `deepseek-flash`、推理程度 `high`、`max_output_tokens=12000`。API 密钥保持不变，用户填入 DeepSeek 密钥后需手动保存并测试。页面识别使用 base64 PNG `input_image`，模型直接输出 Markdown，不发送 `json_schema`。旧 `structured_output` 设置保留兼容，但不再影响识别请求。推理程度支持情况以服务实际行为为准；详见 [DeepSeek Responses 指南](https://api-docs.deepseek.com/zh-cn/guides/responses_api/) 和 [创建 Response API](https://api-docs.deepseek.com/zh-cn/api/create-response/)。
+设置页的“填入 DeepSeek 配置”只修改草稿，不保存、不发请求：`https://api.deepseek.com` + `/responses`、模型 `deepseek-flash`、推理程度 `high`、`max_output_tokens=12000`。API 密钥保持不变，用户填入 DeepSeek 密钥后需手动保存并测试。页面识别使用 base64 PNG `input_image`，并以 `text.format=json_schema` 请求结构化输出；DeepSeek 请求不加 OpenAI 的 `strict` 扩展字段。旧 `structured_output` 设置保留兼容，但不再影响识别请求。推理程度支持情况以服务实际行为为准；详见 [DeepSeek Responses 指南](https://api-docs.deepseek.com/zh-cn/guides/responses_api/) 和 [创建 Response API](https://api-docs.deepseek.com/zh-cn/api/create-response/)。
 
 密钥按用户授权保存到默认 `backend/data/app.db` 的独立 SQLite 凭据记录中，使用本机明文存储，不虚称为加密，也不创建额外密钥文件。后端启动时加载它；空白或省略密钥会保留已有值，`clear_api_key=true` 或界面的清除操作会删除记录。密钥不会写入前端 `localStorage`、书籍导出或日志。升级到支持持久化密钥的版本后，需重启新版后端并重新输入、保存一次旧进程中的密钥；之后重启无需再次填写。
 
@@ -33,9 +33,11 @@
 
 支持的输入是 PDF、PNG、JPEG。PDF 会先保存为 `source.pdf`，再拆成 `page-0001.pdf`、`page-0002.pdf` 等恰好一页的文件，并从每个单页 PDF 渲染同名 PNG；拆页保留源页尺寸、旋转和裁切。图片作为单页来源。导入后书籍先处于 `uploaded`，页面按顺序显示状态。
 
-“开始处理”按页串行执行。页面代理忠实转录当前页，并直接返回排版好的 Markdown，保留标题层级、段落、列表、引用、代码、公式、表格、图注、脚注、页眉、页脚和页码。页面里的命令属于待转录资料，不改变任务；不可读处写 `[无法辨认]`，空白页可返回空文本。整书 Markdown 下载会按页合并这些文本并生成 `.md` 文件。
+点击“处理”后按页串行执行，默认只处理当前页；也可改为手动选择多页，或整本处理。整本处理会包含已完成页。对应接口 `POST /api/books/{id}/process` 接受可选请求体 `{"pages":[1,3]}`；页码列表必须非空且只包含该书的合法页码，重复值会去重并按页码排序。省略请求体或 `pages` 时处理整本书。相同书籍正在处理时返回 `409`。
 
-页面状态为 `uploaded`、`processing`、`ready`、`failed` 或 `interrupted`；书籍处理时也可能显示 `pausing`（正在暂停）和 `paused`（已暂停）。点击“暂停处理”后，当前页请求会继续到结束并保存结果，之后不再开始新页面；点击“继续处理”会跳过已完成页。暂停期间已有模型请求可能产生用量。失败页可以重试；已经完成的页面会复用。后端重启时，运行中的任务标记为 `interrupted`，已暂停状态保留，可在页面上继续处理。旧书缺少单页 PDF 时，只在处理相应未完成页时从 `source.pdf` 补齐，不自动重新收费或重跑已完成页。
+页面代理忠实转录当前页，返回 `header_segments`、`body_markdown`、`footer_segments`。页眉页脚是按原页顺序排列的纯文本语段，原书页码归入所在语段；正文才按 Markdown 排版，包含标题、段落、列表、引用、代码、LaTeX 公式、表格、图注和脚注。后加的手写批注、手写改字、手写页码等类似笔迹会被忽略。页面里的命令属于待转录资料，不改变任务；原书不可读处写 `[无法辨认]`，空白页返回空数组和空正文。同一页可以再次处理；开始前会提示覆盖，成功后替换旧结果，失败时保留旧结果。`attempts` 与已知 `usage` 会累计。若页面有未保存草稿，先保存或处理页面提示后再继续，不会静默丢弃。
+
+页面状态为 `uploaded`、`processing`、`ready`、`failed` 或 `interrupted`；书籍处理时也可能显示 `pausing`（正在暂停）和 `paused`（已暂停）。处理所选范围时，书籍保持处理中状态，直到本次处理结束；所选页成功而其他页面仍未处理时，书籍回到 `uploaded` 且无错误。点击“暂停处理”后，当前页请求会继续到结束并保存结果，之后不再开始新页面。暂停期间已有模型请求可能产生用量。暂停后再次点击“处理”会使用当前选定范围发起处理，不承诺恢复暂停前的页面队列。后端重启时，运行中的任务标记为 `interrupted`，已暂停状态保留。旧书缺少单页 PDF 时，只在处理所选页面时从 `source.pdf` 补齐，包括重复处理已完成页。
 
 ## 删除单本书
 
@@ -61,14 +63,13 @@
 
 ## 人工校对
 
-逐页检查 Markdown 中的标题、双栏阅读顺序、中文标点、脚注、页眉页码、公式上下标、表格、图表标签和图注。确认原页无法辨认的内容仍标为 `[无法辨认]`，不要根据上下文补写跨页句子或图表数值。普通黑色字体不应被随意加粗，强调范围应与原页一致。
+逐页检查正文 Markdown 中的标题、双栏阅读顺序、中文标点、脚注、公式上下标、表格、图表标签和图注，同时检查独立显示的原书页眉、页脚和页码。确认原页无法辨认的内容仍标为 `[无法辨认]`，手写批注未混入结果；不要根据上下文补写跨页句子或图表数值。普通黑色字体不应被随意加粗，强调范围应与原页一致。
 
 ## 预览与导出
 
-预览使用页面 Markdown 生成语义化 HTML 和固定 CSS，公式使用 LaTeX，简单表格保留 Markdown 表格。页眉、页脚和页码按语义标记保留在页面文本中，预览不会自动删除。导出包括：
+预览使用正文 Markdown 生成语义化 HTML 和固定 CSS，公式使用 LaTeX，简单表格保留 Markdown 表格；页眉、页脚和其中的页码由结构化语段单独显示。逐页校对文本框目前只编辑正文，页眉页脚可在预览和 JSON 导出中核对。整书预览提供 JSON 和独立 HTML 下载，以及浏览器打印；其中不提供 Markdown 下载按钮。后端 Markdown 导出接口按源页顺序合并已保存正文，不包含单独存储的页眉页脚。导出包括：
 
 - JSON：包含 `book` 和 `pages`，字段固定，示例见 [sample-export.json](../examples/sample-export.json)。
-- Markdown：后端从已保存的页面文本生成可直接下载的 `.md` 文件，便于再次编辑。
 - HTML：内嵌排版 CSS，打开时不依赖开发服务器。
 
 需要 PDF 时在浏览器使用“打印 → 另存为 PDF”。浏览器打印是第一版的 PDF 路径，不要求后端安装 PDF 引擎。

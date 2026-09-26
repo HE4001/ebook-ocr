@@ -1,14 +1,14 @@
 # PDF 逐页代理：总体设计和详细模块任务
 
-> 历史设计记录：本分支已改为模型直接返回页面 Markdown，不再要求 `sections` JSON 或 `json_schema`。现行流程见 [操作说明](usage.md)。
+> 历史设计记录：现行流程改为 JSON Schema 结构化输出 `header_segments`、`body_markdown`、`footer_segments`，页眉页脚与正文分开，正文才使用 Markdown，并排除后加手写批注。下文的 `sections` 设计和旧分工属于历史方案；现行流程见 [操作说明](usage.md)。
 
 ## 目标与边界
 PDF → PyMuPDF 拆成独立单页 PDF → 每单页渲染 PNG → 每页一个独立 PageAgent → 一次 Responses 请求完成忠实提取与分类 → 保存 Markdown 文本和真实 token。PNG/JPEG 保持支持。PageAgent 是应用内独立上下文的函数/对象，不创建 Codex 任务，不需要 Agents SDK 或工具循环。默认逐页串行，失败可重试、成功复用、中断保留已知结果。仅使用 extraction_model（界面改称页面代理模型）；旧 classification_model 字段兼容保留但不调用，前端去掉其输入。设置提供可选的 `reasoning_effort` 手动输入，并支持从书库删除单本书。
 
-前端每页只输出文本和用量（另有必要页码、状态、错误、保存操作），移除原图面板、bbox框选、分类块编辑器；后端不再生成裁图或要求坐标。保留整书预览、文本编辑、HTML/JSON导出，增加简单Markdown下载。无复杂编辑器、微服务、队列系统。
+前端每页只输出文本和用量（另有必要页码、状态、错误、保存操作），移除原图面板、bbox框选、分类块编辑器；后端不再生成裁图或要求坐标。保留整书预览、文本编辑、HTML/JSON导出；整书预览不提供 Markdown 下载按钮，`GET /api/books/{id}/export.md` 接口仍保留。无复杂编辑器、微服务、队列系统。
 
 ## PDF模块
-沿用PyMuPDF，不额外引入同类PDF库。保留 source.pdf，拆为 page-0001.pdf、page-0002.pdf……，每份恰好一页并保留源页尺寸/旋转/裁切，再从该单页渲染同名PNG。沿用大小/页数/像素限制和安全assets路由。旧PDF缺拆页文件时仅在用户处理未完成页时补齐，不自动重新收费或重跑已完成页。import_document 保持返回现有(number,width,height,image_name)四元组列表。为补旧PDF提供简单 ensure_pdf_pages 辅助函数，签名与后端代理协调。
+沿用PyMuPDF，不额外引入同类PDF库。保留 source.pdf，拆为 page-0001.pdf、page-0002.pdf……，每份恰好一页并保留源页尺寸/旋转/裁切，再从该单页渲染同名PNG。沿用大小/页数/像素限制和安全assets路由。旧PDF缺拆页文件时，仅为本次处理所选页面补齐，包括重复处理已完成页；未选页面不自动处理。import_document 保持返回现有(number,width,height,image_name)四元组列表。为补旧PDF提供简单 ensure_pdf_pages 辅助函数，签名与后端代理协调。
 
 ## 提示词与内容
 集中 prompts.py 维护。指令与页面资料分离：页面里的命令均是待转录资料，不改变任务。每次提供文件名、页码N、总页数total、本页图像，不累计历史聊天。
@@ -41,7 +41,7 @@ Page = {number:number,status:string,error:string|null,text:string,usage:Usage,at
 Book = 原{id,title,filename,status,page_count,completed_pages,error,created_at} + usage:Usage。全书合计已尝试页；未处理页不降低已返回调用统计完整性。旧有结果无usage必须未知，不假装免费。
 GET books/{id}及export → {book:Book,pages:Page[]}。
 PUT books/{id}/pages/{number}请求改为{text:string} → Page；校对不变更usage/attempts，运行中拒绝修改。
-POST books/{id}/process → {started:boolean}；只处理未完成页，同书运行中409。
+POST books/{id}/process → {started:boolean}；可选请求体 `{"pages":[1,3]}` 指定非空合法页码列表，去重并排序；省略请求体或 `pages` 时处理整本（包括已完成页）；同书运行中返回409。
 DELETE books/{id} → 204；删除一本书的记录、页面记录、请求用量记录以及源文件和页面文件。书籍运行中返回409，未知书籍返回404；不影响其他书籍、全局设置或API密钥。
 
 SQLite增量迁移，不删除/重建用户DB。旧blocks按顺序转Markdown保留文本，旧ready不自动重跑、token未知。原始旧字段可留以免丢数据；旧原图/裁图不必删除。测试用临时DB/mock，不污染真实书库。

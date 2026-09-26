@@ -22,6 +22,7 @@ from .models import (
     Page,
     PageUpdate,
     PauseResult,
+    ProcessRequest,
     ProcessResult,
     SettingsOut,
     SettingsUpdate,
@@ -198,11 +199,17 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         return Response(status_code=204)
 
     @app.post("/api/books/{book_id}/process", response_model=ProcessResult)
-    async def process_book(book_id: str) -> ProcessResult:
+    async def process_book(book_id: str, request: ProcessRequest | None = None) -> ProcessResult:
         ensure_book(book_id)
         if book_id in running:
             raise HTTPException(status_code=409, detail="该书籍正在处理")
-        if not storage.get_unfinished_page_records(book_id):
+        records = storage.get_page_records(book_id)
+        if request is not None and request.pages is not None:
+            numbers = set(request.pages)
+            records = [record for record in records if record["number"] in numbers]
+            if len(records) != len(numbers):
+                raise HTTPException(status_code=400, detail="所选页面不存在")
+        if not records:
             return ProcessResult(started=False)
         settings = storage.get_settings()
         if not secrets.api_key:
@@ -213,7 +220,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         pause_requested = asyncio.Event()
         storage.begin_book(book_id)
         task = asyncio.create_task(processor.process(
-            book_id, settings, secrets.api_key, pause_requested,
+            book_id, settings, secrets.api_key, pause_requested, records,
         ))
         running[book_id] = task
         pause_requests[book_id] = pause_requested

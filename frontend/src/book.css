@@ -11,6 +11,9 @@ body { margin: 0; }
 .book-page { border-top: 1px solid #ddd; padding-top: 1.2em; }
 .book-page + .book-page { margin-top: 2.5em; }
 .book-page-number { margin-bottom: 1.5em; color: #666; font: 12px/1.5 system-ui, sans-serif; }
+.page-margin { display: flex; flex-wrap: wrap; gap: .4em 1.5em; white-space: pre-wrap; color: #555; font-size: .82em; }
+.page-margin-header { margin-bottom: 1.2em; }
+.page-margin-footer { margin-top: 1.2em; }
 .markdown-body h1,.markdown-body h2,.markdown-body h3,.markdown-body h4,.markdown-body h5,.markdown-body h6 { line-height: 1.35; margin: 1.5em 0 .6em; break-after: avoid; }
 .markdown-body h1 { font-size: 1.8em; }
 .markdown-body h2 { font-size: 1.5em; }
