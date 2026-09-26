@@ -116,10 +116,13 @@ class BookProcessor:
         pause_requested: asyncio.Event | None = None,
         records: list[dict[str, Any]] | None = None,
         pending_pages: list[int] | None = None,
+        manually_saved_pages: set[int] | None = None,
     ) -> None:
         context_reuse_enabled = settings.get("context_reuse_enabled", False)
         group_size = settings.get("context_reuse_max_pages", 10) if context_reuse_enabled else 1
         concurrency = settings.get("processing_concurrency", 10)
+        if manually_saved_pages is None:
+            manually_saved_pages = set()
         if pause_requested is None or not pause_requested.is_set():
             self.storage.begin_book(book_id)
         if pending_pages is None:
@@ -151,7 +154,10 @@ class BookProcessor:
                     reserved_pages.pop(number)
                     record = self.storage.get_page_record(book_id, number)
                     # A removed and re-added page belongs to its new queue position.
-                    if number in pending_pages or record is None or not record["selected"]:
+                    # A manual save supersedes this run's queued OCR, including
+                    # pages already reserved by a context-reuse group.
+                    if (number in pending_pages or number in manually_saved_pages
+                            or record is None or not record["selected"]):
                         continue
                     try:
                         self.storage.set_page_status(book_id, number, "processing")

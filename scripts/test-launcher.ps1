@@ -94,7 +94,7 @@ $main = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Au
             if ($scenario -in @("missing", "stale", "malformed")) {
                 Assert-True ($messages -match "The project is already running") "$scenario did not reuse healthy services"
             } elseif ($scenario -in @("partial", "unhealthy")) {
-                Assert-True ($messages -match "Run stop.bat before starting again") "$scenario did not give recovery instructions"
+                Assert-True ($messages -match "Run ocr.bat Restart") "$scenario did not give recovery instructions"
             } elseif ($scenario -notlike "stop-*") {
                 Assert-True ($messages -match "Port 8000 is already in use") "$scenario did not reject the conflicting listener"
             } else {
@@ -119,6 +119,58 @@ $main = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Au
             Assert-True (-not (Test-Path $stopsPath)) "$scenario stopped an unverified process"
         }
         Write-Host "PASS: $scenario"
+    }
+
+    $dispatchSetup = @'
+param($sourceDir, $scenario)
+$ErrorActionPreference = "Stop"
+$NoBrowser = $true
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $sourceDir "ocr.ps1"), [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw "Invalid unified launcher syntax" }
+foreach ($statement in $ast.EndBlock.Statements) {
+    if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+        . ([scriptblock]::Create($statement.Extent.Text))
+    }
+}
+$script:calls = @()
+function Invoke-LauncherScript {
+    param($Name, [switch]$WithoutBrowser)
+    $script:calls += $Name
+    if ($Name -eq "start.ps1" -and -not $WithoutBrowser) { throw "NoBrowser flag was lost" }
+    if ($Name -eq "stop.ps1" -and $scenario -eq "stop-failed") { return 7 }
+    return 0
+}
+function Wait-OcrPortsFree {
+    $script:calls += "wait"
+    return ($scenario -ne "port-busy")
+}
+function Show-OcrStatus { $script:calls += "status" }
+$selected = switch ($scenario) {
+    "start" { "Start" }
+    "stop" { "Stop" }
+    "status" { "Status" }
+    default { "Restart" }
+}
+$code = Invoke-OcrAction $selected
+[pscustomobject]@{ Code = $code; Calls = ($script:calls -join ",") }
+'@
+    foreach ($case in @(
+        @{ Name = "start"; Code = 0; Calls = "start.ps1" },
+        @{ Name = "stop"; Code = 0; Calls = "stop.ps1,wait" },
+        @{ Name = "restart"; Code = 0; Calls = "stop.ps1,wait,start.ps1" },
+        @{ Name = "status"; Code = 0; Calls = "status" },
+        @{ Name = "stop-failed"; Code = 7; Calls = "stop.ps1" },
+        @{ Name = "port-busy"; Code = 1; Calls = "stop.ps1,wait" }
+    )) {
+        $runner = [powershell]::Create()
+        try {
+            $null = $runner.AddScript($dispatchSetup).AddArgument($sourceDir).AddArgument($case.Name)
+            $result = @($runner.Invoke())
+            if ($runner.HadErrors) { throw ($runner.Streams.Error | Out-String) }
+            Assert-True ($result.Count -eq 1 -and $result[0].Code -eq $case.Code -and $result[0].Calls -eq $case.Calls) "Incorrect dispatch for $($case.Name)"
+        } finally { $runner.Dispose() }
+        Write-Host "PASS: unified-$($case.Name)"
     }
 } finally {
     # Only this test's freshly created temporary directory may be removed.

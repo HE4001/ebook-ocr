@@ -1,5 +1,12 @@
 import type { CSSProperties } from 'react'
-import type { PaperSize } from './types'
+import type { Page, PageSide, PaperSize } from './types'
+
+export function bindingPageSide(page: Pick<Page, 'page_kind' | 'page_side' | 'footer_segments'>): PageSide {
+  return page.page_kind === 'content'
+    && (page.page_side === 'left' || page.page_side === 'right')
+    && page.footer_segments.some((segment) => segment.text.trim())
+    ? page.page_side : 'unknown'
+}
 
 export const PAPER_SIZES: Record<PaperSize, {
   label: string

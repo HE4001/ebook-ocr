@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { BookContent } from './Markdown'
+import { installDisplayMathFit } from './fitDisplayMath'
 import bookCss from './book.css?inline'
 import type { BookDetail } from './types'
 
@@ -14,7 +15,7 @@ export function buildStandaloneHtml(detail: BookDetail, printVersion = false): s
   return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>' + title + '</title><style>' + bookCss + '</style></head>' +
-    '<body>' + content + '</body></html>'
+    '<body>' + content + '<script>(' + installDisplayMathFit.toString() + ')(document.body);</script></body></html>'
 }
 
 export function downloadText(filename: string, content: string, type: string): void {

@@ -77,7 +77,9 @@ body { margin: 0; }
 .markdown-body th { background: #eee; }
 .markdown-body a { color: #245e83; overflow-wrap: anywhere; }
 .markdown-body .omitted-image { color: #666; }
-.markdown-body .katex-display { overflow-x: auto; overflow-y: hidden; text-align: center; }
+.markdown-body .katex-display { text-align: center; }
+.markdown-body .math-fit-display { display: block; width: 100%; min-width: 0; break-inside: avoid; font-size: 1.21em; line-height: 1.2; text-indent: 0; }
+.markdown-body math[display="block"] { break-inside: avoid; }
 @media screen {
   .book-preview-print .book-page-entry[data-page-side="left"] .book-page {
     padding-left: calc(var(--paper-unit) * (var(--paper-margin-mm) - var(--paper-margin-shift-mm)));

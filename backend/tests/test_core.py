@@ -7,7 +7,7 @@ import time
 import unittest
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import httpx
@@ -231,9 +231,15 @@ class BackendTests(unittest.TestCase):
                             {"type": "message", "content": [{
                                 "type": "output_text", "text": json.dumps({
                                     "page_kind": "content", "page_side": "unknown",
-                                    "header_segments": [{"kind": "text", "text": "原书页眉"}],
+                                    "header_segments": [{
+                                        "kind": "text", "text": "原书页眉", "alignment": "center",
+                                        "row": 1, "font_size": "small", "bold": False, "italic": False,
+                                    }],
                                     "body_markdown": "# 标题\n\n正文 **原文**",
-                                    "footer_segments": [{"kind": "page_number", "text": "12"}],
+                                    "footer_segments": [{
+                                        "kind": "page_number", "text": "12", "alignment": "right",
+                                        "row": 1, "font_size": "small", "bold": False, "italic": False,
+                                    }],
                                 }, ensure_ascii=False),
                             }]},
                         ],
@@ -449,9 +455,10 @@ class BackendTests(unittest.TestCase):
                 "file": ("second.png", png_bytes(), "image/png")}).json()["id"]
             storage = client.app.state.storage
             storage.begin_attempt(first, 1)
-            client.app.state.running[first] = object()
-            self.assertEqual(client.delete(f"/api/books/{first}").status_code, 409)
-            client.app.state.running.pop(first)
+            running_task = Mock(spec=asyncio.Task)
+            running_task.done.return_value = False
+            with patch.dict(client.app.state.running, {first: running_task}):
+                self.assertEqual(client.delete(f"/api/books/{first}").status_code, 409)
             with patch("backend.storage.shutil.rmtree", side_effect=OSError("disk")):
                 with self.assertRaises(OSError):
                     client.delete(f"/api/books/{first}")
@@ -579,6 +586,9 @@ class BackendTests(unittest.TestCase):
                     "file": ("page.png", png_bytes(), "image/png")})
                 self.assertEqual(uploaded.status_code, 201)
                 book_id = uploaded.json()["id"]
+                self.assertEqual(client.put(f"/api/books/{book_id}/arrangement", json={
+                    "file_order": ["legacy"], "page_order": [1],
+                }).status_code, 200)
                 exported = client.get(f"/api/books/{book_id}/export")
                 self.assertEqual(exported.status_code, 200)
                 self.assertNotIn("fictional-replacement-key", exported.text)

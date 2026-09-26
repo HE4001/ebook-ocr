@@ -143,7 +143,7 @@ def _import_image(
             width, height = image.size
             if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
                 raise ImportFailure("图片像素尺寸过大")
-            if image.mode in {"RGBA", "LA"}:
+            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
                 rgba = image.convert("RGBA")
                 rgb = Image.new("RGB", rgba.size, "white")
                 rgb.paste(rgba, mask=rgba.getchannel("A"))

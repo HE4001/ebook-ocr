@@ -65,6 +65,27 @@ export function insertPageBlock(layout: number[], moved: number[], anchor: numbe
   return next
 }
 
+export function findFilePageAnchor(
+  selectedPages: { number: number; source_id: string }[],
+  fileOrder: string[],
+  movedFiles: ReadonlySet<string>,
+  targetFiles: ReadonlySet<string>,
+  side: 'before' | 'after',
+): { anchor: number | null; side: 'before' | 'after' } {
+  const targets = selectedPages.filter((page) => targetFiles.has(page.source_id) && !movedFiles.has(page.source_id))
+  if (targets.length) return { anchor: targets[side === 'before' ? 0 : targets.length - 1].number, side }
+
+  // A file with no selected pages has no book position. Use the next selected
+  // file in the new file order, rather than an excluded page in the source view.
+  const firstMoved = fileOrder.findIndex((id) => movedFiles.has(id))
+  for (const id of fileOrder.slice(firstMoved + 1)) {
+    if (movedFiles.has(id)) continue
+    const page = selectedPages.find((entry) => entry.source_id === id)
+    if (page) return { anchor: page.number, side: 'before' }
+  }
+  return { anchor: null, side: 'after' }
+}
+
 export function reorderVisiblePages(layout: number[], visible: number[], from: number, to: number): number[] {
   const next = [...visible]
   const [moved] = next.splice(from, 1)

@@ -4,7 +4,8 @@ import { BookContent, PageContent } from './Markdown'
 import { buildStandaloneHtml, downloadText, safeFilename } from './exportHtml'
 import ProjectOrganizer from './ProjectOrganizer'
 import { PageEditor } from './PageEditor'
-import { PAPER_SIZES } from './paper'
+import { ReasoningControl } from './ReasoningControl'
+import { bindingPageSide, PAPER_SIZES } from './paper'
 import type { ApiProtocol, Book, BookDetail, Notice, Page, PageDraft, PaperSize, Settings, Usage } from './types'
 
 const STATUS_LABEL: Record<string, string> = {
@@ -90,6 +91,13 @@ function UsageView({ usage, attempts }: { usage: Usage; attempts?: number }) {
       {!usage.complete && <em>{known ? '已知用量，可能不完整' : '用量未知'}</em>}
     </div>
   )
+}
+
+function ToolbarUsage({ usage }: { usage: Usage }) {
+  return <details className="toolbar-usage">
+    <summary>模型用量 <strong>{usage.total_tokens == null ? '未知' : usage.total_tokens.toLocaleString()}</strong>{usage.total_tokens != null && ' tokens'}{!usage.complete && <span> · 不完整</span>}</summary>
+    <UsageView usage={usage} />
+  </details>
 }
 
 function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
@@ -286,7 +294,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
           <small>{isGemini ? '仅列出服务声明支持 generateContent 的模型；不保证支持图片输入或结构化输出，请确认所选模型能力。' : '模型列表仅提供名称，不代表模型支持 Responses 或图片输入，请向供应商确认。'}</small>
         </div>
         <label><span>页面代理模型 ID</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} placeholder="手动填写，或从上方列表选择" disabled={saving} /><small>{isGemini && '可填裸模型 ID 或 models/ 开头的完整资源名。'}保存后用于逐页识别，返回页眉、正文 Markdown 和页脚。</small></label>
-        <label><span>模型推理程度</span><input value={settings.reasoning_effort} onChange={(event) => update('reasoning_effort', event.target.value)} placeholder={isGemini ? '留空使用默认；或填写级别、整数预算' : '例如 low、medium、high'} disabled={saving} /><small>{isGemini ? 'Gemini 3：minimal、low、medium、high 对应 thinkingLevel；Gemini 2.5：整数 ≥ -1 对应 thinkingBudget（0 关闭，-1 动态）。具体支持受模型限制，留空使用服务默认值。' : '手动填写模型供应商支持的值；留空则使用服务默认值。'}</small></label>
+        <ReasoningControl protocol={settings.api_protocol} value={settings.reasoning_effort} onChange={(value) => update('reasoning_effort', value)} disabled={saving} />
         <div className="field-grid compact-grid">
           <label><span>超时秒数</span><input type="number" min={5} max={600} value={settings.timeout_seconds} onChange={(event) => update('timeout_seconds', Number(event.target.value))} disabled={saving} /></label>
         </div>
@@ -345,11 +353,14 @@ function PaperSizeControl({ value, saving, disabled, onChange }: {
   onChange: (size: PaperSize) => void
 }) {
   return <div className="book-paper-control">
-    <label htmlFor="book-paper-size">书本纸张</label>
-    <select id="book-paper-size" value={value} disabled={disabled} aria-describedby="book-paper-note" onChange={(event) => onChange(event.target.value as PaperSize)}>
-      {Object.entries(PAPER_SIZES).map(([size, paper]) => <option key={size} value={size}>{paper.label}</option>)}
-    </select>
-    <small id="book-paper-note" aria-live="polite">{saving ? '正在保存纸张尺寸…' : '整本书生效；预览、HTML 和打印使用同一纸张。'}</small>
+    <span className="paper-swatch" aria-hidden="true" style={{ aspectRatio: `${PAPER_SIZES[value].widthMm} / ${PAPER_SIZES[value].heightMm}` }}><i /><i /><i /></span>
+    <div className="paper-field">
+      <label htmlFor="book-paper-size">成书纸张</label>
+      <select id="book-paper-size" value={value} disabled={disabled} aria-describedby="book-paper-note" onChange={(event) => onChange(event.target.value as PaperSize)}>
+        {Object.entries(PAPER_SIZES).map(([size, paper]) => <option key={size} value={size}>{paper.label}</option>)}
+      </select>
+      <small id="book-paper-note" aria-live="polite">{saving ? '正在保存…' : '整书生效 · 选择后自动保存'}</small>
+    </div>
   </div>
 }
 
@@ -453,10 +464,12 @@ export default function App() {
   const sourcePageHasResult = sourcePage && (sourcePage.status === 'ready' || Boolean(sourcePage.text || sourcePage.cover_fields.length || sourcePage.header_segments.length || sourcePage.footer_segments.length))
   const pendingPages = detail?.pages.filter((page) => page.status !== 'ready') ?? []
   const pagesToProcess = pendingPages.map((page) => page.number)
+  const bindingPageCount = detail?.pages.filter((page) => bindingPageSide(page) !== 'unknown').length ?? 0
+  const effectivePrintVersion = printVersion && bindingPageCount > 0
   const isRunning = detail?.book.status === 'processing' || detail?.book.status === 'pausing'
   const busy = actionBusy || saving || layoutSaving || uploading || deleting || organizerBusy
   const processLocked = isRunning || busy
-  const editLocked = isRunning || busy || sourcePage?.status === 'processing'
+  const editLocked = busy || sourcePage?.status === 'processing'
   const progress = detail?.book.selected_page_count ? Math.round(detail.book.completed_pages / detail.book.selected_page_count * 100) : 0
   const oldBackendContract = Boolean(detail && (!Array.isArray(detail.files) || !detail.book.usage
     || detail.pages.some((page) => typeof page.text !== 'string' || !page.page_kind || !Array.isArray(page.cover_fields) || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage)))
@@ -635,8 +648,9 @@ export default function App() {
     detailRequestRef.current += 1
     try {
       const saved = await api.saveBookLayout(detail.book.id, paperSize)
-      setDetail((current) => current?.book.id === saved.id ? { ...current, book: saved } : current)
-      setBooks((current) => current.map((book) => book.id === saved.id ? saved : book))
+      setDetail((current) => current?.book.id === saved.id ? { ...current, book: { ...current.book, paper_size: saved.paper_size } } : current)
+      setBooks((current) => current.map((book) => book.id === saved.id ? { ...book, paper_size: saved.paper_size } : book))
+      await loadDetail(saved.id, true)
       setNotice({ kind: 'success', text: `已将整本书纸张设为 ${PAPER_SIZES[saved.paper_size].label}。` })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
@@ -646,7 +660,7 @@ export default function App() {
   }
 
   const savePage = async () => {
-    if (!detail || !sourcePage) return
+    if (!detail || !sourcePage || editLocked) return
     setSaving(true)
     try {
       const saved = await api.savePage(detail.book.id, sourcePage.number, {
@@ -657,6 +671,7 @@ export default function App() {
       setDetail((current) => current ? { ...current, pages: current.pages.map((page) => page.number === saved.number ? saved : page) } : current)
       setPageDraft(draftFromPage(saved))
       setDirty(false)
+      await loadDetail(detail.book.id, true)
       setNotice({ kind: 'success', text: `${sourceLabel(saved)} 已保存。` })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
@@ -672,7 +687,7 @@ export default function App() {
       const data = await api.exportBook(detail.book.id)
       const name = safeFilename(data.book.title)
       if (kind === 'json') downloadText(name + '.json', JSON.stringify(data, null, 2), 'application/json;charset=utf-8')
-      if (kind === 'html') downloadText(name + '.html', buildStandaloneHtml(data, printVersion), 'text/html;charset=utf-8')
+      if (kind === 'html') downloadText(name + '.html', buildStandaloneHtml(data, effectivePrintVersion && data.pages.some((page) => bindingPageSide(page) !== 'unknown')), 'text/html;charset=utf-8')
       setNotice({ kind: 'success', text: (kind === 'html' ? '独立 HTML' : 'JSON') + ' 已下载。' })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
@@ -749,22 +764,51 @@ export default function App() {
                   </section>
                 ) : view === 'organize' ? <ProjectOrganizer key={detail.book.id} bookId={detail.book.id} onConfirmed={confirmArrangement} onNotice={showNotice} disabled={processLocked} onDirtyChange={setOrganizerDirty} onBusyChange={setOrganizerBusy} />
                   : view === 'preview' ? <>
-                    <div className="preview-toolbar no-print">
-                      <div><p className="eyebrow">整书预览</p><h2>按已确认的编排阅读</h2><p>共 {detail.pages.length} 个源页面；长正文会按纸张尺寸自然跨页。</p><UsageView usage={detail.book.usage} /></div>
-                      <div className="preview-actions">
-                        <PaperSizeControl value={detail.book.paper_size ?? 'a4'} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
-                        <label className="print-version-control">
-                          <input type="checkbox" checked={printVersion} disabled={busy} onChange={(event) => setPrintVersion(event.target.checked)} aria-describedby="print-version-note" />
-                          <span><strong>打印版本</strong><small id="print-version-note">按源页识别的左右位置预留装订边距；无页脚、未知页侧和封面封底保持居中。</small></span>
-                        </label>
-                        <div className="button-row"><button onClick={() => void exportData('json')} disabled={busy}>下载 JSON</button><button onClick={() => void exportData('html')} disabled={busy}>下载独立 HTML</button><button className="primary" onClick={() => window.print()} disabled={busy}>打印 / 存为 PDF</button></div>
+                    <section className="preview-toolbar no-print" aria-labelledby="preview-title">
+                      <div className="preview-heading">
+                        <div><h2 id="preview-title">预览与导出</h2><p>{detail.pages.length} 页已编排 · 长正文按纸张自然分页</p></div>
+                        <div className="button-row export-buttons">
+                          <button onClick={() => void exportData('json')} disabled={busy}>下载 JSON</button>
+                          <button onClick={() => void exportData('html')} disabled={busy}>下载 HTML</button>
+                          <button className="primary" onClick={() => window.print()} disabled={busy}><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 8V3h10v5M7 17H4V9h16v8h-3M7 14h10v7H7zM17 11h.01" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>打印 / 存为 PDF</button>
+                        </div>
                       </div>
-                      <p className="export-limit">独立 HTML 不加载远程资源，公式以 MathML 保存，离线显示取决于浏览器数学字体。打印时请使用所选纸张，关闭浏览器页眉和页脚。{printVersion && <><br />长正文续页沿用源页版式。屏幕按源页展示，实际分页以打印预览为准。</>}</p>
-                    </div>
-                    <BookContent detail={detail} printVersion={printVersion} />
+                      <div className="preview-options">
+                        <PaperSizeControl value={detail.book.paper_size ?? 'a4'} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
+                        <div className="print-layout-option">
+                          <span className={`binding-preview${effectivePrintVersion ? ' is-bound' : ''}`} aria-hidden="true"><i /><i /></span>
+                          <label className="print-version-control">
+                            <span><strong>打印装订版</strong><small id="print-version-note">{bindingPageCount === 0
+                              ? '没有可用左右页信息，所有页面保持居中'
+                              : `${bindingPageCount}/${detail.pages.length} 页可用；${effectivePrintVersion ? '已按左右页预留装订边距' : '开启后按左右页预留装订边距'}，其他页仍居中`}</small></span>
+                            <input type="checkbox" role="switch" checked={effectivePrintVersion} disabled={busy || bindingPageCount === 0} onChange={(event) => setPrintVersion(event.target.checked)} aria-describedby="print-version-note" />
+                          </label>
+                        </div>
+                      </div>
+                      <div className="toolbar-footnotes">
+                        <details className="export-help"><summary>导出与打印说明</summary><p>HTML 可独立离线阅读，公式显示取决于浏览器数学字体。打印时请选择与成书一致的纸张，并关闭浏览器页眉和页脚。</p><p>装订版中，无页脚、未知页侧和封面封底仍居中。长正文续页沿用源页版式，实际分页以打印预览为准。</p></details>
+                        <ToolbarUsage usage={detail.book.usage} />
+                      </div>
+                    </section>
+                    <BookContent detail={detail} printVersion={effectivePrintVersion} />
                   </> : <>
-                    <div className="proofing-toolbar no-print"><div><p>{pendingPages.length ? `待处理 ${pendingPages.length} 页` : detail.pages.length ? '编排中的页面均已完成' : '编排暂无页面'}</p><UsageView usage={detail.book.usage} /></div><PaperSizeControl value={detail.book.paper_size ?? 'a4'} saving={layoutSaving} disabled={busy} onChange={savePaperSize} /><div className="button-row"><button onClick={() => changeView('organize')} disabled={processLocked}>修改页面编排</button>{pagesToProcess.length > 0 && <button onClick={() => void processPages(pagesToProcess)} className="primary" disabled={processLocked}>{isRunning ? '处理中…' : '识别未完成页'}</button>}{isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}</div></div>
-                    <div className="progress-track" aria-label={'编排已完成比例 ' + progress + '%'}><span style={{ width: progress + '%' }} /></div>
+                    <section className="proofing-toolbar no-print" aria-label="逐页校对工具栏">
+                      <div className="proofing-controls">
+                        <div className="proofing-status">
+                          <div className="proofing-status-title"><h2>{isRunning ? (detail.book.status === 'pausing' ? '正在暂停识别' : '正在逐页识别') : pendingPages.length ? `待识别 ${pendingPages.length} 页` : detail.pages.length ? '页面已全部识别' : '编排暂无页面'}</h2><span>{detail.book.completed_pages} / {detail.book.selected_page_count} 页</span></div>
+                          <div className="progress-track" role="progressbar" aria-label="已编排页面识别进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><span style={{ width: progress + '%' }} /></div>
+                          <p>{isRunning ? '已开始的页面会完成并保存结果' : pendingPages.length ? '识别完成后，可逐页检查并保存校对' : detail.pages.length ? '可继续校对，或进入整书预览' : '返回页面编排，加入需要识别的页面'}</p>
+                        </div>
+                        <PaperSizeControl value={detail.book.paper_size ?? 'a4'} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
+                        <div className="button-row proofing-actions">
+                          <button onClick={() => changeView('organize')} disabled={processLocked}>修改编排</button>
+                          {pagesToProcess.length > 0 && <button onClick={() => void processPages(pagesToProcess)} className="primary" disabled={processLocked}>{isRunning ? '处理中…' : '识别未完成页'}</button>}
+                          {isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}
+                          {!isRunning && detail.pages.length > 0 && pendingPages.length === 0 && <button className="primary" onClick={() => changeView('preview')} disabled={busy}>整书预览 <span aria-hidden="true">→</span></button>}
+                        </div>
+                      </div>
+                      <ToolbarUsage usage={detail.book.usage} />
+                    </section>
                     {detail.book.error && <div className="error-panel"><strong>处理失败</strong><span>{detail.book.error}</span></div>}
                     <div className="workspace-grid">
                       <aside className="page-rail" aria-label="已编排页面">{detail.pages.map((page, index) => <div className="page-row unconfirmed" key={page.number}><button className={page.number === selectedPageNumber ? 'page-link selected' : 'page-link'} onClick={() => choosePage(page)} disabled={busy} aria-current={page.number === selectedPageNumber ? 'page' : undefined}><span className="page-order-label">编排第 {index + 1} 页</span><span className="page-source-name" title={sourceLabel(page)}>{sourceLabel(page)}</span><span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></button></div>)}</aside>
@@ -774,7 +818,7 @@ export default function App() {
                         <div className="proofing-grid">
                           <section className="text-panel">
                             <div className="panel-title"><strong>本页校对</strong><button className="primary" onClick={savePage} disabled={!dirty || editLocked}>{saving ? '保存中…' : '保存本页'}</button></div>
-                            {editLocked && <div className="lock-note">{isRunning ? '处理运行中，本页暂不可编辑。' : '正在更新，本页暂不可编辑。'}</div>}
+                            {editLocked && <div className="lock-note">{sourcePage.status === 'processing' ? '本页正在识别，暂不可编辑；可切换到其他页面校对。' : '正在更新，本页暂不可编辑。'}</div>}
                             <PageEditor draft={pageDraft} onChange={(draft) => { setPageDraft(draft); setDirty(true) }} disabled={editLocked} />
                           </section>
                           <section className="render-panel">

@@ -149,10 +149,7 @@ class GeminiClient:
         data = await self._post(model, payload, on_attempt_start, on_attempt_end)
         response_text = self.extract_output_text(data)
         try:
-            parsed = json.loads(response_text)
-            if not isinstance(parsed, dict) or not set(PAGE_RESPONSE_SCHEMA["required"]).issubset(parsed):
-                raise ValueError("missing page fields")
-            result = StructuredPageResult.model_validate(parsed)
+            result = StructuredPageResult.from_model_response(json.loads(response_text))
         except (ValueError, ValidationError) as exc:
             raise ModelServiceError("模型返回的页面结构无效") from exc
         if result.cover_fields:

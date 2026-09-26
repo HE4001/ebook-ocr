@@ -85,6 +85,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     running: dict[str, asyncio.Task[None]] = {}
     pause_requests: dict[str, asyncio.Event] = {}
     pending_pages: dict[str, list[int]] = {}
+    manually_saved_pages: dict[str, set[int]] = {}
     uploading: set[str] = set()
     preview_lock = asyncio.Lock()
 
@@ -427,10 +428,12 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             storage.confirm_page_selection(book_id, numbers)
         processor = BookProcessor(storage)
         pause_requested = asyncio.Event()
+        manually_saved_pages[book_id] = set()
         storage.begin_book(book_id)
         task = asyncio.create_task(processor.process(
             book_id, settings, secrets.api_key, pause_requested, records,
             pending_pages=numbers,
+            manually_saved_pages=manually_saved_pages[book_id],
         ))
         running[book_id] = task
         pause_requests[book_id] = pause_requested
@@ -441,6 +444,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                 running.pop(book_id, None)
                 pause_requests.pop(book_id, None)
                 pending_pages.pop(book_id, None)
+                manually_saved_pages.pop(book_id, None)
             if not _task.cancelled():
                 _task.exception()
 
@@ -496,16 +500,26 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     @app.put("/api/books/{book_id}/pages/{number}", response_model=Page)
     async def save_page(book_id: str, number: int, update: PageUpdate) -> Page:
         ensure_arranged(ensure_book(book_id))
-        ensure_idle(book_id)
+        if book_id in uploading:
+            raise HTTPException(status_code=409, detail="项目正在上传，请稍后保存")
+        record = storage.get_page_record(book_id, number)
+        if record is None or not record["selected"]:
+            raise HTTPException(status_code=404, detail="页面不存在")
+        if record["status"] == "processing":
+            raise HTTPException(status_code=409, detail="本页正在识别，暂不能保存；可校对其他页面")
+        active = is_running(book_id)
         try:
             storage.save_manual_text(
                 book_id, number, update.text,
                 page_kind=update.page_kind, cover_fields=update.cover_fields,
+                processing=active,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="页面不存在") from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if active:
+            manually_saved_pages[book_id].add(number)
         pages = storage.get_pages(book_id)
         return next(page for page in pages if page.number == number)
 

@@ -1,8 +1,10 @@
+import { useLayoutEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { paperPrintCss, paperStyle } from './paper'
+import { bindingPageSide, paperPrintCss, paperStyle } from './paper'
+import { installDisplayMathFit } from './fitDisplayMath'
 import type { BookDetail, CoverField, MarginSegment, Page, PaperSize } from './types'
 
 function safeUrl(url: string): string {
@@ -10,9 +12,11 @@ function safeUrl(url: string): string {
   return /^(https?:\/\/|mailto:|#)/i.test(value) ? value : ''
 }
 
-export function Markdown({ text }: { text: string }) {
+export function Markdown({ text, paperSize = 'a4' }: { text: string; paperSize?: PaperSize }) {
+  const root = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => installDisplayMathFit(root.current!), [text, paperSize])
   return (
-    <div className="markdown-body">
+    <div ref={root} className="markdown-body">
       <ReactMarkdown
         skipHtml
         remarkPlugins={[remarkGfm, remarkMath]}
@@ -69,13 +73,13 @@ function CoverContent({ fields }: { fields: CoverField[] }) {
 }
 
 export function PageContent({ page, text = page.text, paperSize = 'a4' }: { page: Page; text?: string; paperSize?: PaperSize }) {
-  const pageSide = page.page_kind === 'content' && page.footer_segments.length > 0 ? page.page_side ?? 'unknown' : 'unknown'
+  const pageSide = bindingPageSide(page)
   return <div className="book-page-entry" style={paperStyle(paperSize)} data-page-side={pageSide}>
     <div className="book-page-number">{page.source_filename} · 第 {page.source_page} 页</div>
     <section className={`book-page book-page-${page.page_kind}`} data-page={page.number} aria-label={`${page.source_filename} 第 ${page.source_page} 页排版`}>
       {page.page_kind === 'content' ? <>
         <MarginContent segments={page.header_segments} placement="header" />
-        <div className="page-body">{text && <Markdown text={text} />}</div>
+        <div className="page-body">{text && <Markdown text={text} paperSize={paperSize} />}</div>
         <MarginContent segments={page.footer_segments} placement="footer" />
       </> : <CoverContent fields={page.cover_fields} />}
     </section>

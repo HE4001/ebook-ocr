@@ -384,7 +384,7 @@ try {
                 }
                 exit 0
             }
-            throw "This project already has a tracked launcher process. Run stop.bat before starting again."
+            throw "This project already has a tracked launcher process. Run ocr.bat Restart to restart it."
         }
     }
 

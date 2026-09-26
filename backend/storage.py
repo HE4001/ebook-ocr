@@ -555,6 +555,7 @@ class Storage:
     def save_manual_text(
         self, book_id: str, number: int, text: str, *,
         page_kind: PageKind | None = None, cover_fields: list[CoverField] | None = None,
+        processing: bool = False,
     ) -> None:
         with self._connect() as connection:
             page = connection.execute(
@@ -587,7 +588,7 @@ class Storage:
                 "WHERE book_id = ? AND number = ?",
                 (text, kind, page_side, fields_json, header_json, footer_json, book_id, number),
             )
-        self.refresh_book(book_id, processing=False)
+        self.refresh_book(book_id, processing=processing)
 
     def refresh_book(self, book_id: str, processing: bool) -> None:
         with self._connect() as connection:

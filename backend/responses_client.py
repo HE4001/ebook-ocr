@@ -119,7 +119,7 @@ class ResponsesClient:
         data = await self._post(payload, on_attempt_start, on_attempt_end)
         response_text = self.extract_output_text(data)
         try:
-            result = StructuredPageResult.model_validate(json.loads(response_text))
+            result = StructuredPageResult.from_model_response(json.loads(response_text))
         except (ValueError, ValidationError) as exc:
             raise ModelServiceError("模型返回的页面结构无效") from exc
         if result.cover_fields:

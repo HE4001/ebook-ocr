@@ -310,6 +310,31 @@ class StructuredPageResult(BaseModel):
     body_markdown: str = Field(max_length=1_000_000)
     footer_segments: list[MarginSegment] = Field(max_length=100)
 
+    @classmethod
+    def from_model_response(cls, value: object) -> "StructuredPageResult":
+        """新模型响应必须显式提供字段；存量数据仍可使用兼容默认值。"""
+        required = cls.model_fields.keys() - {"cover_fields"}
+        if not isinstance(value, dict) or not required.issubset(value):
+            raise ValueError("模型页面结构缺少必填字段")
+        for name in ("header_segments", "footer_segments"):
+            segments = value[name]
+            if isinstance(segments, list):
+                for segment in segments:
+                    if not isinstance(segment, dict) or not MarginSegment.model_fields.keys() <= segment.keys():
+                        raise ValueError("模型页眉页脚缺少必填字段")
+        result = cls.model_validate(value)
+        if result.page_kind == "content":
+            footer = [segment for segment in result.footer_segments if segment.text.strip()]
+            page_numbers = [segment for segment in footer if segment.kind == "page_number"]
+            alignments = {segment.alignment for segment in (page_numbers or footer)}
+            if alignments == {"left"}:
+                result.page_side = "left"
+            elif alignments == {"right"}:
+                result.page_side = "right"
+            else:
+                result.page_side = "unknown"
+        return result
+
     @model_validator(mode="after")
     def validate_length(self) -> "StructuredPageResult":
         if self.page_kind == "content":

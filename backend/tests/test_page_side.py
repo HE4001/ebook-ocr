@@ -23,6 +23,72 @@ def content(side="unknown", footer=None):
 
 
 class PageSideTests(unittest.TestCase):
+    def test_new_model_response_side_follows_footer_evidence(self):
+        def segment(alignment, kind="page_number", text="12"):
+            return MarginSegment(kind=kind, text=text, alignment=alignment).model_dump()
+
+        cases = [
+            ("unknown with left number", "unknown", [segment("left")], "left"),
+            ("unknown with right number", "unknown", [segment("right")], "right"),
+            ("wrong left", "left", [segment("right")], "right"),
+            ("wrong right", "right", [segment("left")], "left"),
+            ("number before other text", "left",
+             [segment("left", "text"), segment("right"), segment("center", "text")], "right"),
+            ("centered number blocks fallback", "right",
+             [segment("center"), segment("right", "text")], "unknown"),
+            ("conflicting numbers", "left", [segment("left"), segment("right")], "unknown"),
+            ("number with center conflict", "left", [segment("left"), segment("center")], "unknown"),
+            ("numbers on one side", "unknown", [segment("left"), segment("left")], "left"),
+            ("left text without number", "unknown", [segment("left", "text")], "left"),
+            ("right texts without number", "left",
+             [segment("right", "text"), segment("right", "text")], "right"),
+            ("center text without number", "right", [segment("center", "text")], "unknown"),
+            ("mixed text positions", "left",
+             [segment("left", "text"), segment("right", "text")], "unknown"),
+            ("center text blocks fallback", "right",
+             [segment("right", "text"), segment("center", "text")], "unknown"),
+            ("blank number ignored", "right",
+             [segment("right", text=" \t"), segment("left", "text")], "left"),
+            ("blank text ignored", "unknown",
+             [segment("left", "text", " "), segment("right")], "right"),
+            ("blank footer", "left", [segment("left", text=" ")], "unknown"),
+            ("no footer", "right", [], "unknown"),
+        ]
+        for name, reported, footer, expected in cases:
+            with self.subTest(name=name):
+                payload = {"page_kind": "content", "page_side": reported,
+                           "header_segments": [segment("right")], "body_markdown": "正文",
+                           "footer_segments": footer}
+                result = StructuredPageResult.from_model_response(payload)
+                self.assertEqual(result.page_side, expected)
+                self.assertEqual([item.model_dump() for item in result.footer_segments], footer)
+                self.assertEqual(payload["page_side"], reported)
+
+    def test_new_model_response_side_never_uses_number_parity(self):
+        for text in ("5", "6", "· 12 ·", "iv"):
+            for position in ("left", "right", "center"):
+                with self.subTest(text=text, position=position):
+                    footer = MarginSegment(kind="page_number", text=text, alignment=position)
+                    result = StructuredPageResult.from_model_response({
+                        "page_kind": "content", "page_side": "unknown", "header_segments": [],
+                        "body_markdown": "正文", "footer_segments": [footer.model_dump()],
+                    })
+                    self.assertEqual(result.page_side, position if position != "center" else "unknown")
+
+    def test_new_response_normalization_does_not_reinterpret_legacy_results(self):
+        payload = {"page_kind": "content", "page_side": "unknown", "header_segments": [],
+                   "body_markdown": "正文", "footer_segments": [
+                       MarginSegment(kind="page_number", text="12", alignment="left").model_dump()]}
+        self.assertEqual(StructuredPageResult.model_validate(payload).page_side, "unknown")
+        self.assertEqual(StructuredPageResult.from_model_response(payload).page_side, "left")
+        for kind in ("front_cover", "back_cover"):
+            with self.subTest(kind=kind):
+                result = StructuredPageResult.from_model_response({
+                    "page_kind": kind, "page_side": "right", "header_segments": [],
+                    "body_markdown": "", "footer_segments": [],
+                })
+                self.assertEqual(result.page_side, "unknown")
+
     def test_schema_and_unknown_boundaries(self):
         self.assertIn("page_side", PAGE_RESPONSE_SCHEMA["required"])
         self.assertEqual(PAGE_RESPONSE_SCHEMA["properties"]["page_side"]["enum"],
