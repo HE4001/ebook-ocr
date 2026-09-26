@@ -12,6 +12,7 @@ $script:BackendErr = Join-Path $script:LauncherDir "backend.err.log"
 $script:FrontendOut = Join-Path $script:LauncherDir "frontend.out.log"
 $script:FrontendErr = Join-Path $script:LauncherDir "frontend.err.log"
 $script:StartedEntries = @()
+. (Join-Path $PSScriptRoot "launcher-processes.ps1")
 
 function Get-RuntimeRoot {
     $profileRoot = $env:USERPROFILE
@@ -154,22 +155,6 @@ function Install-BackendDependencies {
     }
 }
 
-function Get-ListeningPids {
-    param([int]$Port)
-
-    $pids = @()
-    try {
-        $pids = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess)
-    } catch {
-        foreach ($line in @(netstat -ano -p tcp 2>$null)) {
-            if ($line -match "^\s*TCP\s+\S+:$Port\s+\S+\s+LISTENING\s+(\d+)\s*$") {
-                $pids += [int]$Matches[1]
-            }
-        }
-    }
-    return @($pids | ForEach-Object { [int]$_ } | Select-Object -Unique)
-}
-
 function Test-TrackedProcess {
     param([object]$Entry, [string]$Root)
 
@@ -227,7 +212,14 @@ function Save-LauncherState {
 function Stop-VerifiedEntries {
     param([object[]]$Entries)
 
+    $stopEntries = @()
     foreach ($entry in @($Entries)) {
+        if ($null -ne $entry) {
+            $stopEntries += Get-ProjectListenerEntry $entry.role $script:Root
+            $stopEntries += $entry
+        }
+    }
+    foreach ($entry in $stopEntries) {
         if ($null -eq $entry -or $null -eq $entry.pid) {
             continue
         }
@@ -367,6 +359,18 @@ try {
     }
 
     $state = Read-LauncherState
+    $backendListener = Get-ProjectListenerEntry "backend" $script:Root
+    $frontendListener = Get-ProjectListenerEntry "frontend" $script:Root
+    if ($null -ne $backendListener -or $null -ne $frontendListener) {
+        # Recover missing/stale records and track the actual listener, including
+        # the child interpreter created by Windows venv's python.exe launcher.
+        if ($null -ne $state -and [string]::Equals([string]$state.root, $script:Root, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($null -eq $backendListener -and (Test-TrackedProcess $state.backend $script:Root)) { $backendListener = $state.backend }
+            if ($null -eq $frontendListener -and (Test-TrackedProcess $state.frontend $script:Root)) { $frontendListener = $state.frontend }
+        }
+        Save-LauncherState $backendListener $frontendListener
+        $state = Read-LauncherState
+    }
     $trackedBackend = $false
     $trackedFrontend = $false
     if ($null -ne $state -and [string]::Equals([string]$state.root, $script:Root, [StringComparison]::OrdinalIgnoreCase)) {
@@ -446,7 +450,7 @@ try {
         Stop-VerifiedEntries $script:StartedEntries
     }
     $stateAfterFailure = Read-LauncherState
-    if ($null -ne $stateAfterFailure -and [string]::Equals([string]$stateAfterFailure.root, $script:Root, [StringComparison]::OrdinalIgnoreCase)) {
+    if ($script:StartedEntries.Count -gt 0 -and $null -ne $stateAfterFailure -and [string]::Equals([string]$stateAfterFailure.root, $script:Root, [StringComparison]::OrdinalIgnoreCase)) {
         Remove-Item -LiteralPath $script:StateFile -Force -ErrorAction SilentlyContinue
     }
     exit 1

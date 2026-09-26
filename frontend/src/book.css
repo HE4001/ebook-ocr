@@ -18,19 +18,40 @@ body { margin: 0; }
   font: 16px/1.75 SimSun, "Songti SC", serif;
 }
 .page-body { flex: 1 0 auto; }
-.page-margin { display: flex; flex-direction: column; gap: .15em; white-space: pre-wrap; line-height: 1.45; color: #4f4c47; }
+.page-margin { display: flex; flex-direction: column; white-space: pre-wrap; line-height: 1.45; color: #4f4c47; }
 .page-margin-header { margin-bottom: 1.8em; }
 .page-margin-footer { margin-top: 1.8em; }
-.margin-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .55em; }
-.margin-slot { display: flex; flex-wrap: wrap; align-content: start; gap: 0 .45em; min-width: 0; }
-.margin-slot-left { justify-content: flex-start; text-align: left; }
-.margin-slot-center { justify-content: center; text-align: center; }
-.margin-slot-right { justify-content: flex-end; text-align: right; }
-.margin-segment { min-width: 0; }
+.margin-row { min-height: 1.45em; }
+.margin-row-centered,.margin-row-edges { display: grid; align-items: start; column-gap: .6em; }
+.margin-row-centered { grid-template-columns: minmax(0, 1fr) fit-content(50%) minmax(0, 1fr); }
+.margin-row-edges { grid-template-columns: minmax(0, max-content) minmax(0, max-content); justify-content: space-between; }
+.margin-slot { min-width: 0; grid-row: 1; }
+.margin-slot-left { grid-column: 1; text-align: left; }
+.margin-slot-center { grid-column: 2; text-align: center; }
+.margin-slot-right { grid-column: 3; text-align: right; }
+.margin-row-edges .margin-slot-right { grid-column: 2; }
+.margin-segment + .margin-segment::before { content: "\2002"; }
 .margin-size-small { font-size: .8em; }
 .margin-size-normal { font-size: 1em; }
 .margin-bold { font-weight: 700; }
 .margin-italic { font-style: italic; }
+.cover-content { display: flex; flex: 1; flex-direction: column; gap: 3rem; padding-block: 4rem 1rem; text-align: center; }
+.cover-content p { margin: 0; white-space: pre-wrap; }
+.cover-content p + p { margin-top: .85em; }
+.cover-heading,.cover-credits,.cover-publication { break-inside: avoid; }
+.cover-heading { margin-top: 2rem; }
+.cover-field-title { font: 700 2.4em/1.4 "Noto Serif CJK SC", "Songti SC", SimSun, serif; }
+.cover-field-subtitle { font-size: 1.2em; line-height: 1.65; }
+.cover-field-series { font-size: .88em; }
+.cover-credits { line-height: 1.8; }
+.cover-publication { margin-top: auto; padding-top: 2rem; font-size: .9em; line-height: 1.65; }
+.cover-field-isbn { font-size: .9em; font-variant-numeric: tabular-nums; }
+.book-page-back_cover .cover-content { justify-content: flex-end; gap: 1.8rem; padding-block: 3rem 1.5rem; text-align: left; }
+.book-page-back_cover .cover-heading { margin-top: auto; }
+.book-page-back_cover .cover-field-title { font-size: 1.35em; }
+.book-page-back_cover .cover-field-subtitle { font-size: 1em; }
+.book-page-back_cover .cover-credits { font-size: .92em; }
+.book-page-back_cover .cover-publication { margin-top: 0; padding-top: 0; }
 .markdown-body h1,.markdown-body h2,.markdown-body h3,.markdown-body h4,.markdown-body h5,.markdown-body h6 { line-height: 1.35; margin: 1.5em 0 .6em; break-after: avoid; }
 .markdown-body h1 { font-size: 1.8em; }
 .markdown-body h2 { font-size: 1.5em; }

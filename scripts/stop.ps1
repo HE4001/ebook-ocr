@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 $script:Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $script:LauncherDir = Join-Path $script:Root ".cache\launcher"
 $script:StateFile = Join-Path $script:LauncherDir "pids.json"
+. (Join-Path $PSScriptRoot "launcher-processes.ps1")
 
 function Test-TrackedProcess {
     param([object]$Entry)
@@ -33,16 +34,16 @@ function Test-TrackedProcess {
 }
 
 try {
-    if (-not (Test-Path -LiteralPath $script:StateFile -PathType Leaf)) {
-        Write-Host "No launcher state was found; no processes were stopped."
-        exit 0
+    $state = $null
+    if (Test-Path -LiteralPath $script:StateFile -PathType Leaf) {
+        try { $state = Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json } catch { $state = $null }
     }
-    $state = Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json
-    if (-not [string]::Equals([string]$state.root, $script:Root, [StringComparison]::OrdinalIgnoreCase)) {
+    if ($null -ne $state -and -not [string]::Equals([string]$state.root, $script:Root, [StringComparison]::OrdinalIgnoreCase)) {
         throw "The launcher state belongs to a different project directory; no process was stopped."
     }
 
-    $entries = @($state.backend, $state.frontend)
+    # Stop verified listeners before their recorded launcher parents.
+    $entries = @((Get-ProjectListenerEntry "backend" $script:Root), (Get-ProjectListenerEntry "frontend" $script:Root), $state.backend, $state.frontend)
     foreach ($entry in $entries) {
         if ($null -eq $entry -or $null -eq $entry.pid) {
             continue
@@ -54,7 +55,7 @@ try {
             Write-Host ("Did not stop PID {0}: it is gone or no longer matches this project." -f $entry.pid)
         }
     }
-    Remove-Item -LiteralPath $script:StateFile -Force
+    if (Test-Path -LiteralPath $script:StateFile) { Remove-Item -LiteralPath $script:StateFile -Force }
     Write-Host "Project launcher state cleared."
     exit 0
 } catch {

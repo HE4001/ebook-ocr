@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
 
 SectionType = Literal[
@@ -13,6 +13,11 @@ SectionType = Literal[
 ]
 PageStatus = Literal["uploaded", "processing", "ready", "failed", "interrupted"]
 BookStatus = PageStatus | Literal["pausing", "paused"]
+PageKind = Literal["content", "front_cover", "back_cover"]
+CoverFieldKind = Literal[
+    "title", "subtitle", "author", "translator", "editor", "publisher",
+    "series", "edition", "publication_year", "isbn",
+]
 
 
 class Usage(BaseModel):
@@ -28,6 +33,10 @@ class Book(BaseModel):
     filename: str
     status: BookStatus
     page_count: int
+    file_count: int = 1
+    upload_confirmed: bool = True
+    selection_confirmed: bool
+    selected_page_count: int
     completed_pages: int
     error: str | None
     created_at: str
@@ -45,37 +54,99 @@ class MarginSegment(BaseModel):
     italic: bool = False
 
 
+class CoverField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: CoverFieldKind
+    text: str = Field(max_length=50_000)
+
+
 class Page(BaseModel):
     number: int
+    source_id: str = "legacy"
+    source_filename: str = ""
+    source_page: int = 1
     status: PageStatus
     error: str | None
     text: str
+    page_kind: PageKind = "content"
+    cover_fields: list[CoverField] = Field(default_factory=list)
     header_segments: list[MarginSegment]
     footer_segments: list[MarginSegment]
     usage: Usage
     attempts: int
 
 
+class SourceFile(BaseModel):
+    id: str
+    filename: str
+    kind: Literal["pdf", "image"]
+    page_count: int
+    position: int
+    parent_id: str | None = None
+
+
 class BookDetail(BaseModel):
     book: Book
+    files: list[SourceFile] = Field(default_factory=list)
     pages: list[Page]
+
+
+class Arrangement(BookDetail):
+    order: list[int]
+
+
+class ProjectCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("项目名称不能为空")
+        return value.strip()
+
+
+class ArrangementUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_order: list[str] = Field(min_length=1)
+    page_order: list[StrictInt] = Field(min_length=1)
+    file_parents: dict[str, str | None] | None = None
 
 
 class PageUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(max_length=1_000_000)
+    page_kind: PageKind | None = None
+    cover_fields: list[CoverField] | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_page_content(self) -> "PageUpdate":
+        for field in ("page_kind", "cover_fields"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} 不能为 null")
+        if self.page_kind == "content" and self.cover_fields:
+            raise ValueError("正文页不能包含封面书目信息")
+        if self.page_kind in {"front_cover", "back_cover"} and self.text:
+            raise ValueError("封面和封底不能包含正文")
+        if len(self.text) + sum(len(field.text) for field in self.cover_fields or []) > 1_000_000:
+            raise ValueError("页面文本过长")
+        return self
 
 
 class SettingsOut(BaseModel):
     base_url: str
     responses_path: str
+    models_path: str
     extraction_model: str
     reasoning_effort: str
     classification_model: str
     has_api_key: bool
     structured_output: bool
     timeout_seconds: int
-    max_output_tokens: int
+    processing_concurrency: StrictInt = Field(default=10, ge=1)
+    context_reuse_enabled: StrictBool = False
+    context_reuse_max_pages: StrictInt = Field(default=10, ge=1, le=10)
 
 
 class SettingsUpdate(BaseModel):
@@ -83,6 +154,7 @@ class SettingsUpdate(BaseModel):
 
     base_url: str | None = None
     responses_path: str | None = None
+    models_path: str | None = None
     extraction_model: str | None = Field(default=None, max_length=200)
     reasoning_effort: str | None = Field(default=None, max_length=200)
     classification_model: str | None = Field(default=None, max_length=200)
@@ -90,7 +162,9 @@ class SettingsUpdate(BaseModel):
     clear_api_key: bool = False
     structured_output: bool | None = None
     timeout_seconds: int | None = Field(default=None, ge=5, le=600)
-    max_output_tokens: int | None = Field(default=None, gt=0, strict=True)
+    processing_concurrency: StrictInt | None = Field(default=None, ge=1)
+    context_reuse_enabled: StrictBool | None = None
+    context_reuse_max_pages: StrictInt | None = Field(default=None, ge=1, le=10)
 
     @field_validator("base_url")
     @classmethod
@@ -110,7 +184,7 @@ class SettingsUpdate(BaseModel):
             raise ValueError("API 根地址必须是无凭据、查询或片段的 http(s) 地址")
         return value
 
-    @field_validator("responses_path")
+    @field_validator("responses_path", "models_path")
     @classmethod
     def validate_responses_path(cls, value: str | None) -> str | None:
         if value is None:
@@ -120,11 +194,11 @@ class SettingsUpdate(BaseModel):
             return ""
         parsed = urlsplit(value)
         if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
-            raise ValueError("Responses 接入路径必须是相对路径")
+            raise ValueError("接入路径必须是相对路径")
         if not value.startswith("/"):
             value = "/" + value
         if any(part == ".." for part in value.split("/")):
-            raise ValueError("Responses 接入路径不能包含 ..")
+            raise ValueError("接入路径不能包含 ..")
         return value
 
     @field_validator("extraction_model", "classification_model", "reasoning_effort")
@@ -136,6 +210,30 @@ class SettingsUpdate(BaseModel):
 class ConnectionTestResult(BaseModel):
     ok: bool
     message: str
+
+
+class ModelsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    models_path: str
+    api_key: str | None = Field(default=None, max_length=10_000)
+    clear_api_key: bool = False
+    timeout_seconds: int = Field(ge=5, le=600)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        return SettingsUpdate.validate_base_url(value)
+
+    @field_validator("models_path")
+    @classmethod
+    def validate_models_path(cls, value: str) -> str:
+        return SettingsUpdate.validate_responses_path(value)
+
+
+class ModelsResult(BaseModel):
+    models: list[str]
 
 
 class ProcessResult(BaseModel):
@@ -151,6 +249,11 @@ class ProcessRequest(BaseModel):
         if "pages" in self.model_fields_set and self.pages is None:
             raise ValueError("pages 必须是非空页码列表")
         return self
+
+
+class PagesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    pages: list[StrictInt] = Field(min_length=1)
 
 
 class PauseResult(BaseModel):
@@ -176,15 +279,22 @@ class PageResult(BaseModel):
 
 class StructuredPageResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    page_kind: PageKind = "content"
+    cover_fields: list[CoverField] = Field(default_factory=list, max_length=100)
     header_segments: list[MarginSegment] = Field(max_length=100)
     body_markdown: str = Field(max_length=1_000_000)
     footer_segments: list[MarginSegment] = Field(max_length=100)
 
     @model_validator(mode="after")
     def validate_length(self) -> "StructuredPageResult":
+        if self.page_kind == "content":
+            if self.cover_fields:
+                raise ValueError("正文页不能包含封面书目信息")
+        elif self.body_markdown or self.header_segments or self.footer_segments:
+            raise ValueError("封面和封底只能包含书目信息")
         total = len(self.body_markdown) + sum(
             len(segment.text) for segment in self.header_segments + self.footer_segments
-        )
+        ) + sum(len(field.text) for field in self.cover_fields)
         if total > 1_000_000:
             raise ValueError("页面文本过长")
         return self

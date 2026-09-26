@@ -2,32 +2,47 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 from pathlib import Path
 from typing import Any
 
-from .importers import ensure_pdf_pages
+from .importers import prepare_source_page
 from .models import StructuredPageResult
-from .prompts import PAGE_AGENT_PROMPT, page_context
+from .prompts import PAGE_AGENT_PROMPT, PAGE_CONTEXT_AGENT_PROMPT, page_context
 from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig
 from .storage import Storage
 
 
-class PageAgent:
-    """单页、单次 Responses 请求；不携带相邻页面或历史对话。"""
+_render_lock = threading.Lock()
 
-    def __init__(self, client: ResponsesClient, storage: Storage):
+
+def _prepare_page(book_dir: Path, record: dict[str, Any]) -> tuple[int, int, str]:
+    # PyMuPDF cannot render concurrently, including across different projects.
+    with _render_lock:
+        return prepare_source_page(book_dir, record)
+
+
+class PageAgent:
+    """每次只提交当前页；实验模式的历史由组内 client 管理。"""
+
+    def __init__(
+        self, client: ResponsesClient, storage: Storage, context_reuse_enabled: bool = False,
+    ):
         self.client = client
         self.storage = storage
+        self.prompt = PAGE_CONTEXT_AGENT_PROMPT if context_reuse_enabled else PAGE_AGENT_PROMPT
 
     async def run(
         self, book_id: str, number: int, total: int, filename: str,
-        model: str, image_path: Path,
+        model: str, image_path: Path, source_page: int | None = None,
     ) -> StructuredPageResult:
-        image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        image_data = await asyncio.to_thread(
+            lambda: base64.b64encode(image_path.read_bytes()).decode("ascii")
+        )
         input_value = [
-            {"role": "system", "content": [{"type": "input_text", "text": PAGE_AGENT_PROMPT}]},
+            {"role": "system", "content": [{"type": "input_text", "text": self.prompt}]},
             {"role": "user", "content": [
-                {"type": "input_text", "text": page_context(filename, number, total)},
+                {"type": "input_text", "text": page_context(filename, source_page or number, total)},
                 {"type": "input_image", "image_url": f"data:image/png;base64,{image_data}",
                  "detail": "high"},
             ]},
@@ -49,53 +64,88 @@ class BookProcessor:
         self, book_id: str, settings: dict[str, Any], api_key: str,
         pause_requested: asyncio.Event | None = None,
         records: list[dict[str, Any]] | None = None,
+        pending_pages: list[int] | None = None,
     ) -> None:
-        client = ResponsesClient(ResponsesConfig(
+        context_reuse_enabled = settings.get("context_reuse_enabled", False)
+        group_size = settings.get("context_reuse_max_pages", 10) if context_reuse_enabled else 1
+        concurrency = settings.get("processing_concurrency", 10)
+        config = ResponsesConfig(
             base_url=settings["base_url"],
             responses_path=settings["responses_path"],
             api_key=api_key,
             structured_output=settings["structured_output"],
             timeout_seconds=settings["timeout_seconds"],
-            max_output_tokens=settings["max_output_tokens"],
             reasoning_effort=settings["reasoning_effort"],
-        ))
+            context_reuse_enabled=context_reuse_enabled,
+        )
         if pause_requested is None or not pause_requested.is_set():
             self.storage.begin_book(book_id)
-        if records is None:
-            records = self.storage.get_page_records(book_id)
-        book = self.storage.get_book(book_id)
-        assert book is not None
-        current_number: int | None = None
+        if pending_pages is None:
+            if records is None:
+                records = self.storage.get_page_records(book_id)
+            pending_pages = [record["number"] for record in records]
+        book_dir = self.storage.books_root / book_id
+        reserved_pages: dict[int, list[int]] = {}
+
+        def paused() -> bool:
+            return pause_requested is not None and pause_requested.is_set()
+
+        async def worker() -> None:
+            while pending_pages:
+                if paused():
+                    return
+                # Reserve consecutive pages before yielding so each session follows
+                # the arranged order, rather than alternating pages between workers.
+                group = pending_pages[:group_size]
+                del pending_pages[:group_size]
+                reserved_pages.update((number, group) for number in group)
+                client = ResponsesClient(config)
+                agent = PageAgent(client, self.storage, context_reuse_enabled)
+                for number in group:
+                    if paused():
+                        return
+                    if reserved_pages.get(number) is not group:
+                        continue
+                    reserved_pages.pop(number)
+                    record = self.storage.get_page_record(book_id, number)
+                    # A removed and re-added page belongs to its new queue position.
+                    if number in pending_pages or record is None or not record["selected"]:
+                        continue
+                    try:
+                        self.storage.set_page_status(book_id, number, "processing")
+                        width, height, image_name = await asyncio.to_thread(
+                            _prepare_page, book_dir, record
+                        )
+                        self.storage.update_page_image(book_id, number, width, height, image_name)
+                        result = await agent.run(
+                            book_id, number, record["source_page_count"], record["source_filename"],
+                            settings["extraction_model"], book_dir / image_name, record["source_page"],
+                        )
+                        self.storage.save_page_result(book_id, number, result)
+                    except (ModelServiceError, ValueError, OSError) as exc:
+                        self.storage.fail_page(book_id, number, _safe_error(exc))
+                        if context_reuse_enabled:
+                            client.reset_context()
+                    except asyncio.CancelledError:
+                        self.storage.interrupt_page(book_id, number)
+                        raise
+
         try:
-            completed = 0
-            for record in records:
-                if pause_requested is not None and pause_requested.is_set():
-                    break
-                current_number = record["number"]
-                try:
-                    self.storage.set_page_status(book_id, current_number, "processing")
-                    book_dir = self.storage.books_root / book_id
-                    if book.filename.lower().endswith(".pdf"):
-                        single_page = book_dir / f"page-{current_number:04d}.pdf"
-                        if not single_page.is_file():
-                            await asyncio.to_thread(ensure_pdf_pages, book_dir, [current_number])
-                    result = await PageAgent(client, self.storage).run(
-                        book_id, current_number, book.page_count, book.filename,
-                        settings["extraction_model"], book_dir / record["image_name"],
-                    )
-                    self.storage.save_page_result(book_id, current_number, result)
-                except (ModelServiceError, ValueError, OSError) as exc:
-                    self.storage.fail_page(book_id, current_number, _safe_error(exc))
-                completed += 1
-            if pause_requested is not None and pause_requested.is_set() and completed < len(records):
+            async with asyncio.TaskGroup() as tasks:
+                for _ in range(min(concurrency, len(pending_pages))):
+                    tasks.create_task(worker())
+        except BaseException:
+            self.storage.finish_book(book_id)
+            raise
+        else:
+            if (paused()
+                    and (pending_pages or any(
+                        page["number"] in reserved_pages or page["status"] != "ready"
+                        for page in self.storage.get_page_records(book_id)
+                    ))):
                 self.storage.pause_book(book_id)
             else:
                 self.storage.finish_book(book_id)
-        except asyncio.CancelledError:
-            if current_number is not None:
-                self.storage.interrupt_page(book_id, current_number)
-            self.storage.finish_book(book_id)
-            raise
 
 
 def _safe_error(exc: Exception) -> str:

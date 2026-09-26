@@ -14,26 +14,49 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from .importers import ImportFailure, import_document
+from .importers import ImportFailure, import_document, prepare_source_preview
 from .models import (
+    Arrangement,
+    ArrangementUpdate,
     Book,
     BookDetail,
     ConnectionTestResult,
+    ModelsRequest,
+    ModelsResult,
     Page,
     PageUpdate,
+    PagesRequest,
     PauseResult,
     ProcessRequest,
     ProcessResult,
+    ProjectCreate,
     SettingsOut,
     SettingsUpdate,
 )
 from .pipeline import BookProcessor
-from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig
+from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig, fetch_models
 from .storage import Storage
 
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 ASSET_NAME = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+COVER_FIELD_LABELS = {
+    "title": "书名", "subtitle": "副标题", "author": "作者", "translator": "译者",
+    "editor": "编者", "publisher": "出版社", "series": "丛书", "edition": "版本",
+    "publication_year": "出版年份", "isbn": "ISBN",
+}
+
+
+def _page_markdown(page: Page) -> str:
+    if page.page_kind == "content":
+        return page.text
+    label = "封面" if page.page_kind == "front_cover" else "封底"
+    lines = []
+    for field in page.cover_fields:
+        text = re.sub(r"([\\`*{}\[\]()#+\-.!_<>|$~&])", r"\\\1", field.text)
+        lines.append(f"**{COVER_FIELD_LABELS[field.kind]}**：{text}")
+    fields = "\n\n".join(lines)
+    return f"### {label}\n\n{fields}".rstrip()
 
 
 class RuntimeSecrets:
@@ -58,6 +81,9 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     secrets = RuntimeSecrets()
     running: dict[str, asyncio.Task[None]] = {}
     pause_requests: dict[str, asyncio.Event] = {}
+    pending_pages: dict[str, list[int]] = {}
+    uploading: set[str] = set()
+    preview_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -97,6 +123,43 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="书籍不存在")
         return book
 
+    def is_running(book_id: str) -> bool:
+        task = running.get(book_id)
+        return task is not None and not task.done()
+
+    def book_detail(book_id: str) -> BookDetail:
+        return BookDetail(book=ensure_book(book_id), files=storage.get_files(book_id), pages=storage.get_pages(book_id))
+
+    def arrangement(book_id: str) -> Arrangement:
+        return Arrangement(
+            book=ensure_book(book_id), files=storage.get_files(book_id),
+            pages=storage.get_pages(book_id, all_pages=True),
+            order=[page.number for page in storage.get_pages(book_id)],
+        )
+
+    def ensure_idle(book_id: str) -> None:
+        if is_running(book_id) or book_id in uploading:
+            raise HTTPException(status_code=409, detail="项目正在处理或上传，请稍后操作")
+
+    def ensure_arranged(book: Book) -> None:
+        if not book.upload_confirmed or not book.selection_confirmed:
+            raise HTTPException(status_code=409, detail="请先确认上传并完成页面编排")
+
+    async def read_upload(file: UploadFile) -> tuple[str, bytes]:
+        filename = Path(file.filename or "").name
+        if not filename or len(filename) > 255:
+            raise HTTPException(status_code=400, detail="文件名为空或过长")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := await file.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="每个文件不能超过 100 MB")
+            chunks.append(chunk)
+        if not size:
+            raise HTTPException(status_code=400, detail="文件为空")
+        return filename, b"".join(chunks)
+
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -125,6 +188,28 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             secrets.api_key = new_api_key
         return settings_response()
 
+    @app.post("/api/settings/models", response_model=ModelsResult)
+    async def list_models(request: ModelsRequest) -> ModelsResult:
+        api_key = (request.api_key or "").strip()
+        if not api_key and not request.clear_api_key:
+            settings = storage.get_settings()
+            saved_base_url = SettingsUpdate.validate_base_url(settings["base_url"])
+            if request.base_url != saved_base_url:
+                raise HTTPException(status_code=400, detail="API 根地址已改变，请输入此地址的 API 密钥")
+            api_key = secrets.api_key
+        if not api_key:
+            raise HTTPException(status_code=400, detail="请先输入 API 密钥")
+        try:
+            models = await fetch_models(
+                base_url=request.base_url,
+                models_path=request.models_path,
+                api_key=api_key,
+                timeout_seconds=request.timeout_seconds,
+            )
+        except ModelServiceError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return ModelsResult(models=models)
+
     @app.post("/api/settings/test", response_model=ConnectionTestResult)
     async def test_settings() -> ConnectionTestResult:
         settings = storage.get_settings()
@@ -140,7 +225,6 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                 api_key=secrets.api_key,
                 structured_output=settings["structured_output"],
                 timeout_seconds=settings["timeout_seconds"],
-                max_output_tokens=settings["max_output_tokens"],
                 reasoning_effort=settings["reasoning_effort"],
             )
         )
@@ -153,6 +237,113 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     @app.get("/api/books", response_model=list[Book])
     async def list_books() -> list[Book]:
         return storage.list_books()
+
+    @app.post("/api/projects", response_model=Book, status_code=201)
+    async def create_project(request: ProjectCreate) -> Book:
+        return storage.create_project(str(uuid4()), request.title)
+
+    @app.get("/api/books/{book_id}/arrangement", response_model=Arrangement)
+    async def get_arrangement(book_id: str) -> Arrangement:
+        return arrangement(book_id)
+
+    @app.post("/api/books/{book_id}/files", response_model=Arrangement)
+    async def upload_files(book_id: str, files: list[UploadFile] = File(...)) -> Arrangement:
+        ensure_book(book_id)
+        ensure_idle(book_id)
+        if not files:
+            raise HTTPException(status_code=400, detail="请选择上传文件")
+        uploading.add(book_id)
+        book_dir = storage.books_root / book_id
+        staging = book_dir / f".upload-{uuid4()}"
+        moved: list[Path] = []
+        try:
+            staging.mkdir(parents=True)
+            imported = []
+            for file in files:
+                filename, data = await read_upload(file)
+                source_id = str(uuid4())
+                directory = staging / source_id
+                directory.mkdir()
+                pages = await asyncio.to_thread(import_document, data, filename, directory)
+                imported.append({
+                    "id": source_id, "filename": filename,
+                    "kind": "pdf" if filename.lower().endswith(".pdf") else "image",
+                    "directory": f"sources/{source_id}", "pages": pages,
+                })
+            (book_dir / "sources").mkdir(exist_ok=True)
+            for source in imported:
+                target = book_dir / source["directory"]
+                (staging / source["id"]).rename(target)
+                moved.append(target)
+            storage.append_files(book_id, imported)
+        except BaseException as exc:
+            for directory in moved:
+                shutil.rmtree(directory)
+            if isinstance(exc, ImportFailure):
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+            uploading.discard(book_id)
+        return arrangement(book_id)
+
+    @app.post("/api/books/{book_id}/confirm-upload", response_model=Arrangement)
+    async def confirm_upload(book_id: str) -> Arrangement:
+        book = ensure_book(book_id)
+        ensure_idle(book_id)
+        if not book.file_count:
+            raise HTTPException(status_code=400, detail="请先上传文件")
+        storage.confirm_upload(book_id)
+        return arrangement(book_id)
+
+    @app.put("/api/books/{book_id}/arrangement", response_model=BookDetail)
+    async def put_arrangement(book_id: str, request: ArrangementUpdate) -> BookDetail:
+        book = ensure_book(book_id)
+        ensure_idle(book_id)
+        if not book.upload_confirmed:
+            raise HTTPException(status_code=409, detail="请先确认上传文件")
+        file_ids = {source.id for source in storage.get_files(book_id)}
+        if len(request.file_order) != len(file_ids) or set(request.file_order) != file_ids:
+            raise HTTPException(status_code=400, detail="文件排序必须包含全部文件且不能重复")
+        if request.file_parents is not None:
+            if set(request.file_parents) != file_ids:
+                raise HTTPException(status_code=400, detail="文件层级必须包含全部文件")
+            for source_id, parent_id in request.file_parents.items():
+                if parent_id is not None and parent_id not in file_ids:
+                    raise HTTPException(status_code=400, detail="父文件必须属于当前项目")
+                if parent_id == source_id:
+                    raise HTTPException(status_code=400, detail="文件不能嵌入自身")
+            for source_id in file_ids:
+                seen: set[str] = set()
+                current: str | None = source_id
+                while current is not None:
+                    if current in seen:
+                        raise HTTPException(status_code=400, detail="文件层级不能形成循环")
+                    seen.add(current)
+                    current = request.file_parents[current]
+            if any(
+                parent_id is not None and request.file_parents[parent_id] is not None
+                for parent_id in request.file_parents.values()
+            ):
+                raise HTTPException(status_code=400, detail="子文件必须属于顶层文件，不能继续嵌套子文件")
+        numbers = set(request.page_order)
+        if len(numbers) != len(request.page_order) or any(number < 1 or number > book.page_count for number in numbers):
+            raise HTTPException(status_code=400, detail="页面排序包含重复或无效页面")
+        storage.save_arrangement(book_id, request.file_order, request.page_order, request.file_parents)
+        return book_detail(book_id)
+
+    @app.get("/api/books/{book_id}/pages/{number}/preview")
+    async def preview_page(book_id: str, number: int) -> FileResponse:
+        ensure_book(book_id)
+        record = storage.get_page_record(book_id, number)
+        if record is None:
+            raise HTTPException(status_code=404, detail="页面不存在")
+        try:
+            async with preview_lock:
+                path = await asyncio.to_thread(prepare_source_preview, storage.books_root / book_id, record)
+        except ImportFailure as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return FileResponse(path, media_type="image/png")
 
     @app.post("/api/books", response_model=Book, status_code=201)
     async def upload_book(file: UploadFile = File(...)) -> Book:
@@ -187,28 +378,30 @@ def create_app(data_root: Path | None = None) -> FastAPI:
 
     @app.get("/api/books/{book_id}", response_model=BookDetail)
     async def get_book(book_id: str) -> BookDetail:
-        book = ensure_book(book_id)
-        return BookDetail(book=book, pages=storage.get_pages(book_id))
+        return book_detail(book_id)
 
     @app.delete("/api/books/{book_id}", status_code=204)
     async def delete_book(book_id: str) -> Response:
         ensure_book(book_id)
-        if book_id in running:
-            raise HTTPException(status_code=409, detail="该书籍正在处理")
+        ensure_idle(book_id)
         storage.delete_book(book_id)
         return Response(status_code=204)
 
     @app.post("/api/books/{book_id}/process", response_model=ProcessResult)
     async def process_book(book_id: str, request: ProcessRequest | None = None) -> ProcessResult:
-        ensure_book(book_id)
-        if book_id in running:
-            raise HTTPException(status_code=409, detail="该书籍正在处理")
+        book = ensure_book(book_id)
+        ensure_idle(book_id)
+        legacy_upload = all(source.id == "legacy" for source in storage.get_files(book_id)) and book.file_count == 1
+        if not legacy_upload:
+            ensure_arranged(book)
         records = storage.get_page_records(book_id)
         if request is not None and request.pages is not None:
             numbers = set(request.pages)
+            if any(number < 1 or number > book.page_count for number in numbers):
+                raise HTTPException(status_code=400, detail="页码超出源文件范围")
             records = [record for record in records if record["number"] in numbers]
             if len(records) != len(numbers):
-                raise HTTPException(status_code=400, detail="所选页面不存在")
+                raise HTTPException(status_code=400, detail="所选页面不在当前清单中，请先添加页面")
         if not records:
             return ProcessResult(started=False)
         settings = storage.get_settings()
@@ -216,18 +409,25 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="请先设置 API 密钥")
         if not settings["extraction_model"]:
             raise HTTPException(status_code=400, detail="请先填写页面代理模型")
+        numbers = [record["number"] for record in records]
+        if not book.selection_confirmed:
+            storage.confirm_page_selection(book_id, numbers)
         processor = BookProcessor(storage)
         pause_requested = asyncio.Event()
         storage.begin_book(book_id)
         task = asyncio.create_task(processor.process(
             book_id, settings, secrets.api_key, pause_requested, records,
+            pending_pages=numbers,
         ))
         running[book_id] = task
         pause_requests[book_id] = pause_requested
+        pending_pages[book_id] = numbers
 
         def remove_finished(_task: asyncio.Task[None]) -> None:
-            running.pop(book_id, None)
-            pause_requests.pop(book_id, None)
+            if running.get(book_id) is _task:
+                running.pop(book_id, None)
+                pause_requests.pop(book_id, None)
+                pending_pages.pop(book_id, None)
             if not _task.cancelled():
                 _task.exception()
 
@@ -246,22 +446,61 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             storage.request_pause(book_id)
         return PauseResult(requested=True)
 
+    @app.post("/api/books/{book_id}/pages", response_model=BookDetail)
+    async def add_pages(book_id: str, request: PagesRequest) -> BookDetail:
+        book = ensure_book(book_id)
+        if not book.selection_confirmed:
+            raise HTTPException(status_code=400, detail="请先选择处理范围")
+        numbers = sorted(set(request.pages))
+        if any(number < 1 or number > book.page_count for number in numbers):
+            raise HTTPException(status_code=400, detail="页码超出源文件范围")
+        added = storage.add_pages(book_id, numbers)
+        active = is_running(book_id)
+        if active and not pause_requests[book_id].is_set():
+            for number in added:
+                record = storage.get_page_record(book_id, number)
+                if record is not None and record["status"] != "ready":
+                    pending_pages[book_id].append(number)
+        storage.refresh_book(book_id, processing=active)
+        return book_detail(book_id)
+
+    @app.delete("/api/books/{book_id}/pages/{number}", response_model=BookDetail)
+    async def delete_page(book_id: str, number: int) -> BookDetail:
+        book = ensure_book(book_id)
+        if not book.selection_confirmed:
+            raise HTTPException(status_code=400, detail="请先选择处理范围")
+        record = storage.get_page_record(book_id, number)
+        if record is None or not record["selected"]:
+            raise HTTPException(status_code=404, detail="页面不在当前清单中")
+        if record["status"] == "processing":
+            raise HTTPException(status_code=409, detail="当前页面正在处理，暂不能删除")
+        storage.remove_page(book_id, number)
+        if book_id in pending_pages:
+            pending_pages[book_id][:] = [page for page in pending_pages[book_id] if page != number]
+        storage.refresh_book(book_id, processing=is_running(book_id))
+        return book_detail(book_id)
+
     @app.put("/api/books/{book_id}/pages/{number}", response_model=Page)
     async def save_page(book_id: str, number: int, update: PageUpdate) -> Page:
-        ensure_book(book_id)
-        if book_id in running:
-            raise HTTPException(status_code=409, detail="处理运行中，暂不能修改")
+        ensure_arranged(ensure_book(book_id))
+        ensure_idle(book_id)
         try:
-            storage.save_manual_text(book_id, number, update.text)
+            storage.save_manual_text(
+                book_id, number, update.text,
+                page_kind=update.page_kind, cover_fields=update.cover_fields,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="页面不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         pages = storage.get_pages(book_id)
         return next(page for page in pages if page.number == number)
 
     @app.get("/api/books/{book_id}/export")
     async def export_book(book_id: str) -> JSONResponse:
         book = ensure_book(book_id)
-        payload = BookDetail(book=book, pages=storage.get_pages(book_id)).model_dump(mode="json")
+        ensure_arranged(book)
+        payload = book_detail(book_id).model_dump(mode="json")
         return JSONResponse(
             content=payload,
             headers={
@@ -272,9 +511,11 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     @app.get("/api/books/{book_id}/export.md")
     async def export_markdown(book_id: str) -> Response:
         book = ensure_book(book_id)
+        ensure_arranged(book)
         pages = storage.get_pages(book_id)
         body = "# " + book.title + "\n\n" + "\n\n---\n\n".join(
-            f"## 第 {page.number} 页\n\n{page.text}" for page in pages
+            f"## 第 {index} 页 · {page.source_filename} / 源第 {page.source_page} 页\n\n{_page_markdown(page)}"
+            for index, page in enumerate(pages, 1)
         ) + "\n"
         return Response(
             content=body,
@@ -297,6 +538,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     app.state.secrets = secrets
     app.state.running = running
     app.state.pause_requests = pause_requests
+    app.state.pending_pages = pending_pages
     return app
 
 

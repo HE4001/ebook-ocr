@@ -2,7 +2,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import type { BookDetail, MarginSegment, Page } from './types'
+import type { BookDetail, CoverField, MarginSegment, Page } from './types'
 
 function safeUrl(url: string): string {
   const value = url.trim()
@@ -33,25 +33,49 @@ export function MarginContent({ segments, placement }: {
   placement: 'header' | 'footer'
 }) {
   if (!segments.length) return null
-  const rows = [...new Set(segments.map((segment) => segment.row))].sort((a, b) => a - b)
+  const rows = Array.from({ length: Math.max(...segments.map((segment) => segment.row)) }, (_, index) => index + 1)
 
   return <div className={`page-margin page-margin-${placement}`} aria-label={placement === 'header' ? '原书页眉' : '原书页脚'}>
-    {rows.map((row, index) => <div className="margin-row" key={row} style={{ marginTop: `${(index === 0 ? row - 1 : row - rows[index - 1] - 1) * .25}em` }}>
-      {alignments.map((alignment) => <div className={`margin-slot margin-slot-${alignment}`} key={alignment}>
-        {segments.filter((segment) => segment.row === row && segment.alignment === alignment).map((segment, index) =>
-          <span key={index} className={`margin-segment margin-size-${segment.font_size}${segment.bold ? ' margin-bold' : ''}${segment.italic ? ' margin-italic' : ''}${segment.kind === 'page_number' ? ' source-page-number' : ''}`}>{segment.text}</span>)}
-      </div>)}
-    </div>)}
+    {rows.map((row) => {
+      const rowSegments = segments.filter((segment) => segment.row === row)
+      const occupied = alignments.filter((alignment) => rowSegments.some((segment) => segment.alignment === alignment))
+      const layout = occupied.length < 2 ? 'single' : occupied.includes('center') ? 'centered' : 'edges'
+      return <div className={`margin-row margin-row-${layout}`} key={row} data-row={row}>
+        {occupied.map((alignment) => <div className={`margin-slot margin-slot-${alignment}`} key={alignment}>
+          {rowSegments.filter((segment) => segment.alignment === alignment).map((segment, index) =>
+            <span key={index} className={`margin-segment margin-size-${segment.font_size}${segment.bold ? ' margin-bold' : ''}${segment.italic ? ' margin-italic' : ''}${segment.kind === 'page_number' ? ' source-page-number' : ''}`}>{segment.text}</span>)}
+        </div>)}
+      </div>
+    })}
+  </div>
+}
+
+function CoverContent({ fields }: { fields: CoverField[] }) {
+  const groups: { name: string; kinds: CoverField['kind'][] }[] = [
+    { name: 'heading', kinds: ['series', 'title', 'subtitle'] },
+    { name: 'credits', kinds: ['author', 'translator', 'editor'] },
+    { name: 'publication', kinds: ['publisher', 'edition', 'publication_year', 'isbn'] },
+  ]
+
+  return <div className="cover-content">
+    {groups.map(({ name, kinds }) => {
+      const entries = fields.filter((field) => kinds.includes(field.kind) && field.text.trim())
+      return entries.length > 0 && <div className={`cover-${name}`} key={name}>
+        {entries.map((field, index) => <p className={`cover-field-${field.kind}`} key={index}>{field.text}</p>)}
+      </div>
+    })}
   </div>
 }
 
 export function PageContent({ page, text = page.text }: { page: Page; text?: string }) {
   return <div className="book-page-entry">
-    <div className="book-page-number">源文件第 {page.number} 页</div>
-    <section className="book-page" data-page={page.number} aria-label={`源文件第 ${page.number} 页排版`}>
-      <MarginContent segments={page.header_segments} placement="header" />
-      <div className="page-body">{text && <Markdown text={text} />}</div>
-      <MarginContent segments={page.footer_segments} placement="footer" />
+    <div className="book-page-number">{page.source_filename} · 第 {page.source_page} 页</div>
+    <section className={`book-page book-page-${page.page_kind}`} data-page={page.number} aria-label={`${page.source_filename} 第 ${page.source_page} 页排版`}>
+      {page.page_kind === 'content' ? <>
+        <MarginContent segments={page.header_segments} placement="header" />
+        <div className="page-body">{text && <Markdown text={text} />}</div>
+        <MarginContent segments={page.footer_segments} placement="footer" />
+      </> : <CoverContent fields={page.cover_fields} />}
     </section>
   </div>
 }

@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import { BookContent, PageContent } from './Markdown'
 import { buildStandaloneHtml, downloadText, safeFilename } from './exportHtml'
-import type { Book, BookDetail, Notice, Page, Settings, Usage } from './types'
+import ProjectOrganizer from './ProjectOrganizer'
+import { PageEditor } from './PageEditor'
+import type { Book, BookDetail, Notice, Page, PageDraft, Settings, Usage } from './types'
 
 const STATUS_LABEL: Record<string, string> = {
   uploaded: '待处理', processing: '处理中', pausing: '正在暂停', paused: '已暂停', ready: '已完成',
@@ -11,6 +13,7 @@ const STATUS_LABEL: Record<string, string> = {
 
 const EMPTY_SETTINGS: Settings = {
   base_url: 'https://api.openai.com/v1',
+  models_path: '/models',
   responses_path: '/responses',
   extraction_model: '',
   reasoning_effort: '',
@@ -18,8 +21,10 @@ const EMPTY_SETTINGS: Settings = {
   api_key: '',
   has_api_key: false,
   structured_output: false,
-  max_output_tokens: 12000,
   timeout_seconds: 120,
+  processing_concurrency: 10,
+  context_reuse_enabled: false,
+  context_reuse_max_pages: 10,
 }
 
 function errorText(error: unknown): string {
@@ -41,11 +46,14 @@ function endpoint(baseUrl: string, pathValue: string): string {
 
 function sameSavedSettings(current: Settings, saved: Settings): boolean {
   return current.base_url === saved.base_url
+    && current.models_path === saved.models_path
     && current.responses_path === saved.responses_path
     && current.extraction_model === saved.extraction_model
     && current.reasoning_effort === saved.reasoning_effort
-    && current.max_output_tokens === saved.max_output_tokens
     && current.timeout_seconds === saved.timeout_seconds
+    && current.processing_concurrency === saved.processing_concurrency
+    && current.context_reuse_enabled === saved.context_reuse_enabled
+    && current.context_reuse_max_pages === saved.context_reuse_max_pages
 }
 
 function connectionTestMessage(result: { ok: boolean; message: string }) {
@@ -72,56 +80,110 @@ function UsageView({ usage, attempts }: { usage: Usage; attempts?: number }) {
 function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
   const [settings, setSettings] = useState<Settings>(EMPTY_SETTINGS)
   const [savedSettings, setSavedSettings] = useState<Settings | null>(null)
+  const [processingConcurrency, setProcessingConcurrency] = useState(String(EMPTY_SETTINGS.processing_concurrency))
+  const [concurrencyError, setConcurrencyError] = useState('')
   const [clearKey, setClearKey] = useState(false)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
+  const [models, setModels] = useState<string[] | null>(null)
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelsError, setModelsError] = useState<string | null>(null)
+  const modelsRequest = useRef(0)
 
   useEffect(() => {
     api.getSettings()
       .then((value) => {
-        const loaded = { ...value, reasoning_effort: value.reasoning_effort ?? '', max_output_tokens: value.max_output_tokens ?? 12000, api_key: '' }
+        const loaded = {
+          ...value,
+          models_path: value.models_path ?? '/models',
+          reasoning_effort: value.reasoning_effort ?? '',
+          processing_concurrency: value.processing_concurrency ?? 10,
+          context_reuse_enabled: value.context_reuse_enabled ?? false,
+          context_reuse_max_pages: value.context_reuse_max_pages ?? 10,
+          api_key: '',
+        }
         setSettings(loaded)
         setSavedSettings(loaded)
+        setProcessingConcurrency(String(loaded.processing_concurrency))
       })
       .catch((error) => onNotice({ kind: 'error', text: errorText(error) }))
       .finally(() => setLoading(false))
+    return () => { modelsRequest.current += 1 }
   }, [onNotice])
 
+  const resetModels = () => {
+    modelsRequest.current += 1
+    setModels(null)
+    setModelsLoading(false)
+    setModelsError(null)
+  }
+
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) => {
+    if (key === 'base_url' || key === 'api_key' || key === 'models_path') resetModels()
     setSettings((current) => ({ ...current, [key]: value }))
     setTestResult(null)
   }
 
   const hasUnsavedChanges = savedSettings !== null && (
     !sameSavedSettings(settings, savedSettings)
+    || processingConcurrency !== String(savedSettings.processing_concurrency)
     || Boolean(settings.api_key?.trim())
     || clearKey
   )
-  const validMaxOutputTokens = Number.isInteger(settings.max_output_tokens) && settings.max_output_tokens > 0
 
-  const fillDeepSeek = () => {
-    setSettings((current) => ({
-      ...current,
-      base_url: 'https://api.deepseek.com',
-      responses_path: '/responses',
-      extraction_model: 'deepseek-flash',
-      reasoning_effort: 'high',
-      structured_output: false,
-      max_output_tokens: 12000,
-    }))
-    setTestResult(null)
+  const sameApiBase = savedSettings !== null
+    && endpoint(settings.base_url, '') === endpoint(savedSettings.base_url, '')
+  const modelLookupIssue = !settings.base_url.trim()
+    ? '请先填写 API 根地址。'
+    : clearKey
+      ? '已勾选清除密钥，请取消勾选并填写或复用密钥后获取模型。'
+      : !settings.api_key?.trim() && !(sameApiBase && savedSettings?.has_api_key)
+        ? savedSettings?.has_api_key && !sameApiBase
+          ? 'API 根地址已更改，请为此地址输入新密钥后获取模型。'
+          : '请先输入 API 密钥，再获取模型。'
+        : null
+
+  const fetchModels = async () => {
+    const requestId = ++modelsRequest.current
+    setModelsLoading(true)
+    setModels(null)
+    setModelsError(null)
+    try {
+      const result = await api.fetchModels(settings, clearKey)
+      if (requestId === modelsRequest.current) setModels(result.models)
+    } catch (error) {
+      if (requestId === modelsRequest.current) setModelsError(errorText(error))
+    } finally {
+      if (requestId === modelsRequest.current) setModelsLoading(false)
+    }
   }
 
   const save = async () => {
+    const concurrency = Number(processingConcurrency)
+    if (!processingConcurrency.trim() || !Number.isInteger(concurrency) || concurrency < 1) {
+      setConcurrencyError('请输入大于或等于 1 的整数。')
+      return
+    }
+    setConcurrencyError('')
     setSaving(true)
     setTestResult(null)
     try {
-      const saved = await api.saveSettings(settings, clearKey)
-      const loaded = { ...saved, reasoning_effort: saved.reasoning_effort ?? '', max_output_tokens: saved.max_output_tokens ?? 12000, api_key: '' }
+      const saved = await api.saveSettings({ ...settings, processing_concurrency: concurrency }, clearKey)
+      const loaded = {
+        ...saved,
+        models_path: saved.models_path ?? '/models',
+        reasoning_effort: saved.reasoning_effort ?? '',
+        processing_concurrency: saved.processing_concurrency ?? 10,
+        context_reuse_enabled: saved.context_reuse_enabled ?? false,
+        context_reuse_max_pages: saved.context_reuse_max_pages ?? 10,
+        api_key: '',
+      }
       setSettings(loaded)
       setSavedSettings(loaded)
+      setProcessingConcurrency(String(loaded.processing_concurrency))
       setClearKey(false)
+      resetModels()
       onNotice({
         kind: 'success',
         text: clearKey
@@ -154,38 +216,95 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
     <main className="settings-page">
       <header className="section-heading"><p className="eyebrow">模型接入</p><h1>设置</h1></header>
       <div className="settings-card">
-        <div className="provider-preset"><button type="button" onClick={fillDeepSeek} disabled={saving}>填入 DeepSeek 配置</button><small>替换接入地址、模型、推理程度和最大输出 token；不会更改密钥或超时。仅填入表单，保存后生效。若当前密钥不是 DeepSeek 密钥，请自行替换。</small><small>图片识别使用 deepseek-flash；推理程度可填 none、low、high、max，留空使用模型默认值。<a href="https://api-docs.deepseek.com/zh-cn/guides/responses_api/" target="_blank" rel="noreferrer">Responses 指南</a> · <a href="https://api-docs.deepseek.com/zh-cn/api/create-response/" target="_blank" rel="noreferrer">参数文档</a></small></div>
-        <label><span>API 根地址</span><input value={settings.base_url} onChange={(event) => update('base_url', event.target.value)} placeholder="https://api.openai.com/v1" /><small>包含协议和 API 版本；接入路径留空时，此地址就是完整请求地址。</small></label>
-        <label><span>Responses 接入路径</span><input value={settings.responses_path} onChange={(event) => update('responses_path', event.target.value)} placeholder="/responses" /><small>可留空，或填写自定义相对路径。</small></label>
-        <div className="endpoint-preview"><span>实际 POST 地址</span><code>{endpoint(settings.base_url, settings.responses_path)}</code>{settings.responses_path.trim() === '' && <small>接入路径为空，API 根地址会直接作为完整请求地址。</small>}{settings.responses_path.trim() === '/' && <small>当前路径为 /，请求会发到 API 根地址。</small>}</div>
-        <label><span>页面代理模型</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} /><small>每页返回结构化页眉、正文 Markdown 和页脚。</small></label>
-        <label><span>模型推理程度</span><input value={settings.reasoning_effort} onChange={(event) => update('reasoning_effort', event.target.value)} placeholder="例如 low、medium、high" /><small>手动填写模型供应商支持的值；留空则使用服务默认值。</small></label>
-        <label className="number-field"><span>最大输出 token</span><input type="number" min={1} step={1} value={settings.max_output_tokens} onChange={(event) => update('max_output_tokens', Number(event.target.value))} /><small>包含推理和正文；识别与连接测试均使用。提高额度可能增加用量。</small></label>
-        <label><span className="field-title">API 密钥 <span className={settings.has_api_key ? 'key-state saved' : 'key-state missing'}>{settings.has_api_key ? '已保存到本机' : '未配置'}</span></span><input type="password" autoComplete="new-password" value={settings.api_key ?? ''} onChange={(event) => update('api_key', event.target.value)} placeholder={settings.has_api_key ? '已保存；留空保留' : '输入密钥'} disabled={clearKey} /><small>已保存密钥不会回显；留空保留，输入新密钥替换。密钥以明文保存在本机 SQLite 数据库中，重启后自动读取，不保存在浏览器中。</small></label>
-        <label className="check-row"><input type="checkbox" checked={clearKey} onChange={(event) => { const checked = event.target.checked; setClearKey(checked); setTestResult(null); if (checked) update('api_key', '') }} /><span>清除本机已保存的密钥</span></label>
-        <div className="field-grid compact-grid">
-          <label><span>超时秒数</span><input type="number" min={5} max={600} value={settings.timeout_seconds} onChange={(event) => update('timeout_seconds', Number(event.target.value))} /></label>
+        <label><span>API 根地址</span><input value={settings.base_url} onChange={(event) => update('base_url', event.target.value)} placeholder="https://api.openai.com/v1" disabled={saving} /><small>填写包含协议和 API 版本的地址；自定义接口路径可在下方高级项中设置。</small></label>
+        <label><span className="field-title">API 密钥 <span className={settings.has_api_key ? 'key-state saved' : 'key-state missing'}>{settings.has_api_key ? '已保存到本机' : '未配置'}</span></span><input type="password" autoComplete="new-password" value={settings.api_key ?? ''} onChange={(event) => update('api_key', event.target.value)} placeholder={settings.has_api_key ? '已保存；留空保留' : '输入密钥'} disabled={saving || clearKey} /><small>已保存密钥不会回显；留空保留，输入新密钥替换。获取模型时，留空仅可复用同一 API 根地址的已保存密钥。密钥以明文保存在本机 SQLite 数据库中，不保存在浏览器中。</small></label>
+        <label className="check-row"><input type="checkbox" checked={clearKey} disabled={saving} onChange={(event) => { const checked = event.target.checked; setClearKey(checked); resetModels(); setTestResult(null); if (checked) setSettings((current) => ({ ...current, api_key: '' })) }} /><span>清除本机已保存的密钥</span></label>
+        <details className="settings-advanced">
+          <summary>高级接入路径</summary>
+          <div className="settings-paths">
+            <div>
+              <label><span>Models 路径</span><input value={settings.models_path} onChange={(event) => update('models_path', event.target.value)} placeholder="/models" disabled={saving} /><small>默认 /models；可填自定义相对路径，留空则直接请求根地址。</small></label>
+              <div className="endpoint-preview"><span>GET Models</span><code>{endpoint(settings.base_url, settings.models_path)}</code></div>
+            </div>
+            <div>
+              <label><span>Responses 路径</span><input value={settings.responses_path} onChange={(event) => update('responses_path', event.target.value)} placeholder="/responses" disabled={saving} /><small>默认 /responses；可填自定义相对路径，留空则直接请求根地址。</small></label>
+              <div className="endpoint-preview"><span>POST Responses</span><code>{endpoint(settings.base_url, settings.responses_path)}</code></div>
+            </div>
+          </div>
+        </details>
+        <div className="model-discovery">
+          <div className="model-fetch-row"><button type="button" onClick={fetchModels} disabled={saving || modelsLoading || Boolean(modelLookupIssue)}>{modelsLoading ? '正在获取…' : '获取模型'}</button><small>使用当前地址与密钥，无需先保存。</small></div>
+          <div className="model-lookup-status" aria-live="polite">
+            {modelsError
+              ? <p className="model-lookup-error" role="alert">获取失败：{modelsError} 请检查地址、Models 路径和密钥后重试，也可手动填写模型 ID。</p>
+              : <p>{modelLookupIssue || (modelsLoading ? '正在向服务器获取模型列表…' : models === null ? '点击获取服务器的模型名称，或直接手动填写模型 ID。' : models.length ? `已获取 ${models.length} 个模型。请选择需要使用的模型。` : '服务器返回的模型列表为空。可检查 Models 路径后重试，或手动填写模型 ID。')}</p>}
+          </div>
+          <label><span>服务器模型</span><select value={models?.includes(settings.extraction_model) ? settings.extraction_model : ''} onChange={(event) => update('extraction_model', event.target.value)} disabled={saving || modelsLoading || !models?.length}><option value="" disabled>{models?.length ? '选择模型，不会自动保存' : '获取模型后选择'}</option>{models?.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+          <small>模型列表仅提供名称，不代表模型支持 Responses 或图片输入，请向供应商确认。</small>
         </div>
+        <label><span>页面代理模型 ID</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} placeholder="手动填写，或从上方列表选择" disabled={saving} /><small>保存后用于逐页识别，返回页眉、正文 Markdown 和页脚。</small></label>
+        <label><span>模型推理程度</span><input value={settings.reasoning_effort} onChange={(event) => update('reasoning_effort', event.target.value)} placeholder="例如 low、medium、high" disabled={saving} /><small>手动填写模型供应商支持的值；留空则使用服务默认值。</small></label>
+        <div className="field-grid compact-grid">
+          <label><span>超时秒数</span><input type="number" min={5} max={600} value={settings.timeout_seconds} onChange={(event) => update('timeout_seconds', Number(event.target.value))} disabled={saving} /></label>
+        </div>
+        <label className="number-field">
+          <span>处理并发数</span>
+          <input type="number" min={1} step={1} value={processingConcurrency} onChange={(event) => { setProcessingConcurrency(event.target.value); setConcurrencyError(''); setTestResult(null) }} disabled={saving} aria-invalid={Boolean(concurrencyError)} aria-describedby={concurrencyError ? 'processing-concurrency-help processing-concurrency-error' : 'processing-concurrency-help'} />
+          <small id="processing-concurrency-help">每个项目同时识别的最多页数，默认 10。请输入正整数，无固定上限。</small>
+          {concurrencyError && <small id="processing-concurrency-error" className="field-error" role="alert">{concurrencyError}</small>}
+        </label>
+        <label className="check-row">
+          <input type="checkbox" checked={settings.context_reuse_enabled} onChange={(event) => update('context_reuse_enabled', event.target.checked)} disabled={saving} aria-describedby="context-reuse-help" />
+          <span>上下文复用（实验性）<small id="context-reuse-help">让相邻页面共享识别上下文。需要模型服务支持保存并续接对话，历史内容仍占用上下文和用量。</small></span>
+        </label>
+        {settings.context_reuse_enabled && <label className="number-field">
+          <span>每条对话最多识别页数</span>
+          <select value={settings.context_reuse_max_pages} onChange={(event) => update('context_reuse_max_pages', Number(event.target.value))} disabled={saving} aria-describedby="context-reuse-pages-help">
+            {Array.from({ length: 10 }, (_, index) => index + 1).map((count) => <option key={count} value={count}>{count} 页</option>)}
+          </select>
+          <small id="context-reuse-pages-help">含首张页面。按编排顺序连续分组，组间并行、组内依次识别，最终页序不变；每次开始处理都会建立新对话。</small>
+        </label>}
         {testResult && <div className={testResult.ok ? 'inline-result success-box' : 'inline-result error-box'}>{testResult.message}</div>}
-        <div className="button-row"><button className="primary" onClick={save} disabled={saving || !validMaxOutputTokens}>{saving ? '请稍候…' : '保存设置'}</button><button onClick={test} disabled={saving || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存当前改动' : undefined}>主动测试连接</button></div>
-        {!validMaxOutputTokens && <p className="settings-warning">最大输出 token 请填写正整数。</p>}
+        <div className="button-row"><button className="primary" onClick={save} disabled={saving || modelsLoading}>{saving ? '请稍候…' : '保存设置'}</button><button onClick={test} disabled={saving || modelsLoading || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存当前改动' : undefined}>主动测试连接</button></div>
         {hasUnsavedChanges && <p className="settings-warning">有未保存改动。请先保存，再测试模型连接。</p>}
-        <p className="settings-footnote">保存设置不会联系模型服务。主动测试使用已保存配置发送请求，可能产生供应商用量。</p>
+        <p className="settings-footnote">获取模型只查询列表，不保存设置或发送推理请求。保存设置不会联系模型服务。主动测试使用已保存配置发送请求，可能产生供应商用量。</p>
       </div>
     </main>
   )
 }
 
+type WorkspaceView = 'upload' | 'organize' | 'workspace' | 'preview' | 'settings'
+
+function projectView(book: Book): WorkspaceView {
+  if (!book.upload_confirmed) return 'upload'
+  return book.selection_confirmed ? 'workspace' : 'organize'
+}
+
+function projectStatus(book: Book): string {
+  if (!book.upload_confirmed) return '待确认资料'
+  if (!book.selection_confirmed) return '待编排'
+  return STATUS_LABEL[book.status] ?? book.status
+}
+
+function sourceLabel(page: Page): string {
+  return `${page.source_filename} · 第 ${page.source_page} 页`
+}
+
+function draftFromPage(page: Page | null): PageDraft {
+  return page ? { text: page.text, page_kind: page.page_kind, cover_fields: page.cover_fields }
+    : { text: '', page_kind: 'content', cover_fields: [] }
+}
+
 export default function App() {
-  const [view, setView] = useState<'workspace' | 'preview' | 'settings'>('workspace')
+  const [view, setView] = useState<WorkspaceView>('upload')
   const [books, setBooks] = useState<Book[]>([])
   const [selectedBookId, setSelectedBookId] = useState<string | null>(null)
   const [detail, setDetail] = useState<BookDetail | null>(null)
   const [selectedPageNumber, setSelectedPageNumber] = useState(1)
-  const [processScope, setProcessScope] = useState<'current' | 'selected' | 'all'>('current')
-  const [processPages, setProcessPages] = useState<number[]>([])
-  const [draftText, setDraftText] = useState('')
+  const [pageDraft, setPageDraft] = useState<PageDraft>(() => draftFromPage(null))
   const [dirty, setDirty] = useState(false)
+  const [organizerDirty, setOrganizerDirty] = useState(false)
+  const [organizerBusy, setOrganizerBusy] = useState(false)
   const [notice, setNotice] = useState<Notice>(null)
   const [initialLoading, setInitialLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -193,15 +312,29 @@ export default function App() {
   const [saving, setSaving] = useState(false)
   const [actionBusy, setActionBusy] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [newProject, setNewProject] = useState(false)
+  const [projectTitle, setProjectTitle] = useState('')
+  const [uploadError, setUploadError] = useState('')
   const fileInput = useRef<HTMLInputElement>(null)
   const selectedBookIdRef = useRef<string | null>(null)
+  const detailRequestRef = useRef(0)
   const showNotice = useCallback((value: Notice) => setNotice(value), [])
 
   useEffect(() => {
-    if (!notice) return
+    if (!notice || notice.kind === 'error') return
     const timer = window.setTimeout(() => setNotice(null), 5000)
     return () => window.clearTimeout(timer)
   }, [notice])
+
+  useEffect(() => {
+    if (!dirty && !organizerDirty) return
+    const protectDraft = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', protectDraft)
+    return () => window.removeEventListener('beforeunload', protectDraft)
+  }, [dirty, organizerDirty])
 
   const loadBooks = useCallback(async () => {
     try {
@@ -217,94 +350,177 @@ export default function App() {
     }
   }, [])
 
-  const loadDetail = useCallback(async (id: string, quiet = false) => {
+  const applyDetail = useCallback((value: BookDetail) => {
+    if (value.book.id !== selectedBookIdRef.current) return
+    setDetail(value)
+    setBooks((current) => current.map((book) => book.id === value.book.id ? value.book : book))
+    setSelectedPageNumber((current) => value.pages.some((page) => page.number === current)
+      ? current : value.pages[0]?.number ?? 1)
+  }, [])
+
+  const loadDetail = useCallback(async (id: string, quiet = false, openProject = false) => {
+    const requestNumber = ++detailRequestRef.current
     if (!quiet) setDetailLoading(true)
     try {
       const value = await api.getBook(id)
-      if (id !== selectedBookIdRef.current) return
-      setDetail(value)
-      setBooks((current) => current.map((book) => book.id === value.book.id ? value.book : book))
-      setSelectedPageNumber((current) => value.pages.some((page) => page.number === current) ? current : value.pages[0]?.number ?? 1)
+      if (id !== selectedBookIdRef.current || requestNumber !== detailRequestRef.current) return
+      applyDetail(value)
+      if (openProject) setView((current) => current === 'settings' ? current : projectView(value.book))
     } catch (error) {
       if (!quiet && id === selectedBookIdRef.current) setNotice({ kind: 'error', text: errorText(error) })
     } finally {
       if (!quiet && id === selectedBookIdRef.current) setDetailLoading(false)
     }
-  }, [])
+  }, [applyDetail])
 
   useEffect(() => { void loadBooks() }, [loadBooks])
   useEffect(() => {
-    if (!selectedBookId) { setDetail(null); return }
     setDirty(false)
+    setOrganizerDirty(false)
+    setUploadError('')
     setDetail(null)
-    setProcessScope('current')
-    setProcessPages([])
     setSelectedPageNumber(1)
-    void loadDetail(selectedBookId)
+    if (selectedBookId) void loadDetail(selectedBookId, false, true)
   }, [selectedBookId, loadDetail])
   useEffect(() => {
-    if (!selectedBookId || !['processing', 'pausing'].includes(detail?.book.status ?? '')) return
+    if (!selectedBookId || actionBusy || !['processing', 'pausing'].includes(detail?.book.status ?? '')) return
     const timer = window.setInterval(() => void loadDetail(selectedBookId, true), 2000)
     return () => window.clearInterval(timer)
-  }, [selectedBookId, detail?.book.status, loadDetail])
+  }, [selectedBookId, detail?.book.status, actionBusy, loadDetail])
 
   const sourcePage = useMemo(() => detail?.pages.find((page) => page.number === selectedPageNumber) ?? null, [detail, selectedPageNumber])
-  useEffect(() => { if (!dirty) setDraftText(sourcePage?.text ?? '') }, [sourcePage, dirty])
+  const pendingPages = detail?.pages.filter((page) => page.status !== 'ready') ?? []
+  const pagesToProcess = (pendingPages.length ? pendingPages : detail?.pages ?? []).map((page) => page.number)
+  const isRunning = detail?.book.status === 'processing' || detail?.book.status === 'pausing'
+  const busy = actionBusy || saving || uploading || deleting || organizerBusy
+  const processLocked = isRunning || busy
+  const editLocked = isRunning || busy || sourcePage?.status === 'processing'
+  const progress = detail?.book.selected_page_count ? Math.round(detail.book.completed_pages / detail.book.selected_page_count * 100) : 0
+  const oldBackendContract = Boolean(detail && (!Array.isArray(detail.files) || !detail.book.usage
+    || detail.pages.some((page) => typeof page.text !== 'string' || !page.page_kind || !Array.isArray(page.cover_fields) || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage)))
+
+  useEffect(() => { if (!dirty) setPageDraft(draftFromPage(sourcePage)) }, [sourcePage, dirty])
+
+  const leaveDrafts = () => {
+    const message = organizerDirty ? '页面编排尚未确认，确定离开并放弃这些调整吗？' : '当前页有未保存修改，确定离开并放弃吗？'
+    if ((dirty || organizerDirty) && !window.confirm(message)) return false
+    setDirty(false)
+    setOrganizerDirty(false)
+    return true
+  }
+
+  const changeView = (next: WorkspaceView) => {
+    if (busy || (next === view && !newProject)) return
+    if (!leaveDrafts()) return
+    setNewProject(false)
+    setView(next)
+  }
 
   const choosePage = (page: Page) => {
-    if (actionBusy) return
-    if (page.number === selectedPageNumber) return
-    if (dirty && !window.confirm('本页有未保存修改，确定切换并放弃吗？')) return
+    if (busy || page.number === selectedPageNumber) return
+    if (!leaveDrafts()) return
     setSelectedPageNumber(page.number)
-    setDraftText(page.text)
-    setDirty(false)
+    setPageDraft(draftFromPage(page))
   }
 
   const chooseBook = (id: string) => {
-    if (deleting || actionBusy) return
-    if (id === selectedBookId) return
-    if (dirty && !window.confirm('当前页有未保存修改，确定切换书籍并放弃吗？')) return
-    setDirty(false)
+    if (busy) return
+    if (id === selectedBookId) {
+      if (newProject) setNewProject(false)
+      return
+    }
+    if (!leaveDrafts()) return
+    setNewProject(false)
     selectedBookIdRef.current = id
     setSelectedBookId(id)
   }
 
-  const upload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    if (deleting) return
-    const file = event.target.files?.[0]
-    event.target.value = ''
-    if (!file) return
-    setUploading(true)
-    setNotice({ kind: 'info', text: '正在导入 ' + file.name + '…' })
+  const beginProject = () => {
+    if (busy || !leaveDrafts()) return
+    setProjectTitle('')
+    setNewProject(true)
+    setView('upload')
+  }
+
+  const createProject = async () => {
+    if (!projectTitle.trim() || busy) return
+    setActionBusy(true)
     try {
-      const book = await api.uploadBook(file)
-      setBooks((current) => [book, ...current.filter((item) => item.id !== book.id)])
+      const book = await api.createProject(projectTitle.trim())
+      setBooks((current) => [book, ...current])
       selectedBookIdRef.current = book.id
       setSelectedBookId(book.id)
-      setNotice({ kind: 'success', text: '已导入 ' + book.title + '，可开始处理。' })
+      setNewProject(false)
+      setView('upload')
+      setNotice({ kind: 'success', text: '项目已创建。请向项目中添加 PDF 或图片。' })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
+    } finally {
+      setActionBusy(false)
+    }
+  }
+
+  const upload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = ''
+    if (!detail || processLocked || files.length === 0) return
+    setUploading(true)
+    setUploadError('')
+    const id = detail.book.id
+    setNotice({ kind: 'info', text: `正在向项目添加 ${files.length} 个文件，并读取页面信息…` })
+    try {
+      const value = await api.uploadFiles(id, files)
+      applyDetail({ book: value.book, files: value.files, pages: value.order.map((number) => value.pages.find((page) => page.number === number)!) })
+      setView('upload')
+      setNotice({ kind: 'success', text: `已添加 ${files.length} 个文件。项目现有 ${value.files.length} 个文件，请确认资料后继续编排。` })
+    } catch (error) {
+      const message = errorText(error)
+      setUploadError(message)
+      setNotice({ kind: 'error', text: message })
+      await loadDetail(id, true)
     } finally {
       setUploading(false)
     }
   }
 
+  const confirmUpload = async () => {
+    if (!detail || processLocked || detail.files.length === 0) return
+    setActionBusy(true)
+    try {
+      const value = await api.confirmUpload(detail.book.id)
+      applyDetail({ book: value.book, files: value.files, pages: value.order.map((number) => value.pages.find((page) => page.number === number)!) })
+      setView('organize')
+      setNotice({ kind: 'success', text: '资料已确认。请选择页面、调整文件和页内顺序，再确认最终编排。' })
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorText(error) })
+    } finally {
+      setActionBusy(false)
+    }
+  }
+
+  const confirmArrangement = (value: BookDetail) => {
+    applyDetail(value)
+    setOrganizerDirty(false)
+    setView('workspace')
+    setNotice({ kind: 'success', text: `编排已确认，共 ${value.pages.length} 页。可以开始识别并逐页校对。` })
+  }
+
   const processBook = async () => {
-    if (!detail || actionBusy || saving || uploading || deleting || ['processing', 'pausing'].includes(detail.book.status)) return
+    if (!detail?.book.selection_confirmed || processLocked || pagesToProcess.length === 0) return
     const bookId = detail.book.id
-    const pages = processScope === 'all' ? undefined : processScope === 'current' ? [selectedPageNumber] : [...processPages].sort((a, b) => a - b)
-    if (pages?.length === 0) return
-    const targets = pages === undefined ? detail.pages : detail.pages.filter((page) => pages.includes(page.number))
-    if ((targets.some((page) => Boolean(page.text || page.header_segments.length || page.footer_segments.length)) || dirty)
-      && !window.confirm(`这次处理会产生新的模型用量，成功后会覆盖所选页面已有的识别或校对文本。${dirty ? '当前未保存修改也会被放弃。' : ''}确定继续吗？`)) return
+    const pages = pagesToProcess
+    const targets = detail.pages.filter((page) => pages.includes(page.number))
+    const discardDraft = dirty && pages.includes(selectedPageNumber)
+    if ((targets.some((page) => page.status === 'ready' || Boolean(page.text || page.cover_fields.length || page.header_segments.length || page.footer_segments.length)) || discardDraft)
+      && !window.confirm(`这次处理会产生新的模型用量，成功后会覆盖本次处理页面已有的识别或校对文本。${discardDraft ? '当前未保存修改也会被放弃。' : ''}确定继续吗？`)) return
     setActionBusy(true)
     try {
       const result = await api.processBook(bookId, pages)
-      if (result.started) {
+      if (result.started && discardDraft) {
         setDirty(false)
-        setDraftText(sourcePage?.text ?? '')
+        setPageDraft(draftFromPage(sourcePage))
       }
-      setNotice({ kind: 'success', text: result.started ? '处理已开始，将逐页更新状态。' : '当前没有需要处理的页面。' })
+      setNotice({ kind: 'success', text: result.started ? '处理已开始，页面完成后自动更新，最终顺序保持不变。' : '当前没有需要处理的页面。' })
       await loadDetail(bookId, true)
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
@@ -318,7 +534,7 @@ export default function App() {
     setActionBusy(true)
     try {
       await api.pauseBook(selectedBookId)
-      setNotice({ kind: 'info', text: '已请求暂停。当前页完成后会停止处理后续页面。' })
+      setNotice({ kind: 'info', text: '已请求暂停。等待所有已开始的页面完成后暂停，不再开始新页面。' })
       await loadDetail(selectedBookId, true)
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
@@ -329,9 +545,9 @@ export default function App() {
   }
 
   const deleteBook = async () => {
-    if (!detail || deleting || uploading || actionBusy || saving || ['processing', 'pausing'].includes(detail.book.status)) return
+    if (!detail || processLocked) return
     const book = detail.book
-    if (!window.confirm(`确定删除《${book.title}》吗？这会删除该书的源文件、识别和校对结果，且无法撤销。`)) return
+    if (!window.confirm(`确定删除项目「${book.title}」吗？这会删除项目内全部源文件、识别和校对结果，且无法撤销。`)) return
     setDeleting(true)
     try {
       await api.deleteBook(book.id)
@@ -340,13 +556,11 @@ export default function App() {
       selectedBookIdRef.current = remaining[0]?.id ?? null
       setSelectedBookId(selectedBookIdRef.current)
       setDetail(null)
-      setSelectedPageNumber(1)
-      setDraftText('')
+      setPageDraft(draftFromPage(null))
       setDirty(false)
-      setProcessScope('current')
-      setProcessPages([])
-      setView('workspace')
-      setNotice({ kind: 'success', text: `已删除《${book.title}》。` })
+      setOrganizerDirty(false)
+      setView('upload')
+      setNotice({ kind: 'success', text: `已删除项目「${book.title}」。` })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
     } finally {
@@ -358,11 +572,15 @@ export default function App() {
     if (!detail || !sourcePage) return
     setSaving(true)
     try {
-      const saved = await api.savePage(detail.book.id, sourcePage.number, draftText)
+      const saved = await api.savePage(detail.book.id, sourcePage.number, {
+        ...pageDraft,
+        text: pageDraft.page_kind === 'content' ? pageDraft.text : '',
+        cover_fields: pageDraft.page_kind === 'content' ? [] : pageDraft.cover_fields.filter((field) => field.text.trim()),
+      })
       setDetail((current) => current ? { ...current, pages: current.pages.map((page) => page.number === saved.number ? saved : page) } : current)
-      setDraftText(saved.text)
+      setPageDraft(draftFromPage(saved))
       setDirty(false)
-      setNotice({ kind: 'success', text: '第 ' + saved.number + ' 页已保存。' })
+      setNotice({ kind: 'success', text: `${sourceLabel(saved)} 已保存。` })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
     } finally {
@@ -386,94 +604,105 @@ export default function App() {
     }
   }
 
-  const printBook = () => { setView('preview'); window.setTimeout(() => window.print(), 80) }
-  const isRunning = detail?.book.status === 'processing' || detail?.book.status === 'pausing'
-  const processLocked = isRunning || actionBusy || saving || uploading || deleting
-  const editLocked = isRunning || actionBusy || deleting || sourcePage?.status === 'processing'
-  const progress = detail?.book.page_count ? Math.round(detail.book.completed_pages / detail.book.page_count * 100) : 0
-  const oldBackendContract = Boolean(detail && (
-    !detail.book.usage || detail.pages.some((page) => typeof page.text !== 'string' || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage
-      || [...page.header_segments, ...page.footer_segments].some((segment) => !segment.alignment || !segment.row))
-  ))
-  const bookControlsVisible = Boolean(view === 'workspace' && selectedBookId && !detailLoading && detail?.book.id === selectedBookId && !oldBackendContract)
-  const noticeView = notice && <div className={'notice ' + notice.kind + ' no-print'} role="status"><span>{notice.text}</span><button onClick={() => setNotice(null)} aria-label="关闭提示">×</button></div>
-
   return (
     <div className="app-shell">
       <header className="topbar no-print">
-        <button className="brand" onClick={() => setView('workspace')}><span className="brand-mark">页</span><span>纸页重排</span></button>
+        <button className="brand" onClick={() => changeView(detail ? projectView(detail.book) : 'upload')} disabled={busy}><span className="brand-mark">页</span><span>纸页重排</span></button>
         <nav aria-label="主导航">
-          <button className={view === 'workspace' ? 'nav-active' : ''} onClick={() => setView('workspace')}>逐页校对</button>
-          <button className={view === 'preview' ? 'nav-active' : ''} onClick={() => setView('preview')} disabled={!detail || deleting}>整书预览</button>
-          <button className={view === 'settings' ? 'nav-active' : ''} onClick={() => setView('settings')}>设置</button>
+          <button className={view !== 'settings' ? 'nav-active' : ''} onClick={() => changeView(detail ? projectView(detail.book) : 'upload')} disabled={busy}>项目工作台</button>
+          <button className={view === 'settings' ? 'nav-active' : ''} onClick={() => changeView('settings')} disabled={busy}>设置</button>
         </nav>
       </header>
-      {!bookControlsVisible && noticeView}
+      {notice && <div className={'notice ' + notice.kind + ' no-print'} role="status"><span>{notice.text}</span><button onClick={() => setNotice(null)} aria-label="关闭提示">×</button></div>}
       {view === 'settings' ? <SettingsView onNotice={showNotice} /> : (
         <div className="layout">
           <aside className="library no-print">
-            <div className="library-heading"><div><p className="eyebrow">本地项目</p><h2>书库</h2></div><button className="compact-button" onClick={() => fileInput.current?.click()} disabled={uploading || deleting || actionBusy}>{uploading ? '导入中…' : '＋ 导入'}</button></div>
-            <input ref={fileInput} className="visually-hidden" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={upload} />
-            {initialLoading ? <p className="sidebar-state">正在读取书库…</p> : books.length === 0 ? <div className="library-empty"><p>还没有书籍</p><span>导入 PDF、PNG 或 JPEG 开始。</span></div> : (
+            <div className="library-heading"><div><p className="eyebrow">本地工作空间</p><h2>项目</h2></div><button className="compact-button" onClick={beginProject} disabled={busy}>＋ 新建</button></div>
+            {initialLoading ? <p className="sidebar-state">正在读取项目…</p> : books.length === 0 ? <div className="library-empty"><p>还没有项目</p><span>将同一本书的资料放在一起。</span></div> : (
               <div className="book-list">{books.map((book) => (
-                <button className={book.id === selectedBookId ? 'book-item selected' : 'book-item'} onClick={() => chooseBook(book.id)} disabled={deleting || actionBusy} key={book.id}>
+                <button className={book.id === selectedBookId && !newProject ? 'book-item selected' : 'book-item'} onClick={() => chooseBook(book.id)} disabled={busy} key={book.id} aria-current={book.id === selectedBookId && !newProject ? 'page' : undefined}>
                   <span className="book-item-title">{book.title}</span>
-                  <span className="book-item-meta"><span className={statusClass(book.status)}>{STATUS_LABEL[book.status] ?? book.status}</span><span>{book.page_count} 页</span></span>
+                  <span className="project-file-count">{book.file_count} 个文件 · {book.page_count} 页</span>
+                  <span className="book-item-meta"><span className={statusClass(book.status)}>{projectStatus(book)}</span>{book.selection_confirmed && <span>{book.completed_pages} / {book.selected_page_count} 已完成</span>}</span>
                 </button>
               ))}</div>
             )}
+            <p className="library-footnote">资料保存在本机<br />PDF 与图片可在同一项目中混排</p>
           </aside>
           <main className="main-panel">
-            {!selectedBookId ? <div className="welcome-state"><span className="welcome-icon">文</span><h1>从纸页到可读书稿</h1><p>导入扫描 PDF 或图片，逐页提取并校对 Markdown 文本。</p><button className="primary" onClick={() => fileInput.current?.click()}>导入第一本书</button></div>
-              : detailLoading || !detail || detail.book.id !== selectedBookId ? <div className="center-state">正在读取书籍…</div>
-              : oldBackendContract ? <div className="center-state"><h2>后端仍在运行旧版本</h2><p>请使用 stop.bat 和 start.bat 重启后端，以加载结构化页面接口。</p></div>
-              : view === 'preview' ? (
-                <>
-                  <div className="preview-toolbar no-print">
-                    <div><p className="eyebrow">整书预览</p><h1>{detail.book.title}</h1><p>按源页顺序显示识别内容；页眉页脚和原书页码位于纸张内。</p><UsageView usage={detail.book.usage} /></div>
-                    <div className="preview-actions"><div className="button-row"><button onClick={() => void exportData('json')} disabled={actionBusy}>下载 JSON</button><button onClick={() => void exportData('html')} disabled={actionBusy}>下载独立 HTML</button><button className="primary" onClick={printBook} disabled={actionBusy}>打印 / 存为 PDF</button></div></div>
-                    <p className="export-limit">独立 HTML 不加载远程资源，公式以 MathML 保存，离线显示取决于浏览器数学字体。</p>
-                  </div>
-                  <BookContent detail={detail} />
-                </>
-              ) : (
-                <>
-                  <header className="book-header">
-                    <div className="book-heading"><p className="eyebrow">{detail.book.filename}</p><h1>{detail.book.title}</h1><div className="book-summary"><span className={statusClass(detail.book.status)}>{STATUS_LABEL[detail.book.status] ?? detail.book.status}</span><span>全书已完成 {detail.book.completed_pages} / {detail.book.page_count} 页</span></div><UsageView usage={detail.book.usage} /></div>
-                    <div className="book-controls">
-                      {detail.pages.length > 1 && <fieldset className="process-scope" disabled={processLocked}>
-                        <legend>处理范围</legend>
-                        <div className="scope-options">
-                          <label><input type="radio" name="process-scope" checked={processScope === 'current'} onChange={() => setProcessScope('current')} />当前页（第 {selectedPageNumber} 页）</label>
-                          <label><input type="radio" name="process-scope" checked={processScope === 'selected'} onChange={() => setProcessScope('selected')} />选择页面</label>
-                          <label><input type="radio" name="process-scope" checked={processScope === 'all'} onChange={() => setProcessScope('all')} />整本</label>
-                        </div>
-                        {processScope === 'selected' && <div className="process-page-picker" role="group" aria-label="选择处理页面">
-                          <span>已选 {processPages.length} 页</span>
-                          <div className="process-page-list">{detail.pages.map((page) => <label key={page.number}><input type="checkbox" checked={processPages.includes(page.number)} onChange={(event) => setProcessPages((current) => event.target.checked ? [...current, page.number] : current.filter((number) => number !== page.number))} />第 {page.number} 页 <span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></label>)}</div>
-                        </div>}
-                      </fieldset>}
-                      <div className="book-actions"><button onClick={processBook} className="primary" disabled={processLocked || (processScope === 'selected' && processPages.length === 0)}>{isRunning ? '处理中…' : '处理'}</button>{isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}<button className="danger-action" onClick={deleteBook} disabled={isRunning || actionBusy || saving || uploading || deleting}>{deleting ? '删除中…' : '删除此书'}</button></div>
-                      {noticeView}
+            {newProject ? (
+              <section className="project-create">
+                <p className="eyebrow">建立一本书的工作空间</p><h1>新建项目</h1><p>为这份书稿起个名字，再把 PDF、扫描图和补充页放进同一个项目。</p>
+                <form onSubmit={(event) => { event.preventDefault(); void createProject() }}>
+                  <label htmlFor="project-title">项目名称</label><input id="project-title" value={projectTitle} onChange={(event) => setProjectTitle(event.target.value)} maxLength={200} placeholder="例如：Python 学习手册" autoFocus disabled={actionBusy} />
+                  <div className="button-row"><button className="primary" type="submit" disabled={!projectTitle.trim() || actionBusy}>{actionBusy ? '创建中…' : '创建项目并添加资料'}</button><button type="button" onClick={() => setNewProject(false)} disabled={actionBusy}>取消</button></div>
+                </form>
+              </section>
+            ) : !selectedBookId ? (
+              <div className="welcome-state"><span className="welcome-icon">页</span><h1>多份资料，一本书稿</h1><p>先建立项目，汇集 PDF 与图片；确认页序后，再识别和校对。</p><button className="primary" onClick={beginProject} disabled={busy}>新建第一个项目</button></div>
+            ) : detailLoading || !detail || detail.book.id !== selectedBookId ? <div className="center-state">正在读取项目…</div>
+              : oldBackendContract ? <div className="center-state"><h2>后端仍在运行旧版本</h2><p>请使用 stop.bat 和 start.bat 重启后端，以加载多文件项目接口。</p></div>
+              : <>
+                <header className="book-header project-header no-print">
+                  <div className="book-overview">
+                    <div className="book-heading">
+                      <p className="eyebrow">当前项目</p><div className="book-title-row"><h1>{detail.book.title}</h1><span className={statusClass(detail.book.status)}>{projectStatus(detail.book)}</span></div>
+                      <div className="book-meta"><p className="book-summary"><span>{detail.files.length} 个文件</span><span>源资料 {detail.book.page_count} 页</span>{detail.book.selection_confirmed && <><span>编排 {detail.book.selected_page_count} 页</span><span>已完成 {detail.book.completed_pages} 页</span></>}</p></div>
                     </div>
-                  </header>
-                  <div className="progress-track" aria-label={'全书已完成比例 ' + progress + '%'}><span style={{ width: progress + '%' }} /></div>
-                  {detail.book.error && <div className="error-panel"><strong>处理失败</strong><span>{detail.book.error}</span></div>}
-                  <div className="workspace-grid">
-                    <aside className="page-rail" aria-label="查看页面">{detail.pages.map((page) => <button key={page.number} className={page.number === selectedPageNumber ? 'page-link selected' : 'page-link'} onClick={() => choosePage(page)} disabled={deleting || actionBusy}><span>第 {page.number} 页</span><span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></button>)}</aside>
-                    {sourcePage ? (
-                      <div className="proofing-area">
-                        <div className="page-heading"><div><p className="eyebrow">逐页结果</p><h2>第 {sourcePage.number} 页</h2><span className={statusClass(sourcePage.status)}>{STATUS_LABEL[sourcePage.status] ?? sourcePage.status}</span></div><UsageView usage={sourcePage.usage} attempts={sourcePage.attempts} /></div>
+                    <button className="book-delete danger-action" onClick={deleteBook} disabled={processLocked}>{deleting ? '删除中…' : '删除项目'}</button>
+                  </div>
+                  <nav className="workflow-nav" aria-label="项目处理步骤">
+                    <button className={view === 'upload' ? 'current' : ''} aria-current={view === 'upload' ? 'step' : undefined} onClick={() => changeView('upload')} disabled={busy}><span>1</span><strong>上传资料</strong><small>{detail.book.upload_confirmed ? '已确认' : '确认文件'}</small></button>
+                    <button className={view === 'organize' ? 'current' : ''} aria-current={view === 'organize' ? 'step' : undefined} onClick={() => changeView('organize')} disabled={!detail.book.upload_confirmed || busy || isRunning}><span>2</span><strong>页面编排</strong><small>{detail.book.selection_confirmed ? '已确认' : '选页与排序'}</small></button>
+                    <button className={view === 'workspace' ? 'current' : ''} aria-current={view === 'workspace' ? 'step' : undefined} onClick={() => changeView('workspace')} disabled={!detail.book.selection_confirmed || busy}><span>3</span><strong>逐页校对</strong><small>识别与编辑</small></button>
+                    <button className={view === 'preview' ? 'current' : ''} aria-current={view === 'preview' ? 'step' : undefined} onClick={() => changeView('preview')} disabled={!detail.book.selection_confirmed || busy}><span>4</span><strong>整书预览</strong><small>预览与导出</small></button>
+                  </nav>
+                </header>
+                {view === 'upload' ? (
+                  <section className="project-upload">
+                    <div className="upload-intro"><div><p className="eyebrow">项目资料</p><h2>{detail.files.length ? '确认本次使用的文件' : '把资料添加到这个项目'}</h2><p>支持一次选择多个 PDF、PNG 或 JPEG，可分批继续添加。</p></div><span className="file-total">{detail.files.length}<small>个文件</small></span></div>
+                    <input ref={fileInput} className="visually-hidden" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={upload} disabled={processLocked} />
+                    <div className="upload-target"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M8 11V5h12l5 5v17H8V21M20 5v6h5M3 16h13m-4-4 4 4-4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg><div><strong>{uploading ? '正在添加文件并读取页面…' : 'PDF 和图片，一起加入'}</strong><p>{isRunning ? '处理运行中；暂停后可添加资料。' : detail.book.selection_confirmed ? '添加新资料后，需要重新确认上传与编排。已有识别结果会保留。' : '上传完成后点击下方确认，再选择页面和编排顺序。'}</p></div><button className="primary" onClick={() => fileInput.current?.click()} disabled={processLocked}>{uploading ? '上传中…' : '选择文件'}</button></div>
+                    {uploadError && <div className="upload-error" role="alert"><strong>文件添加未完成</strong><p>{uploadError}</p><span>下方列表显示当前项目已保存的文件，请核对后再继续添加。</span></div>}
+                    {detail.files.length > 0 && <div className="source-groups">{(['pdf', 'image'] as const).map((kind) => {
+                      const files = detail.files.filter((file) => file.kind === kind)
+                      return files.length > 0 && <section className="source-group" key={kind}><div className="source-group-heading"><h3>{kind === 'pdf' ? 'PDF 文档' : '图片'}</h3><span>{files.length} 个文件 · {files.reduce((total, file) => total + file.page_count, 0)} 页</span></div><ul>{files.map((file) => <li key={file.id}><span className={'file-kind ' + kind}>{kind === 'pdf' ? 'PDF' : '图'}</span><span className="source-filename" title={file.filename}>{file.filename}</span><span className="source-pages">{file.page_count} 页</span></li>)}</ul></section>
+                    })}</div>}
+                    <div className="upload-confirm"><p>{detail.files.length ? `共 ${detail.files.length} 个文件、${detail.book.page_count} 页。确认后进入页面编排。` : '先添加至少一个文件，再确认资料。'}</p><button className="primary" onClick={confirmUpload} disabled={processLocked || detail.files.length === 0}>{actionBusy ? '确认中…' : detail.book.upload_confirmed ? '进入页面编排' : '确认上传，开始编排'}</button></div>
+                  </section>
+                ) : view === 'organize' ? <ProjectOrganizer key={detail.book.id} bookId={detail.book.id} onConfirmed={confirmArrangement} onNotice={showNotice} disabled={processLocked} onDirtyChange={setOrganizerDirty} onBusyChange={setOrganizerBusy} />
+                  : view === 'preview' ? <>
+                    <div className="preview-toolbar no-print"><div><p className="eyebrow">整书预览</p><h2>按已确认的编排阅读</h2><p>共 {detail.pages.length} 页；下方顺序与已确认的编排及导出顺序一致。</p><UsageView usage={detail.book.usage} /></div><div className="preview-actions"><div className="button-row"><button onClick={() => void exportData('json')} disabled={busy}>下载 JSON</button><button onClick={() => void exportData('html')} disabled={busy}>下载独立 HTML</button><button className="primary" onClick={() => window.print()} disabled={busy}>打印 / 存为 PDF</button></div></div><p className="export-limit">独立 HTML 不加载远程资源，公式以 MathML 保存，离线显示取决于浏览器数学字体。</p></div>
+                    <BookContent detail={detail} />
+                  </> : <>
+                    <div className="proofing-toolbar no-print"><div><p>{pendingPages.length ? `待处理 ${pendingPages.length} 页` : detail.pages.length ? '编排中的页面均已完成' : '编排暂无页面'}</p><UsageView usage={detail.book.usage} /></div><div className="button-row"><button onClick={() => changeView('organize')} disabled={processLocked}>修改页面编排</button><button onClick={processBook} className="primary" disabled={processLocked || pagesToProcess.length === 0}>{isRunning ? '处理中…' : pendingPages.length ? '识别未完成页' : '重新识别全部页'}</button>{isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}</div></div>
+                    <div className="progress-track" aria-label={'编排已完成比例 ' + progress + '%'}><span style={{ width: progress + '%' }} /></div>
+                    {detail.book.error && <div className="error-panel"><strong>处理失败</strong><span>{detail.book.error}</span></div>}
+                    <div className="workspace-grid">
+                      <aside className="page-rail" aria-label="已编排页面">{detail.pages.map((page, index) => <div className="page-row unconfirmed" key={page.number}><button className={page.number === selectedPageNumber ? 'page-link selected' : 'page-link'} onClick={() => choosePage(page)} disabled={busy} aria-current={page.number === selectedPageNumber ? 'page' : undefined}><span className="page-order-label">编排第 {index + 1} 页</span><span className="page-source-name" title={sourceLabel(page)}>{sourceLabel(page)}</span><span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></button></div>)}</aside>
+                      {sourcePage ? <div className="proofing-area">
+                        <div className="page-heading"><div><p className="eyebrow">编排第 {detail.pages.findIndex((page) => page.number === sourcePage.number) + 1} 页</p><h2 className="proofing-source-title">{sourceLabel(sourcePage)}</h2><span className={statusClass(sourcePage.status)}>{STATUS_LABEL[sourcePage.status] ?? sourcePage.status}</span></div><UsageView usage={sourcePage.usage} attempts={sourcePage.attempts} /></div>
                         {sourcePage.error && <div className="page-error">{sourcePage.error}</div>}
                         <div className="proofing-grid">
-                          <section className="text-panel"><div className="panel-title"><strong>正文 Markdown 源文本</strong><button className="primary" onClick={savePage} disabled={!dirty || saving || editLocked}>{saving ? '保存中…' : '保存本页'}</button></div>{editLocked && <div className="lock-note">{deleting ? '删除中，本页暂不可编辑。' : '处理运行中，本页暂不可编辑。'}</div>}<textarea aria-label="本页正文 Markdown 源文本" value={draftText} onChange={(event) => { setDraftText(event.target.value); setDirty(true) }} disabled={editLocked} spellCheck={false} placeholder="本页暂无正文" /></section>
-                          <section className="render-panel"><div className="panel-title"><strong>预览</strong></div><div className="page-render"><PageContent page={sourcePage} text={draftText} />{!draftText && <p className="empty-page">本页暂无正文</p>}</div></section>
+                          <section className="text-panel">
+                            <div className="panel-title"><strong>本页校对</strong><button className="primary" onClick={savePage} disabled={!dirty || editLocked}>{saving ? '保存中…' : '保存本页'}</button></div>
+                            {editLocked && <div className="lock-note">{isRunning ? '处理运行中，本页暂不可编辑。' : '正在更新，本页暂不可编辑。'}</div>}
+                            <PageEditor draft={pageDraft} onChange={(draft) => { setPageDraft(draft); setDirty(true) }} disabled={editLocked} />
+                          </section>
+                          <section className="render-panel">
+                            <div className="panel-title"><strong>排版预览</strong><a href={api.pagePreviewUrl(detail.book.id, sourcePage.number)} target="_blank" rel="noreferrer">查看原页</a></div>
+                            <div className="page-render">
+                              <PageContent page={{ ...sourcePage, ...pageDraft }} />
+                              {pageDraft.page_kind === 'content'
+                                ? !pageDraft.text && <p className="empty-page">本页暂无正文</p>
+                                : !pageDraft.cover_fields.some((field) => field.text.trim()) && <p className="empty-page">本页暂无书目信息</p>}
+                            </div>
+                          </section>
                         </div>
-                      </div>
-                    ) : <div className="center-state">暂无页面。</div>}
-                  </div>
-                </>
-              )}
+                      </div> : <div className="page-list-empty"><h2>编排暂无页面</h2><p>返回页面编排，选择需要识别和校对的页面。</p><button onClick={() => changeView('organize')} disabled={processLocked}>进入页面编排</button></div>}
+                    </div>
+                  </>}
+              </>}
           </main>
         </div>
       )}

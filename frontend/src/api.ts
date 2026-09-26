@@ -1,4 +1,4 @@
-import type { Book, BookDetail, Page, Settings } from './types'
+import type { Arrangement, Book, BookDetail, Page, PageDraft, Settings } from './types'
 
 const API_PREFIX = '/api'
 
@@ -36,6 +36,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   listBooks: () => request<Book[]>('/books'),
+  createProject: (title: string) => request<Book>('/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  }),
+  uploadFiles: (id: string, files: File[]) => {
+    const form = new FormData()
+    files.forEach((file) => form.append('files', file))
+    return request<Arrangement>(`/books/${encodeURIComponent(id)}/files`, { method: 'POST', body: form })
+  },
+  confirmUpload: (id: string) => request<Arrangement>(`/books/${encodeURIComponent(id)}/confirm-upload`, { method: 'POST' }),
+  getArrangement: (id: string) => request<Arrangement>(`/books/${encodeURIComponent(id)}/arrangement`),
+  saveArrangement: (id: string, order: { file_order: string[]; file_parents: Record<string, string | null>; page_order: number[] }) =>
+    request<BookDetail>(`/books/${encodeURIComponent(id)}/arrangement`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(order),
+    }),
+  pagePreviewUrl: (id: string, number: number) => `${API_PREFIX}/books/${encodeURIComponent(id)}/pages/${number}/preview`,
   getBook: (id: string) => request<BookDetail>(`/books/${encodeURIComponent(id)}`),
   deleteBook: (id: string) => request<void>(`/books/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   uploadBook: (file: File) => {
@@ -53,13 +72,21 @@ export const api = {
     request<{ requested: boolean }>(`/books/${encodeURIComponent(id)}/pause`, {
       method: 'POST',
     }),
-  savePage: (bookId: string, pageNumber: number, text: string) =>
+  addPages: (id: string, pages: number[]) =>
+    request<BookDetail>(`/books/${encodeURIComponent(id)}/pages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pages }),
+    }),
+  removePage: (id: string, pageNumber: number) =>
+    request<BookDetail>(`/books/${encodeURIComponent(id)}/pages/${encodeURIComponent(pageNumber)}`, { method: 'DELETE' }),
+  savePage: (bookId: string, pageNumber: number, page: PageDraft) =>
     request<Page>(
       `/books/${encodeURIComponent(bookId)}/pages/${encodeURIComponent(pageNumber)}`,
       {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify(page),
       },
     ),
   getSettings: () => request<Settings>('/settings'),
@@ -69,15 +96,30 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         base_url: settings.base_url,
+        models_path: settings.models_path,
         responses_path: settings.responses_path,
         extraction_model: settings.extraction_model,
         reasoning_effort: settings.reasoning_effort,
         classification_model: settings.classification_model,
         api_key: settings.api_key || '',
         structured_output: false,
-        max_output_tokens: settings.max_output_tokens,
         timeout_seconds: settings.timeout_seconds,
+        processing_concurrency: settings.processing_concurrency,
+        context_reuse_enabled: settings.context_reuse_enabled,
+        context_reuse_max_pages: settings.context_reuse_max_pages,
         clear_api_key: clearApiKey,
+      }),
+    }),
+  fetchModels: (settings: Settings, clearApiKey: boolean) =>
+    request<{ models: string[] }>('/settings/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_url: settings.base_url,
+        models_path: settings.models_path,
+        api_key: settings.api_key || '',
+        clear_api_key: clearApiKey,
+        timeout_seconds: settings.timeout_seconds,
       }),
     }),
   testSettings: () => request<{ ok: boolean; message: string }>('/settings/test', { method: 'POST' }),

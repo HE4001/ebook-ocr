@@ -42,7 +42,9 @@ class BackendTests(unittest.TestCase):
             ])
             storage.save_manual_text(book_id, 1, "旧一")
             storage.save_manual_text(book_id, 2, "旧二")
-            client.put("/api/settings", json={"api_key": "secret", "extraction_model": "vision"})
+            client.put("/api/settings", json={
+                "api_key": "secret", "extraction_model": "vision", "processing_concurrency": 1,
+            })
 
             def wait_finished() -> None:
                 deadline = time.monotonic() + 5
@@ -82,10 +84,17 @@ class BackendTests(unittest.TestCase):
                 wait_finished()
                 self.assertEqual(called, [1, 2])
                 self.assertEqual([page.text for page in storage.get_pages(book_id)],
-                                 ["新1", "新2", ""])
-                self.assertEqual(storage.get_book(book_id).status, "uploaded")
+                                 ["新1", "新2"])
+                self.assertEqual([page.number for page in storage.get_pages(book_id)], [1, 2])
+                self.assertEqual(storage.get_book(book_id).page_count, 3)
+                self.assertEqual(storage.get_book(book_id).selected_page_count, 2)
+                self.assertTrue(storage.get_book(book_id).selection_confirmed)
+                self.assertEqual(storage.get_book(book_id).status, "ready")
                 self.assertIsNone(storage.get_book(book_id).error)
 
+                self.assertEqual(client.post(f"/api/books/{book_id}/pages", json={
+                    "pages": [3],
+                }).status_code, 200)
                 block_second = True
                 self.assertEqual(client.post(f"/api/books/{book_id}/process", json={}).json(),
                                  {"started": True})
@@ -130,7 +139,9 @@ class BackendTests(unittest.TestCase):
                 (1, 32, 24, "page-0001.png"),
                 (2, 32, 24, "page-0002.png"),
             ])
-            client.put("/api/settings", json={"api_key": "secret", "extraction_model": "vision"})
+            client.put("/api/settings", json={
+                "api_key": "secret", "extraction_model": "vision", "processing_concurrency": 1,
+            })
             first_started = threading.Event()
             release_first = threading.Event()
             called: list[int] = []
@@ -249,7 +260,7 @@ class BackendTests(unittest.TestCase):
                 settings["base_url"] = "https://api.deepseek.com"
                 settings["extraction_model"] = "deepseek-flash"
                 settings["reasoning_effort"] = "high"
-                settings["max_output_tokens"] = 24_000
+                settings["max_output_tokens"] = 24_000  # 旧配置不能重新启用请求额度。
                 with patch("backend.responses_client.httpx.AsyncClient", FakeClient), patch(
                     "backend.responses_client.asyncio.sleep", return_value=None
                 ):
@@ -262,10 +273,11 @@ class BackendTests(unittest.TestCase):
                 self.assertEqual(page.attempts, 2)
                 self.assertEqual(sent_urls[0], "https://api.deepseek.com/responses")
                 self.assertEqual(sent_payloads[0]["reasoning"], {"effort": "high"})
-                self.assertEqual(sent_payloads[0]["max_output_tokens"], 24_000)
+                for payload in sent_payloads:
+                    self.assertNotIn("max_output_tokens", payload)
                 self.assertEqual(sent_payloads[0]["model"], "deepseek-flash")
                 self.assertEqual(sent_payloads[0]["text"]["format"]["type"], "json_schema")
-                self.assertNotIn("strict", sent_payloads[0]["text"]["format"])
+                self.assertIs(sent_payloads[0]["text"]["format"]["strict"], True)
                 self.assertIn("手写批注", sent_payloads[0]["input"][0]["content"][0]["text"])
                 image = sent_payloads[0]["input"][1]["content"][1]
                 self.assertEqual(image["type"], "input_image")
@@ -392,15 +404,21 @@ class BackendTests(unittest.TestCase):
     def test_reasoning_setting_and_connection_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory, TestClient(create_app(Path(directory))) as client:
             self.assertEqual(client.get("/api/settings").json()["reasoning_effort"], "")
-            self.assertEqual(client.get("/api/settings").json()["max_output_tokens"], 12_000)
+            self.assertNotIn("max_output_tokens", client.get("/api/settings").json())
             saved = client.put("/api/settings", json={
                 "api_key": "secret", "extraction_model": "vision",
                 "reasoning_effort": "  custom_depth  ",
-                "max_output_tokens": 24_000,
             })
             self.assertEqual(saved.json()["reasoning_effort"], "custom_depth")
-            self.assertEqual(saved.json()["max_output_tokens"], 24_000)
-            self.assertEqual(client.put("/api/settings", json={"max_output_tokens": 0}).status_code, 422)
+            self.assertEqual(saved.status_code, 200)
+            self.assertNotIn("max_output_tokens", saved.json())
+            # 模拟旧版已持久化的设置，读取和连接测试都不能继续使用其额度。
+            storage = client.app.state.storage
+            legacy_settings = {**storage.get_settings(), "max_output_tokens": 24_000}
+            with storage._connect() as connection:
+                connection.execute("UPDATE settings SET value = ? WHERE id = 1", (json.dumps(legacy_settings),))
+            self.assertNotIn("max_output_tokens", client.get("/api/settings").json())
+            self.assertNotIn("max_output_tokens", storage.get_settings())
             payloads = []
 
             async def fake_post(_self, payload, *_args):
@@ -410,12 +428,15 @@ class BackendTests(unittest.TestCase):
             with patch.object(ResponsesClient, "_post", fake_post):
                 self.assertTrue(client.post("/api/settings/test").json()["ok"])
             self.assertEqual(payloads[0]["reasoning"], {"effort": "custom_depth"})
-            self.assertEqual(payloads[0]["max_output_tokens"], 24_000)
+            self.assertNotIn("max_output_tokens", payloads[0])
             client.put("/api/settings", json={"reasoning_effort": "  "})
             with patch.object(ResponsesClient, "_post", fake_post):
                 self.assertTrue(client.post("/api/settings/test").json()["ok"])
             self.assertNotIn("reasoning", payloads[1])
-            self.assertEqual(client.app.state.storage.get_settings()["max_output_tokens"], 24_000)
+            self.assertNotIn("max_output_tokens", payloads[1])
+            with storage._connect() as connection:
+                persisted = json.loads(connection.execute("SELECT value FROM settings WHERE id = 1").fetchone()[0])
+            self.assertNotIn("max_output_tokens", persisted)
 
     def test_delete_book_isolated_and_running_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory, TestClient(create_app(Path(directory))) as client:
@@ -457,7 +478,11 @@ class BackendTests(unittest.TestCase):
             detail = client.get(f"/api/books/{book_id}").json()
             self.assertEqual(set(detail["pages"][0]), {
                 "number", "status", "error", "text", "header_segments",
-                "footer_segments", "usage", "attempts"})
+                "footer_segments", "usage", "attempts", "source_id",
+                "source_filename", "source_page", "page_kind", "cover_fields"})
+            self.assertEqual(client.put(f"/api/books/{book_id}/arrangement", json={
+                "file_order": ["legacy"], "page_order": [1],
+            }).status_code, 200)
             saved = client.put(f"/api/books/{book_id}/pages/1", json={
                 "text": "**人工校对**"})
             self.assertEqual(saved.status_code, 200)
@@ -480,7 +505,48 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(markdown.status_code, 200)
             self.assertIn("text/markdown", markdown.headers["content-type"])
             self.assertIn('.md"', markdown.headers["content-disposition"])
-            self.assertEqual(markdown.text, "# page\n\n## 第 1 页\n\n**重新识别**\n")
+            self.assertEqual(markdown.text,
+                             "# page\n\n## 第 1 页 · page.png / 源第 1 页\n\n**重新识别**\n")
+
+            fields = [
+                {"kind": "title", "text": "*书名* $x$"},
+                {"kind": "author", "text": "作者甲"},
+                {"kind": "publisher", "text": "出版社乙"},
+            ]
+            for invalid in (
+                {"text": "正文", "page_kind": "content", "cover_fields": fields},
+                {"text": "正文", "page_kind": "front_cover", "cover_fields": fields},
+            ):
+                self.assertEqual(client.put(
+                    f"/api/books/{book_id}/pages/1", json=invalid,
+                ).status_code, 422)
+            for kind, label in (("front_cover", "封面"), ("back_cover", "封底")):
+                cover = client.put(f"/api/books/{book_id}/pages/1", json={
+                    "text": "", "page_kind": kind, "cover_fields": fields,
+                })
+                self.assertEqual(cover.status_code, 200)
+                page = cover.json()
+                self.assertEqual((page["page_kind"], page["cover_fields"]), (kind, fields))
+                self.assertEqual((page["text"], page["header_segments"], page["footer_segments"]),
+                                 ("", [], []))
+                self.assertEqual(client.get(f"/api/books/{book_id}").json()["pages"][0], page)
+                self.assertEqual(client.get(f"/api/books/{book_id}/export").json()["pages"][0], page)
+                exported_cover = client.get(f"/api/books/{book_id}/export.md").text
+                self.assertIn(f"### {label}", exported_cover)
+                self.assertIn(r"**书名**：\*书名\* \$x\$", exported_cover)
+                self.assertIn("**作者**：作者甲", exported_cover)
+                self.assertIn("**出版社**：出版社乙", exported_cover)
+
+            client.app.state.storage.fail_page(book_id, 1, "识别失败")
+            failed = client.get(f"/api/books/{book_id}").json()["pages"][0]
+            self.assertEqual((failed["status"], failed["page_kind"], failed["cover_fields"]),
+                             ("failed", "back_cover", fields))
+            content = client.put(f"/api/books/{book_id}/pages/1", json={
+                "text": "修正为正文", "page_kind": "content", "cover_fields": [],
+            })
+            self.assertEqual(content.status_code, 200)
+            self.assertEqual((content.json()["text"], content.json()["page_kind"],
+                              content.json()["cover_fields"]), ("修正为正文", "content", []))
 
     def test_api_key_persistence_lifecycle_and_failed_save(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

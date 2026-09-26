@@ -4,7 +4,6 @@ import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import urlsplit
 
 import httpx
 from pydantic import ValidationError
@@ -23,6 +22,47 @@ class ModelServiceError(RuntimeError):
     pass
 
 
+def _endpoint_url(base_url: str, path: str) -> str:
+    base_url = base_url.rstrip("/")
+    return base_url + "/" + path.lstrip("/") if path else base_url
+
+
+async def fetch_models(
+    *, base_url: str, models_path: str, api_key: str, timeout_seconds: int,
+) -> list[str]:
+    async with httpx.AsyncClient(
+        follow_redirects=False,
+        timeout=httpx.Timeout(timeout_seconds),
+    ) as client:
+        try:
+            response = await client.get(
+                _endpoint_url(base_url, models_path),
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        except httpx.TimeoutException as exc:
+            raise ModelServiceError("读取模型列表超时") from exc
+        except httpx.RequestError as exc:
+            raise ModelServiceError("无法连接模型服务") from exc
+    if 300 <= response.status_code < 400:
+        raise ModelServiceError("模型服务返回重定向，已拒绝转发密钥")
+    if not response.is_success:
+        raise ModelServiceError(f"模型服务 HTTP {response.status_code}")
+    if len(response.content) > MAX_RESPONSE_BYTES:
+        raise ModelServiceError("模型列表响应过大")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ModelServiceError("模型列表响应格式无效") from exc
+    if not isinstance(data, dict) or data.get("object") != "list" or not isinstance(data.get("data"), list):
+        raise ModelServiceError("模型列表响应格式无效")
+    model_ids: list[str] = []
+    for item in data["data"]:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip():
+            raise ModelServiceError("模型列表响应格式无效")
+        model_ids.append(item["id"])
+    return list(dict.fromkeys(model_ids))
+
+
 @dataclass(frozen=True)
 class ResponsesConfig:
     base_url: str
@@ -30,20 +70,21 @@ class ResponsesConfig:
     api_key: str
     structured_output: bool  # 兼容旧设置；页面请求固定使用 JSON Schema。
     timeout_seconds: int
-    max_output_tokens: int
     reasoning_effort: str = ""
+    context_reuse_enabled: bool = False
 
     @property
     def endpoint(self) -> str:
-        base_url = self.base_url.rstrip("/")
-        if not self.responses_path:
-            return base_url
-        return base_url + "/" + self.responses_path.lstrip("/")
+        return _endpoint_url(self.base_url, self.responses_path)
 
 
 class ResponsesClient:
     def __init__(self, config: ResponsesConfig):
         self.config = config
+        self.previous_response_id: str | None = None
+
+    def reset_context(self) -> None:
+        self.previous_response_id = None
 
     async def request_page(
         self,
@@ -56,24 +97,30 @@ class ResponsesClient:
             "type": "json_schema",
             "name": "page_transcription",
             "schema": PAGE_RESPONSE_SCHEMA,
+            "strict": True,
         }
-        if urlsplit(self.config.base_url).hostname != "api.deepseek.com":
-            output_format["strict"] = True
         payload: dict[str, Any] = {
             "model": model,
             "input": input_value,
-            "store": False,
-            "max_output_tokens": self.config.max_output_tokens,
+            "store": self.config.context_reuse_enabled,
             "text": {"format": output_format},
         }
+        if self.config.context_reuse_enabled and self.previous_response_id is not None:
+            payload["previous_response_id"] = self.previous_response_id
         if self.config.reasoning_effort:
             payload["reasoning"] = {"effort": self.config.reasoning_effort}
         data = await self._post(payload, on_attempt_start, on_attempt_end)
         response_text = self.extract_output_text(data)
         try:
-            return StructuredPageResult.model_validate(json.loads(response_text))
+            result = StructuredPageResult.model_validate(json.loads(response_text))
         except (ValueError, ValidationError) as exc:
             raise ModelServiceError("模型返回的页面结构无效") from exc
+        if self.config.context_reuse_enabled:
+            response_id = data.get("id")
+            if not isinstance(response_id, str) or not response_id.strip():
+                raise ModelServiceError("模型接口未返回有效 response id，不支持实验性上下文续接")
+            self.previous_response_id = response_id
+        return result
 
     async def test_connection(self, model: str) -> None:
         payload = {
@@ -85,7 +132,6 @@ class ResponsesClient:
                 }
             ],
             "store": False,
-            "max_output_tokens": self.config.max_output_tokens,
         }
         if self.config.reasoning_effort:
             payload["reasoning"] = {"effort": self.config.reasoning_effort}
@@ -165,7 +211,7 @@ class ResponsesClient:
             details = data.get("incomplete_details")
             reason = details.get("reason") if isinstance(details, dict) else None
             if reason == "max_output_tokens":
-                raise ModelServiceError("模型已达输出上限（含推理），请增加输出额度或降低推理程度")
+                raise ModelServiceError("模型已达服务端输出上限（含推理），可降低推理程度或更换模型")
             if reason == "content_filter":
                 raise ModelServiceError("模型输出被内容过滤器截断")
             raise ModelServiceError("模型响应未完成")

@@ -3,12 +3,12 @@ from __future__ import annotations
 import io
 import math
 from pathlib import Path
+from typing import Any
 
 import pymupdf as fitz
 from PIL import Image, ImageOps
 
 
-MAX_PAGES = 500
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_RENDER_PIXELS = 20_000_000
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
@@ -37,48 +37,12 @@ def _import_pdf(data: bytes, book_dir: Path) -> list[tuple[int, int, int, str]]:
             raise ImportFailure("暂不支持加密 PDF")
         if document.page_count < 1:
             raise ImportFailure("PDF 没有页面")
-        if document.page_count > MAX_PAGES:
-            raise ImportFailure(f"PDF 页数不能超过 {MAX_PAGES}")
         book_dir.mkdir(parents=True, exist_ok=True)
         (book_dir / "source.pdf").write_bytes(data)
-        pages: list[tuple[int, int, int, str]] = []
-        try:
-            page_paths: list[Path] = []
-            for index in range(document.page_count):
-                page_path = book_dir / f"page-{index + 1:04d}.pdf"
-                _save_single_pdf_page(document, index, page_path)
-                page_paths.append(page_path)
-
-            for index, page_path in enumerate(page_paths):
-                # Reopen the generated one-page PDF so the image is derived from
-                # the exact source page kept on disk, including crop and rotation.
-                single_page_document = fitz.open(page_path)
-                try:
-                    if single_page_document.page_count != 1:
-                        raise ImportFailure("拆分后的 PDF 页面数量无效")
-                    page = single_page_document[0]
-                    base_width, base_height = page.rect.width, page.rect.height
-                    if base_width <= 0 or base_height <= 0:
-                        raise ImportFailure("PDF 页面尺寸无效")
-                    scale = 2.0
-                    pixels = base_width * base_height * scale * scale
-                    if pixels > MAX_RENDER_PIXELS:
-                        scale = math.sqrt(MAX_RENDER_PIXELS / (base_width * base_height))
-                    pixmap = page.get_pixmap(
-                        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
-                    )
-                finally:
-                    single_page_document.close()
-                if pixmap.width * pixmap.height > MAX_RENDER_PIXELS + 10_000:
-                    raise ImportFailure("PDF 页面尺寸过大")
-                image_name = f"page-{index + 1:04d}.png"
-                pixmap.save(book_dir / image_name)
-                pages.append((index + 1, pixmap.width, pixmap.height, image_name))
-        except ImportFailure:
-            raise
-        except Exception as exc:
-            raise ImportFailure("无法渲染 PDF 页面") from exc
-        return pages
+        return [
+            (number, 0, 0, f"page-{number:04d}.png")
+            for number in range(1, document.page_count + 1)
+        ]
     finally:
         document.close()
 
@@ -98,9 +62,8 @@ def _save_single_pdf_page(document: fitz.Document, index: int, target: Path) -> 
 def ensure_pdf_pages(book_dir: Path, page_numbers: list[int]) -> None:
     """Create missing single-page PDFs for an already imported source PDF.
 
-    This is used for books imported before single-page PDF files were stored. It
-    only creates the requested missing pages; existing files and rendered images
-    are left untouched.
+    Only the requested missing pages are created; existing files and rendered
+    images are left untouched, including assets from earlier imports.
     """
     requested = sorted(set(page_numbers))
     if not requested:
@@ -133,6 +96,42 @@ def ensure_pdf_pages(book_dir: Path, page_numbers: list[int]) -> None:
         document.close()
 
 
+def prepare_pdf_page(book_dir: Path, number: int) -> tuple[int, int, int, str]:
+    """Prepare and reuse assets for one selected source PDF page."""
+    ensure_pdf_pages(book_dir, [number])
+    image_name = f"page-{number:04d}.png"
+    image_path = book_dir / image_name
+    try:
+        if image_path.is_file():
+            with Image.open(image_path) as image:
+                width, height = image.size
+            return number, width, height, image_name
+
+        # Render the saved single-page PDF to preserve its crop and rotation.
+        with fitz.open(book_dir / f"page-{number:04d}.pdf") as document:
+            if document.page_count != 1:
+                raise ImportFailure("拆分后的 PDF 页面数量无效")
+            page = document[0]
+            base_width, base_height = page.rect.width, page.rect.height
+            if base_width <= 0 or base_height <= 0:
+                raise ImportFailure("PDF 页面尺寸无效")
+            scale = 2.0
+            pixels = base_width * base_height * scale * scale
+            if pixels > MAX_RENDER_PIXELS:
+                scale = math.sqrt(MAX_RENDER_PIXELS / (base_width * base_height))
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
+            )
+        if pixmap.width * pixmap.height > MAX_RENDER_PIXELS + 10_000:
+            raise ImportFailure("PDF 页面尺寸过大")
+        pixmap.save(image_path)
+        return number, pixmap.width, pixmap.height, image_name
+    except ImportFailure:
+        raise
+    except Exception as exc:
+        raise ImportFailure("无法渲染 PDF 页面") from exc
+
+
 def _import_image(
     data: bytes, suffix: str, book_dir: Path
 ) -> list[tuple[int, int, int, str]]:
@@ -159,6 +158,44 @@ def _import_image(
         raise
     except Exception as exc:
         raise ImportFailure("无法读取图片文件") from exc
+
+
+def prepare_source_page(book_dir: Path, record: dict[str, Any]) -> tuple[int, int, str]:
+    """Resolve a stable project page to its original file and local source page."""
+    if record["source_kind"] == "pdf":
+        _, width, height, name = prepare_pdf_page(
+            book_dir / record["source_directory"], record["source_page"]
+        )
+        image_name = str(Path(record["source_directory"]) / name).replace("\\", "/")
+        return width, height, image_name
+    return record["width"], record["height"], record["image_name"]
+
+
+def prepare_source_preview(book_dir: Path, record: dict[str, Any]) -> Path:
+    """Cache a small preview of only the requested page, without preparing OCR assets."""
+    directory = book_dir / record["source_directory"]
+    target = directory / f'preview-{record["source_page"]:04d}.png'
+    if target.is_file():
+        return target
+    try:
+        if record["source_kind"] == "pdf":
+            with fitz.open(directory / "source.pdf") as document:
+                page = document[record["source_page"] - 1]
+                width, height = page.rect.width, page.rect.height
+                if width <= 0 or height <= 0:
+                    raise ImportFailure("PDF 页面尺寸无效")
+                scale = min(1.5, 1200 / max(width, height))
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False)
+                pixmap.save(target)
+        else:
+            with Image.open(book_dir / record["image_name"]) as image:
+                image.thumbnail((1200, 1200))
+                image.save(target, format="PNG")
+        return target
+    except ImportFailure:
+        raise
+    except Exception as exc:
+        raise ImportFailure("无法预览源页面") from exc
 
 
 def create_source_assets(
