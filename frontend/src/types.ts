@@ -5,7 +5,10 @@ export type Usage = {
   complete: boolean
 }
 
+export type ApiProtocol = 'openai_responses' | 'gemini'
+
 export type Settings = {
+  api_protocol: ApiProtocol
   base_url: string
   models_path: string
   responses_path: string
@@ -23,6 +26,8 @@ export type Settings = {
 
 export type Status = 'uploaded' | 'processing' | 'pausing' | 'paused' | 'ready' | 'failed' | 'interrupted'
 
+export type PaperSize = 'a4' | 'a5' | 'a6' | 'b5' | 'b6' | 'trade_6x9'
+
 export type Book = {
   id: string
   title: string
@@ -37,6 +42,7 @@ export type Book = {
   error: string | null
   created_at: string
   usage: Usage
+  paper_size: PaperSize
 }
 
 export type Page = {
@@ -48,6 +54,7 @@ export type Page = {
   error: string | null
   text: string
   page_kind: PageKind
+  page_side: PageSide
   cover_fields: CoverField[]
   header_segments: MarginSegment[]
   footer_segments: MarginSegment[]
@@ -56,6 +63,7 @@ export type Page = {
 }
 
 export type PageKind = 'content' | 'front_cover' | 'back_cover'
+export type PageSide = 'left' | 'right' | 'unknown'
 
 export type CoverField = {
   kind: 'title' | 'subtitle' | 'author' | 'translator' | 'editor' | 'publisher' | 'series' | 'edition' | 'publication_year' | 'isbn'

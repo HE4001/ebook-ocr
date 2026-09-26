@@ -14,6 +14,8 @@ SectionType = Literal[
 PageStatus = Literal["uploaded", "processing", "ready", "failed", "interrupted"]
 BookStatus = PageStatus | Literal["pausing", "paused"]
 PageKind = Literal["content", "front_cover", "back_cover"]
+PageSide = Literal["left", "right", "unknown"]
+PaperSize = Literal["a4", "a5", "a6", "b5", "b6", "trade_6x9"]
 CoverFieldKind = Literal[
     "title", "subtitle", "author", "translator", "editor", "publisher",
     "series", "edition", "publication_year", "isbn",
@@ -31,6 +33,7 @@ class Book(BaseModel):
     id: str
     title: str
     filename: str
+    paper_size: PaperSize = "a4"
     status: BookStatus
     page_count: int
     file_count: int = 1
@@ -69,6 +72,7 @@ class Page(BaseModel):
     error: str | None
     text: str
     page_kind: PageKind = "content"
+    page_side: PageSide = "unknown"
     cover_fields: list[CoverField] = Field(default_factory=list)
     header_segments: list[MarginSegment]
     footer_segments: list[MarginSegment]
@@ -114,6 +118,11 @@ class ArrangementUpdate(BaseModel):
     file_parents: dict[str, str | None] | None = None
 
 
+class LayoutUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    paper_size: PaperSize
+
+
 class PageUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(max_length=1_000_000)
@@ -135,6 +144,7 @@ class PageUpdate(BaseModel):
 
 
 class SettingsOut(BaseModel):
+    api_protocol: Literal["openai_responses", "gemini"] = "openai_responses"
     base_url: str
     responses_path: str
     models_path: str
@@ -152,6 +162,7 @@ class SettingsOut(BaseModel):
 class SettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    api_protocol: Literal["openai_responses", "gemini"] = "openai_responses"
     base_url: str | None = None
     responses_path: str | None = None
     models_path: str | None = None
@@ -215,6 +226,7 @@ class ConnectionTestResult(BaseModel):
 class ModelsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    api_protocol: Literal["openai_responses", "gemini"] = "openai_responses"
     base_url: str
     models_path: str
     api_key: str | None = Field(default=None, max_length=10_000)
@@ -277,9 +289,22 @@ class PageResult(BaseModel):
         return self
 
 
+class SpecialPageResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_kind: Literal["front_cover", "back_cover"]
+    cover_fields: list[CoverField] = Field(max_length=100)
+
+    @model_validator(mode="after")
+    def validate_length(self) -> "SpecialPageResult":
+        if sum(len(field.text) for field in self.cover_fields) > 1_000_000:
+            raise ValueError("页面文本过长")
+        return self
+
+
 class StructuredPageResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     page_kind: PageKind = "content"
+    page_side: PageSide = "unknown"
     cover_fields: list[CoverField] = Field(default_factory=list, max_length=100)
     header_segments: list[MarginSegment] = Field(max_length=100)
     body_markdown: str = Field(max_length=1_000_000)
@@ -297,4 +322,6 @@ class StructuredPageResult(BaseModel):
         ) + sum(len(field.text) for field in self.cover_fields)
         if total > 1_000_000:
             raise ValueError("页面文本过长")
+        if self.page_kind != "content" or not any(segment.text.strip() for segment in self.footer_segments):
+            self.page_side = "unknown"
         return self

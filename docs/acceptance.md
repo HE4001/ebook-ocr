@@ -7,17 +7,18 @@
 - [ ] 后端能按 README 的实际命令启动，并只监听 `127.0.0.1`。
 - [ ] 前端能按 README 的实际命令启动，能访问后端 `/api/health` 并显示空态。
 - [ ] `GET /api/health` 返回 `{"status":"ok"}`。
-- [ ] 设置页区分 API 根地址、Responses 路径、模型列表路径和页面代理模型；默认分别为 `https://api.openai.com/v1`、`/responses`、`/models`，读取设置不返回密钥。
-- [ ] `models_path` 随设置保存，旧设置缺字段时采用 `/models`；两个路径各自支持自定义相对路径和留空直连根地址。
+- [ ] 设置页区分协议、API 根地址、Responses 路径、模型列表路径和页面代理模型；旧设置默认 `openai_responses`，地址及路径为 `https://api.openai.com/v1`、`/responses`、`/models`；Gemini 可选官方 `https://generativelanguage.googleapis.com/v1beta` 和 `/models`，无具体模型预设。读取设置不返回密钥，切协议不联网，自定义地址保留。
+- [ ] `models_path` 随设置保存，旧设置缺字段时采用 `/models`；路径支持相对值和留空。OpenAI 空路径直连根地址；Gemini 模型路径是资源集合，留空时根地址即集合，生成请求追加短模型名与 `:generateContent`，不使用 `responses_path`。
 - [ ] “获取模型”仅由用户主动触发，使用当前草稿调用 `POST /api/settings/models`，后端 GET 上游标准模型列表并返回模型 ID；不保存草稿或密钥、不触发 Responses 推理，输入变化不自动联网。
-- [ ] 获取模型时，空密钥仅在根地址与已保存地址一致且未选择清除时复用保存值；不同根地址要求重新输入密钥。失败信息不展示原始上游敏感内容。
+- [ ] 获取模型时，空密钥仅在规范化根地址与协议均和已保存配置一致且未选择清除时复用保存值。Gemini 使用 `x-goog-api-key`、分页 `nextPageToken` → `pageToken`，只列出支持 `generateContent` 的完整 `models/...` 名称；手填可用裸 ID 或 `models/` 前缀。失败信息不展示原始上游敏感内容。
 - [ ] 无列表接口或获取失败时仍能手动填写模型 ID；界面不把列表结果宣称为图像、Responses 或 JSON Schema 支持证明。
 - [ ] 首次打开时模型名称和密钥为空能正常显示；应用不替用户选择某个供应商或模型。
-- [ ] 空白或省略密钥时保留已有密钥，非空值替换，`clear_api_key=true` 优先清除；密钥保存于默认 `backend/data/app.db` 的独立 SQLite 凭据记录中，使用本机明文存储。
+- [ ] 同一规范化根地址与协议下空白或省略密钥保留已有值，非空值替换，`clear_api_key=true` 优先清除；有旧密钥时变更地址或协议必须提供新密钥或明确清除，否则 `PUT` 返回 `400`；无旧密钥可保存空配置。密钥保存在默认 `backend/data/app.db` 独立 SQLite 记录，本机明文存储。
 - [ ] 后端重启后从 SQLite 加载已保存密钥；密钥不出现在普通设置 JSON、浏览器存储、日志或书籍导出。升级到支持持久化密钥的版本后，重启新版并重新输入保存一次旧进程 key。
 - [ ] 连接测试只在用户主动操作后发生，使用已保存配置发起文本推理，提示可能产生用量及不代表图像识别质量；失败信息不泄漏密钥或原始敏感响应。
-- [ ] 无供应商预设或域名协议分支；页面结构化请求统一使用 JSON Schema `strict: true`，不回退 Chat Completions。
-- [ ] 设置页不提供最大输出 token 选项；页面识别和文本连接测试请求均不包含 `max_output_tokens`，旧保存值不影响请求，输出额度遵循供应商默认行为及模型限制。
+- [ ] 按显式协议发送请求；OpenAI 使用 `input_image` 和 `text.format` JSON Schema `strict: true`，Gemini 使用 `systemInstruction`、`contents`/`inlineData`、`generationConfig.responseMimeType: application/json` 与 `responseJsonSchema`，不混入 OpenAI 参数。普通、特殊代理都支持；不回退 Chat Completions，不包含 Vertex OAuth 或多账户系统。
+- [ ] `reasoning_effort` 空值使用服务默认；OpenAI 非空值传 `reasoning.effort`；Gemini 的 `minimal/low/medium/high` 传 `thinkingLevel`，整数且 ≥ -1 传 `thinkingBudget`，不按模型名猜测。设置页不提供最大输出 token，识别与文本连接测试不包含 `max_output_tokens` 或 `maxOutputTokens`，旧值不影响请求。
+- [ ] Gemini 输入 usage 取 `promptTokenCount`，输出取 `candidatesTokenCount + thoughtsTokenCount`（thoughts 缺失按 0，candidates 缺失则输出未知），总量取 `totalTokenCount`；不把思考 token 漏算或估算缺失字段。
 - [ ] `processing_concurrency` 默认 10，仅接受正整数且无固定上限；`context_reuse_enabled` 默认 `false` 并标明实验性；`context_reuse_max_pages` 默认 10，仅接受 1–10 的整数，包含首张。旧设置缺字段使用默认值；保存不联网，改动下次任务生效。
 
 ## 项目、上传与页面编排
@@ -43,10 +44,10 @@
 
 ## 逐页处理
 
-- [ ] “识别未完成页”只提交已选未完成页；“重新识别全部页”需确认，成功替换旧文本、失败保留旧文本，用量和尝试次数累计。
+- [ ] “识别未完成页”只提交已选未完成页，全部完成后隐藏按钮，不提供整批重新识别；当前校对页显示“识别本页”，已有结果（包括保留旧结果的失败页）显示“重新识别本页”，请求仅含 `pages:[永久number]`。覆盖已有结果或未保存修改需确认；正在运行或正在暂停时不能再次启动识别。单页重新识别成功替换旧结果、失败保留旧结果，用量和尝试次数累计。
 - [ ] 识别时才准备所选页缺少的单页 PDF 和 PNG，保留源页尺寸、旋转及裁切；已有资产复用，未选页不识别。
-- [ ] 每个项目实际同时处理页数不超过配置，多个项目分别限制；默认每页独立上下文且发送 `store:false`。完成可乱序，最终呈现及导出仍按编排顺序。
-- [ ] 开启复用时，本次待处理页按最终编排顺序连续分组，每组最多 N 页（含首张），组内串行、组间有界并行；各组独立客户端发送 `store:true` 并以 `previous_response_id` 续接。缺少响应 ID 或服务不支持续接应报错，不静默降级；失败保留旧结果，下一页重置对话。
+- [ ] 每个项目实际同时处理页数不超过配置，多个项目分别限制；默认每页独立上下文，OpenAI 发送 `store:false`，Gemini `contents` 只含当前页。完成可乱序，最终呈现及导出仍按编排顺序。
+- [ ] 开启复用时，本次待处理页按最终编排顺序连续分组，每组最多 N 页（含首张），组内串行、组间有界并行；OpenAI 各组独立客户端发送 `store:true` 并以 `previous_response_id` 续接，缺少响应 ID 或服务不支持时应报错。Gemini 各组本地保留完整 `contents`（含图片和原始 `thoughtSignature`）并随下一次发送，不使用服务端 `cachedContent`，不承诺省钱。两者失败均保留旧结果并重置下一页上下文。
 - [ ] 项目进度分母为 `selected_page_count`，完成数只统计已选页；`page_count` 保持全部来源文件总页数。
 - [ ] 运行或上传中不允许重新编排、追加文件或删除项目；未保存草稿不会静默丢失。
 - [ ] 暂停后不再开始新页，等待所有已开始页结束再进入 `paused`，暂停状态可跨重启保留；重启后原运行任务为 `interrupted`。继续处理或其他新任务不复用旧响应 ID。
@@ -55,23 +56,34 @@
 
 - [ ] `Page` 返回永久 `number`、`source_id`、`source_filename`、`source_page`、`status`、`error`、`page_kind`、`cover_fields`、`text`、`header_segments`、`footer_segments`、`usage`、`attempts`；页眉页脚语段含 `kind`、`text`、`alignment`、`row`、`font_size`、`bold`、`italic`，旧结果缺少格式字段时采用文档默认值。
 - [ ] 正文文本保留原页阅读顺序、标题、列表、引用、公式、表格、图注和脚注；原书页眉、页脚及所在页码单独保留为语段。
-- [ ] 页面代理使用严格 JSON Schema，五个顶层字段与页眉页脚语段所有字段均必填；页眉页脚和封面书目保存为纯文本，只有正文按 Markdown 保存，手写批注不进入结果。
+- [ ] 普通页面代理使用严格 JSON Schema，`page_kind`、`header_segments`、`body_markdown`、`footer_segments` 四个顶层字段及页眉页脚语段所有字段均必填；内容页在同一次请求完成转录，只有正文按 Markdown 保存，手写批注不进入结果。
+- [ ] 普通代理判断为 `front_cover` 或 `back_cover` 后停止普通转录，只返回类型及空正文、空页眉页脚；首个非流式响应返回后，后端立即调用独立 `SpecialPageAgent`，不要求用户手动启动，也不宣称流式实时中断。
+- [ ] 特殊子代理使用独立提示词及独立 Schema，只返回 `page_kind`（`front_cover|back_cover`）与 `cover_fields`；收到同一张当前页图像、来源信息和分流类型，沿用已配置协议、模型、地址及推理程度，不新增模型选项、代理框架或 Codex 聊天。
+- [ ] 特殊子代理使用新的同协议独立客户端并关闭上下文复用：Responses 固定 `store:false` 且不携带 `previous_response_id`；Gemini 的 `contents` 只含当前页。开启普通代理上下文复用时仍隔离专用请求，书目提取不读取普通历史，专用响应不接入普通代理续接链。
+- [ ] 中间分流标记不落库、不将第一阶段认作页面完成；整页成功后才保存既有 Page 字段，书目自动进入校对栏并按类型和当前纸型完成预览渲染，无须复制或额外点击生成。
+- [ ] 特殊子代理失败保留旧页面类型、书目及正文等结果；暂停只停止启动新页，等待已开始整页（含特殊提取）结束；页面失败后普通代理的下一页重置上下文。
 - [ ] `page_kind` 只接受 `content`、`front_cover`、`back_cover`，依据当前图像判断，不能因第一页或最后一页推断；扉页、版权页、目录与不确定页面为 `content`。
 - [ ] 封面封底的 `cover_fields` 每项仅含 `kind`、`text`，类别限书名、副标题、作者、译者、编者、出版社、丛书、版次、出版年份和明确标注的 ISBN；排除简介、宣传语、推荐语、定价、联系方式、网址等其他信息，不从相邻页或常识补全。
 - [ ] 封面封底正文为空、页眉页脚为空数组，无核心信息的封底可保留空书目；内容页的书目为空数组，空白内容页其余数组和正文也为空。
 - [ ] SQLite 以增量方式添加页面类型和书目字段，旧页面默认为 `content` 和空书目，保留原结果、状态、用量及尝试次数，不自动重新识别。
 - [ ] 人工 PUT 的 `text` 必填，`page_kind` 和 `cover_fields` 可选且不接受显式 `null`；旧 `{text}` 请求兼容。内容页不接受非空书目，封面封底不接受非空正文；校对不改变用量及尝试次数，运行中的页面拒绝修改。
 - [ ] 校对提供页面类型纠正、封面封底书目字段增删及类别和文本编辑；类型切换后预览使用对应版式，保存后刷新保留结果，未保存修改不会静默丢失。
+- [ ] 校对工具栏提供整书纸张选择，包含 A4（210 × 297）、A5（148 × 210）、A6（105 × 148）、ISO B5（176 × 250）、ISO B6（125 × 176）及 6 × 9 英寸（152.4 × 228.6），毫米尺寸清晰可见；选择后即保存，刷新及重新打开项目后保留。
+- [ ] `Book.paper_size` 只接受 `a4|a5|a6|b5|b6|trade_6x9`，新旧项目默认 `a4`；SQLite 增量迁移保留既有页面、状态和用量，重复初始化不重置已选纸型。
+- [ ] `PUT /api/books/{id}/layout` 返回更新后的 `Book`，非法或空纸型返回 `422`，未知项目返回 `404`；识别期间可修改纸型，不重置确认标记，不改写页面草稿、已存结果、处理状态、用量或尝试次数，不发起模型调用。
 - [ ] 应用内模型请求不创建 Codex 任务；复用历史仅作排版与符号参考，只输出当前页，不复制历史正文或补写跨页内容。
 
 ## 用量与导出
 
 - [ ] `Usage` 的 token 字段缺失时保持 `null`，不估算、不显示为零。
 - [ ] 自动或手动重试累计各次已知用量；拒绝、incomplete、缺少正文带有 usage 时也计入；未知消耗使 `complete=false`。
+- [ ] 普通页通常一次请求、特殊页通常两次；普通与特殊两阶段及各自重试的实际用量和尝试次数累计到同一页，专用提取失败也保留已发生用量；界面不把请求次数误作完成页数。
 - [ ] 界面说明复用需要兼容服务支持响应保存与续接，历史仍占用上下文与用量，不承诺降低费用或已验证真实接口兼容性。
-- [ ] JSON 导出包含来源 `files`、`book.usage`、`pages[].page_kind`、`pages[].cover_fields`、`pages[].usage` 和 `pages[].attempts`；`pages` 按最终页序排列。旧[示例 JSON](../examples/sample-export.json)仅展示单文件页面结果，当前多文件契约见[模块说明](module-architecture.md)。
+- [ ] JSON 导出包含来源 `files`、`book.paper_size`、`book.usage`、`pages[].page_kind`、`pages[].cover_fields`、`pages[].usage` 和 `pages[].attempts`；`pages` 按最终页序排列。旧[示例 JSON](../examples/sample-export.json)仅展示单文件页面结果，当前多文件契约见[模块说明](module-architecture.md)。
 - [ ] 清单预览提供 JSON、HTML 和浏览器打印；没有 Markdown 下载按钮，后端 Markdown 导出接口仍保留。
-- [ ] 不提供整页排版预设或保存到 `localStorage` 的排版选项；单页、清单预览、独立 HTML 和打印共用页面排版，前封面与封底各有专用书目版式，内容页按结构化页眉、正文、页脚排版。
+- [ ] 纸型保存到后端项目记录，`localStorage` 不保存排版选项；单页、整书预览、独立 HTML 和打印采用同一纸型、尺寸与页边距，换纸后正文宽度和换行随之变化，原页图像比例保持不变。
+- [ ] 模型识别或人工纠正为封面、封底后自动采用专用版式：封面标题、署名与出版信息分层，封底信息靠底，字号和留白随纸型适配；不增加书内说明文字，无书目的封底仍保持空白版面。
+- [ ] 普通页继续按结构化页眉、正文、页脚排版，扉页、版权页与目录仍按内容页处理；版式提示和来源标识在纸张外，打印时隐藏。
 - [ ] 页眉页脚 `alignment` 使用整页可排印宽度的左、中、右锚点，只有右侧页码时仍靠右；同一行不同锚点不因缺少语段而重新分列。`row` 保留绝对行次，第 1、3 行之间留出第 2 行空白，页眉和页脚独立编号。
 - [ ] 同一行各语段分别按 `font_size`、`bold`、`italic` 排版；来源页序号在纸张外显示并在打印时隐藏，页眉在顶部、页脚在底部，正文自然伸展。
 - [ ] Markdown 导出按最终页序保留内容页正文、封面封底类型标题和核心书目，不因为封面封底正文为空而丢失字段；没有书目的封底仍保留页面类型。
@@ -80,7 +92,7 @@
 
 ## 历史验证记录
 
-以下为以往开发的验证记录，不代表本轮封面封底识别与位置排版已通过验收。本轮编码和文档子代理均未运行测试、构建、验证脚本或 Computer Use；主代理如执行必要验证，应单独记录实际命令及结果，上方全面验收条目保持未勾选。
+以下历史记录不代表本轮特殊页面子代理已全面通过验收。本轮 Responses 定向验证结果单列于文末；编码和文档子代理均未运行测试、构建、验证脚本或 Computer Use，上方跨协议及全面验收条目保持未勾选。
 
 ## 历史并发与上下文复用必要验证
 
@@ -126,9 +138,9 @@ PDF 代理已用临时两页 PDF 验证页序、单页 PDF 页数、尺寸/旋�
 
 真实服务在备份 `.cache/migration-backups/before-flat-animation-20260927-033345.sqlite3` 后成功重启，隔离 QA 服务已停止。所有子代理均未执行测试、构建、程序或 Computer Use。
 
-## 本轮封面封底与位置排版必要验证
+## 历史封面封底与位置排版必要验证
 
-本轮必要验证由主代理执行，编码及文档子代理未运行测试、构建、验证脚本或 Computer Use。以下记录仅覆盖所述范围，全面验收条目保持未勾选。
+该轮必要验证由主代理执行，编码及文档子代理未运行测试、构建、验证脚本或 Computer Use。以下记录仅覆盖所述范围，全面验收条目保持未勾选。
 
 主代理使用可用的 Python 3.12.14，在临时验证进程中将项目 `.venv/Lib/site-packages` 加入 `sys.path` 后运行定向 unittest。`BackendTests.test_legacy_migration_keeps_ready_page_text` 通过。`test_api_upload_and_manual_text_contract` 最初因过时字段断言失败；后端代理同步新增字段、编排前置条件及来源标题期望，并补充封面断言后，该项通过。检查覆盖封面及封底保存、GET / JSON / Markdown 输出、非法跨分支数据返回 422、`fail_page` 保留封面结果，以及切回 `content` 后清空书目字段。
 
@@ -136,4 +148,40 @@ PDF 代理已用临时两页 PDF 验证页序、单页 PDF 页数、尺寸/旋�
 
 主代理使用独立临时 Chrome headless 生成 `.cache/cover-layout-review.png`，并通过 Image Input 目视核对：封面标题、署名及出版信息层次，封底底部信息，普通页左、中、右位置，第 2 行空白，长页眉换行且无覆盖，以及页脚底部位置符合该合成样本的预期。这不代表全部前端交互、设备或真实模型识别质量已验收。
 
-本轮未调用真实 OCR，未改变真实书库或运行服务。项目 `.venv` 启动器找不到旧基础 Python 路径；验证使用上述可用解释器，未修复或修改项目运行环境。
+该轮未调用真实 OCR，未改变真实书库或运行服务。项目 `.venv` 启动器找不到旧基础 Python 路径；验证使用上述可用解释器，未修复或修改项目运行环境。
+
+## 历史纸张尺寸与自动特殊排版必要验证
+
+主代理报告临时 TestClient / SQLite 定向检查通过：六种纸型枚举、默认 A4、保存与重读、旧库缺列迁移、项目隔离和 JSON 导出；非法值返回 `422`，未知项目返回 `404`。项目处于 `processing` 时可修改纸型，页面记录与其他书籍字段保持不变。
+
+`pnpm run build` 通过，仍有既有 bundle 大于 500 KB 的提示。Vite SSR 对六种纸型生成 HTML，并检查对应毫米单位的 `@page`、纸面变量及自动封面结构。合成 A5、A6 HTML 经临时 Chrome headless 打印后各为 3 页，每页均有文字且没有多余空白页；PDF 尺寸分别约为 148.17 × 209.89 mm、105.16 × 148.17 mm，与目标尺寸的浏览器取整误差小于 0.5 mm。
+
+主代理通过 Image Input 核对 A5 宽屏、500 px 窄屏下的 A5 / A6 及 A6 打印封面，字体和页边距缩放、封面层次及页脚位置符合合成样本预期。样本为 `.cache/paper-review-a5.html`、`.cache/paper-review-a6.html`、相应 `.pdf` 及 `.cache/paper-narrow-a5.png`、`.cache/paper-narrow-a6.png`。
+
+本轮子代理未运行测试、构建、验证脚本或 Computer Use。上述定向验证未调用真实 OCR、未重启真实服务或修改真实书库，不代表完整 GUI 交互或真实模型识别质量已验收；全面验收条目保持未勾选。
+
+## 本轮特殊页面子代理与 Gemini 接入定向验证
+
+- [x] 主代理在 Gemini 配置分支衔接后的当前代码上执行 5 项 Responses mock 测试：4 项特殊页面子代理测试及 1 项既有结构化响应重试测试，结果为 `5 passed`，耗时 1.823 秒。验证使用 Python 3.12，在临时进程的 `sys.path` 中加载项目 `site-packages`；未修改项目运行环境。
+- [x] 主代理报告 Gemini 前封面、后封面模拟子场景通过：完整 `BookProcessor → PageAgent → SpecialPageAgent → 临时 storage`，专用请求保持同协议、同图、独立 `contents=1` 无历史，使用专用 schema 并保存相同页面类型；每页累计 2 次尝试，输入/输出/总 token 为 `4/14/18`，输出含思考 token。
+
+独立验证子代理在项目根目录执行 `.\.venv\Scripts\python.exe -m unittest backend.tests.test_gemini_api backend.tests.test_models_api backend.tests.test_core.BackendTests.test_reasoning_setting_and_connection_payload -v`，12/12 通过，耗时 2.340 秒，包含 7 项 Gemini 新测试及 5 项指定 OpenAI 回归；在 `frontend/` 执行 `pnpm run build` 通过，仅有既有大包提示。该结果对应 `page_side` 新增及打印版开发之前的 Gemini 集成版本，不代表后续改动已验证。
+
+本轮未调用真实模型；上述协议测试均为模拟请求及临时存储。自动填栏和渲染沿用既有前端，没有新增 GUI 验证；通过结果不代表真实 API 联调、模型识别质量或全部交互已验收。文档代理未自行运行测试、构建或 Computer Use，未执行的全面验收条目保持未勾选。
+
+## 本次当前页识别操作定向验证
+
+主代理完成前端代码审查：批量请求仅提交未完成页，当前页按钮仅提交 `pages:[sourcePage.number]`，沿用已有确认与运行锁定流程。主代理执行 `pnpm run build` 通过；既有 `BackendTests.test_selected_pages_and_whole_book_reruns` 定向测试通过，使用模拟 `PageAgent`，未调用真实模型或修改用户数据。本次未进行浏览器实测，不代表全部交互已验收；编码及文档子代理未运行测试、构建、程序或 Computer Use。
+
+## 本轮左右页与打印版定向验证
+
+以下结果由主代理执行并报告，覆盖本轮 [左右页与打印版](PRINT_LAYOUT.md) 的实现。子代理未运行测试、构建、验证脚本或 GUI。
+
+- [x] 后端定向范围为 12 项：`page_side` 3 项、特殊页面子代理 4 项、`GeminiPipeline` 4 项及既有 API 1 项。首轮 10 项通过，新增测试 fixture 的 2 项失败；修正合法 UUID、编排确认和 SQLite 连接关闭后，仅重跑原失败的 2 项，结果均通过。生产代码未因这两项测试失败而修改。
+- [x] 最终 `npm run build` 通过。
+- [x] Chrome 独立 HTML 检查覆盖六种纸型 × 默认 / 打印版，共 12 种组合。左页、右页、`unknown` 的版心位置及相同正文宽度符合预期；320 px 窄屏无横向溢出。
+- [x] A5、A6 的默认 / 打印版共 4 份实际 PDF 检查了纸张尺寸、文字 x 坐标和 55 个 `FLOW` 段落，段落均无缺失；A5 每份 10 页，A6 每份 15 页。打印版已知左页文字左边距为原边距的 0.8 倍，已知右页为 1.2 倍，`unknown` 保持原边距；长正文续页沿用同一源页侧别，两个连续 `left` 源页也符合该规则。
+
+主代理还通过 Image Input 检查了 A6 屏幕预览中的左页、右页、`unknown` 及 A6 PDF 左页，并报告 `git diff --check -- backend frontend docs README.md` 通过。任务范围外 `新建 文本文档.txt` 的既有空白行警告未作修改。
+
+本轮未调用真实 API，未修改真实书库、重启真实服务或执行 Git commit。以上验证不代表真实模型的页侧判断质量或全部浏览器、打印机及交互均已验收，既有全面验收条目保持原状态。

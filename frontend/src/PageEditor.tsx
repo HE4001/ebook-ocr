@@ -31,7 +31,7 @@ export function PageEditor({ draft, onChange, disabled }: {
         <option value="front_cover">封面</option>
         <option value="back_cover">封底</option>
       </select>
-      <p>切换类型时保留未保存草稿；保存后仅保留所选类型的内容。</p>
+      <p>识别为封面或封底时自动应用对应版式，也可在此修正类型。切换时保留未保存草稿；保存后仅保留所选类型的内容。</p>
     </div>
     {draft.page_kind === 'content'
       ? <label className="body-editor"><span>正文 Markdown 源文本</span><textarea aria-label="本页正文 Markdown 源文本" value={draft.text} onChange={(event) => onChange({ ...draft, text: event.target.value })} spellCheck={false} placeholder="本页暂无正文" /></label>

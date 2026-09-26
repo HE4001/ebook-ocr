@@ -21,6 +21,7 @@ from .models import (
     Book,
     BookDetail,
     ConnectionTestResult,
+    LayoutUpdate,
     ModelsRequest,
     ModelsResult,
     Page,
@@ -34,7 +35,9 @@ from .models import (
     SettingsUpdate,
 )
 from .pipeline import BookProcessor
-from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig, fetch_models
+from .gemini_client import fetch_gemini_models
+from .model_client import create_model_client
+from .responses_client import ModelServiceError, fetch_models
 from .storage import Storage
 
 
@@ -176,7 +179,18 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         new_api_key = api_key.strip() if api_key is not None and api_key.strip() else None
         values = {key: value for key, value in values.items() if value is not None}
         settings = storage.get_settings()
+        saved_base_url = SettingsUpdate.validate_base_url(settings["base_url"])
+        saved_protocol = settings.get("api_protocol", "openai_responses")
         settings.update(values)
+        connection_changed = (
+            SettingsUpdate.validate_base_url(settings["base_url"]) != saved_base_url
+            or settings["api_protocol"] != saved_protocol
+        )
+        if connection_changed and secrets.api_key and new_api_key is None and not clear_api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="API 根地址或协议已改变，请输入新连接的 API 密钥或明确清除已保存的密钥",
+            )
         storage.save_settings(
             settings,
             api_key=new_api_key,
@@ -194,13 +208,15 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         if not api_key and not request.clear_api_key:
             settings = storage.get_settings()
             saved_base_url = SettingsUpdate.validate_base_url(settings["base_url"])
-            if request.base_url != saved_base_url:
-                raise HTTPException(status_code=400, detail="API 根地址已改变，请输入此地址的 API 密钥")
+            if (request.base_url != saved_base_url
+                    or request.api_protocol != settings.get("api_protocol", "openai_responses")):
+                raise HTTPException(status_code=400, detail="API 根地址或协议已改变，请输入新连接的 API 密钥")
             api_key = secrets.api_key
         if not api_key:
             raise HTTPException(status_code=400, detail="请先输入 API 密钥")
         try:
-            models = await fetch_models(
+            fetch = fetch_gemini_models if request.api_protocol == "gemini" else fetch_models
+            models = await fetch(
                 base_url=request.base_url,
                 models_path=request.models_path,
                 api_key=api_key,
@@ -218,17 +234,8 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             return ConnectionTestResult(ok=False, message="请先输入 API 密钥")
         if not model:
             return ConnectionTestResult(ok=False, message="请先填写模型名称")
-        client = ResponsesClient(
-            ResponsesConfig(
-                base_url=settings["base_url"],
-                responses_path=settings["responses_path"],
-                api_key=secrets.api_key,
-                structured_output=settings["structured_output"],
-                timeout_seconds=settings["timeout_seconds"],
-                reasoning_effort=settings["reasoning_effort"],
-            )
-        )
         try:
+            client = create_model_client(settings, secrets.api_key, context_reuse_enabled=False)
             await client.test_connection(model)
         except ModelServiceError as exc:
             return ConnectionTestResult(ok=False, message=str(exc))
@@ -379,6 +386,12 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     @app.get("/api/books/{book_id}", response_model=BookDetail)
     async def get_book(book_id: str) -> BookDetail:
         return book_detail(book_id)
+
+    @app.put("/api/books/{book_id}/layout", response_model=Book)
+    async def put_layout(book_id: str, request: LayoutUpdate) -> Book:
+        ensure_book(book_id)
+        storage.save_layout(book_id, request.paper_size)
+        return ensure_book(book_id)
 
     @app.delete("/api/books/{book_id}", status_code=204)
     async def delete_book(book_id: str) -> Response:

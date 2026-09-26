@@ -4,15 +4,22 @@ import { BookContent, PageContent } from './Markdown'
 import { buildStandaloneHtml, downloadText, safeFilename } from './exportHtml'
 import ProjectOrganizer from './ProjectOrganizer'
 import { PageEditor } from './PageEditor'
-import type { Book, BookDetail, Notice, Page, PageDraft, Settings, Usage } from './types'
+import { PAPER_SIZES } from './paper'
+import type { ApiProtocol, Book, BookDetail, Notice, Page, PageDraft, PaperSize, Settings, Usage } from './types'
 
 const STATUS_LABEL: Record<string, string> = {
   uploaded: '待处理', processing: '处理中', pausing: '正在暂停', paused: '已暂停', ready: '已完成',
   failed: '失败', interrupted: '已中断',
 }
 
+const DEFAULT_API_BASES: Record<ApiProtocol, string> = {
+  openai_responses: 'https://api.openai.com/v1',
+  gemini: 'https://generativelanguage.googleapis.com/v1beta',
+}
+
 const EMPTY_SETTINGS: Settings = {
-  base_url: 'https://api.openai.com/v1',
+  api_protocol: 'openai_responses',
+  base_url: DEFAULT_API_BASES.openai_responses,
   models_path: '/models',
   responses_path: '/responses',
   extraction_model: '',
@@ -45,7 +52,8 @@ function endpoint(baseUrl: string, pathValue: string): string {
 }
 
 function sameSavedSettings(current: Settings, saved: Settings): boolean {
-  return current.base_url === saved.base_url
+  return current.api_protocol === saved.api_protocol
+    && current.base_url === saved.base_url
     && current.models_path === saved.models_path
     && current.responses_path === saved.responses_path
     && current.extraction_model === saved.extraction_model
@@ -56,9 +64,16 @@ function sameSavedSettings(current: Settings, saved: Settings): boolean {
     && current.context_reuse_max_pages === saved.context_reuse_max_pages
 }
 
-function connectionTestMessage(result: { ok: boolean; message: string }) {
-  if (!result.ok && /模型服务\s+HTTP\s+404/i.test(result.message)) {
-    return { ...result, message: '模型服务返回 HTTP 404：请检查实际 POST 地址、Responses 接入路径和模型名称。这不能证明 API 密钥有误。' }
+function geminiGenerationEndpoint(settings: Settings): string {
+  const collection = endpoint(settings.base_url, settings.models_path).replace(/\/+$/, '')
+  const model = settings.extraction_model.trim().replace(/^models\//, '')
+  return `${collection}/${model ? encodeURIComponent(model) : '{model}'}:generateContent`
+}
+
+function connectionTestMessage(result: { ok: boolean; message: string }, protocol: ApiProtocol) {
+  if (!result.ok && /HTTP\s+404\b/i.test(result.message)) {
+    const pathName = protocol === 'gemini' ? 'Gemini Models 资源集合路径' : 'Responses 接入路径'
+    return { ...result, message: `模型服务返回 HTTP 404：请检查实际 POST 地址、${pathName}和模型名称。这不能证明 API 密钥有误。` }
   }
   return result
 }
@@ -96,6 +111,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
       .then((value) => {
         const loaded = {
           ...value,
+          api_protocol: value.api_protocol ?? 'openai_responses',
           models_path: value.models_path ?? '/models',
           reasoning_effort: value.reasoning_effort ?? '',
           processing_concurrency: value.processing_concurrency ?? 10,
@@ -120,9 +136,25 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
   }
 
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) => {
-    if (key === 'base_url' || key === 'api_key' || key === 'models_path') resetModels()
+    if (key === 'api_protocol' || key === 'base_url' || key === 'api_key' || key === 'models_path') resetModels()
     setSettings((current) => ({ ...current, [key]: value }))
     setTestResult(null)
+  }
+
+  const changeProtocol = (protocol: ApiProtocol) => {
+    resetModels()
+    setTestResult(null)
+    setSettings((current) => ({
+      ...current,
+      api_protocol: protocol,
+      base_url: endpoint(current.base_url, '') === DEFAULT_API_BASES[current.api_protocol]
+        ? DEFAULT_API_BASES[protocol]
+        : current.base_url,
+      extraction_model: '',
+      classification_model: '',
+      reasoning_effort: '',
+      api_key: '',
+    }))
   }
 
   const hasUnsavedChanges = savedSettings !== null && (
@@ -132,15 +164,20 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
     || clearKey
   )
 
-  const sameApiBase = savedSettings !== null
+  const isGemini = settings.api_protocol === 'gemini'
+  const sameApiConnection = savedSettings !== null
+    && settings.api_protocol === savedSettings.api_protocol
     && endpoint(settings.base_url, '') === endpoint(savedSettings.base_url, '')
+  const canReuseSavedKey = sameApiConnection && Boolean(savedSettings?.has_api_key)
+  const needsNewKey = Boolean(savedSettings?.has_api_key)
+    && !sameApiConnection && !settings.api_key?.trim() && !clearKey
   const modelLookupIssue = !settings.base_url.trim()
     ? '请先填写 API 根地址。'
     : clearKey
       ? '已勾选清除密钥，请取消勾选并填写或复用密钥后获取模型。'
-      : !settings.api_key?.trim() && !(sameApiBase && savedSettings?.has_api_key)
-        ? savedSettings?.has_api_key && !sameApiBase
-          ? 'API 根地址已更改，请为此地址输入新密钥后获取模型。'
+      : !settings.api_key?.trim() && !canReuseSavedKey
+        ? savedSettings?.has_api_key && !sameApiConnection
+          ? '接入协议或 API 根地址已更改，请输入当前接入的密钥后获取模型。'
           : '请先输入 API 密钥，再获取模型。'
         : null
 
@@ -172,6 +209,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
       const saved = await api.saveSettings({ ...settings, processing_concurrency: concurrency }, clearKey)
       const loaded = {
         ...saved,
+        api_protocol: saved.api_protocol ?? 'openai_responses',
         models_path: saved.models_path ?? '/models',
         reasoning_effort: saved.reasoning_effort ?? '',
         processing_concurrency: saved.processing_concurrency ?? 10,
@@ -203,7 +241,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
     setSaving(true)
     setTestResult(null)
     try {
-      setTestResult(connectionTestMessage(await api.testSettings()))
+      setTestResult(connectionTestMessage(await api.testSettings(), settings.api_protocol))
     } catch (error) {
       setTestResult({ ok: false, message: errorText(error) })
     } finally {
@@ -216,20 +254,25 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
     <main className="settings-page">
       <header className="section-heading"><p className="eyebrow">模型接入</p><h1>设置</h1></header>
       <div className="settings-card">
-        <label><span>API 根地址</span><input value={settings.base_url} onChange={(event) => update('base_url', event.target.value)} placeholder="https://api.openai.com/v1" disabled={saving} /><small>填写包含协议和 API 版本的地址；自定义接口路径可在下方高级项中设置。</small></label>
-        <label><span className="field-title">API 密钥 <span className={settings.has_api_key ? 'key-state saved' : 'key-state missing'}>{settings.has_api_key ? '已保存到本机' : '未配置'}</span></span><input type="password" autoComplete="new-password" value={settings.api_key ?? ''} onChange={(event) => update('api_key', event.target.value)} placeholder={settings.has_api_key ? '已保存；留空保留' : '输入密钥'} disabled={saving || clearKey} /><small>已保存密钥不会回显；留空保留，输入新密钥替换。获取模型时，留空仅可复用同一 API 根地址的已保存密钥。密钥以明文保存在本机 SQLite 数据库中，不保存在浏览器中。</small></label>
+        <label className="protocol-field"><span>接入协议</span><select value={settings.api_protocol} onChange={(event) => changeProtocol(event.target.value as ApiProtocol)} disabled={saving} aria-describedby="api-protocol-help"><option value="openai_responses">OpenAI Responses</option><option value="gemini">Google Gemini 原生</option></select><small id="api-protocol-help">按服务提供的接入方式选择。切换协议会清空模型选择、推理程度和未保存密钥。</small></label>
+        <label><span>API 根地址</span><input value={settings.base_url} onChange={(event) => update('base_url', event.target.value)} placeholder={DEFAULT_API_BASES[settings.api_protocol]} disabled={saving} /><small>填写包含协议和 API 版本的地址；自定义接口路径可在下方高级项中设置。</small></label>
+        <label><span className="field-title">API 密钥 <span className={canReuseSavedKey ? 'key-state saved' : 'key-state missing'}>{canReuseSavedKey ? '已保存到本机' : savedSettings?.has_api_key ? '当前接入未配置' : '未配置'}</span></span><input type="password" autoComplete="new-password" value={settings.api_key ?? ''} onChange={(event) => update('api_key', event.target.value)} placeholder={canReuseSavedKey ? '已保存；留空保留' : '输入当前接入的密钥'} disabled={saving || clearKey} aria-describedby={needsNewKey ? 'api-key-help api-key-warning' : 'api-key-help'} /><small id="api-key-help">已保存密钥不会回显；仅协议和 API 根地址均相同时，留空可复用。输入新密钥会替换已保存密钥。密钥以明文保存在本机 SQLite 数据库中，不保存在浏览器中。</small>{needsNewKey && <small id="api-key-warning" className="field-error" role="status">接入协议或 API 根地址已更改，请输入当前接入的密钥，或勾选清除已保存密钥后再保存。</small>}</label>
         <label className="check-row"><input type="checkbox" checked={clearKey} disabled={saving} onChange={(event) => { const checked = event.target.checked; setClearKey(checked); resetModels(); setTestResult(null); if (checked) setSettings((current) => ({ ...current, api_key: '' })) }} /><span>清除本机已保存的密钥</span></label>
         <details className="settings-advanced">
           <summary>高级接入路径</summary>
           <div className="settings-paths">
             <div>
-              <label><span>Models 路径</span><input value={settings.models_path} onChange={(event) => update('models_path', event.target.value)} placeholder="/models" disabled={saving} /><small>默认 /models；可填自定义相对路径，留空则直接请求根地址。</small></label>
+              <label><span>{isGemini ? 'Models 资源集合路径' : 'Models 路径'}</span><input value={settings.models_path} onChange={(event) => update('models_path', event.target.value)} placeholder="/models" disabled={saving} /><small>{isGemini ? '默认 /models；获取列表和生成内容共用此集合。留空时，根地址须为完整集合地址。' : '默认 /models；可填自定义相对路径，留空则直接请求根地址。'}</small></label>
               <div className="endpoint-preview"><span>GET Models</span><code>{endpoint(settings.base_url, settings.models_path)}</code></div>
             </div>
-            <div>
+            {isGemini ? <div>
+              <span className="path-preview-title">内容生成地址</span>
+              <small>在资源集合地址后追加模型 ID 和 :generateContent；模型 ID 会移除一次 models/ 前缀并编码。</small>
+              <div className="endpoint-preview"><span>POST generateContent</span><code>{geminiGenerationEndpoint(settings)}</code>{!settings.extraction_model.trim() && <small>选择或填写模型后，地址中的 {'{model}'} 会替换为模型 ID。</small>}</div>
+            </div> : <div>
               <label><span>Responses 路径</span><input value={settings.responses_path} onChange={(event) => update('responses_path', event.target.value)} placeholder="/responses" disabled={saving} /><small>默认 /responses；可填自定义相对路径，留空则直接请求根地址。</small></label>
               <div className="endpoint-preview"><span>POST Responses</span><code>{endpoint(settings.base_url, settings.responses_path)}</code></div>
-            </div>
+            </div>}
           </div>
         </details>
         <div className="model-discovery">
@@ -237,13 +280,13 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
           <div className="model-lookup-status" aria-live="polite">
             {modelsError
               ? <p className="model-lookup-error" role="alert">获取失败：{modelsError} 请检查地址、Models 路径和密钥后重试，也可手动填写模型 ID。</p>
-              : <p>{modelLookupIssue || (modelsLoading ? '正在向服务器获取模型列表…' : models === null ? '点击获取服务器的模型名称，或直接手动填写模型 ID。' : models.length ? `已获取 ${models.length} 个模型。请选择需要使用的模型。` : '服务器返回的模型列表为空。可检查 Models 路径后重试，或手动填写模型 ID。')}</p>}
+              : <p>{modelLookupIssue || (modelsLoading ? '正在向服务器获取模型列表…' : models === null ? '点击获取服务器的模型名称，或直接手动填写模型 ID。' : models.length ? `已获取 ${models.length} 个模型。请选择需要使用的模型。` : isGemini ? '服务器未返回声明支持 generateContent 的模型。可检查资源集合路径后重试，或手动填写模型 ID。' : '服务器返回的模型列表为空。可检查 Models 路径后重试，或手动填写模型 ID。')}</p>}
           </div>
           <label><span>服务器模型</span><select value={models?.includes(settings.extraction_model) ? settings.extraction_model : ''} onChange={(event) => update('extraction_model', event.target.value)} disabled={saving || modelsLoading || !models?.length}><option value="" disabled>{models?.length ? '选择模型，不会自动保存' : '获取模型后选择'}</option>{models?.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
-          <small>模型列表仅提供名称，不代表模型支持 Responses 或图片输入，请向供应商确认。</small>
+          <small>{isGemini ? '仅列出服务声明支持 generateContent 的模型；不保证支持图片输入或结构化输出，请确认所选模型能力。' : '模型列表仅提供名称，不代表模型支持 Responses 或图片输入，请向供应商确认。'}</small>
         </div>
-        <label><span>页面代理模型 ID</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} placeholder="手动填写，或从上方列表选择" disabled={saving} /><small>保存后用于逐页识别，返回页眉、正文 Markdown 和页脚。</small></label>
-        <label><span>模型推理程度</span><input value={settings.reasoning_effort} onChange={(event) => update('reasoning_effort', event.target.value)} placeholder="例如 low、medium、high" disabled={saving} /><small>手动填写模型供应商支持的值；留空则使用服务默认值。</small></label>
+        <label><span>页面代理模型 ID</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} placeholder="手动填写，或从上方列表选择" disabled={saving} /><small>{isGemini && '可填裸模型 ID 或 models/ 开头的完整资源名。'}保存后用于逐页识别，返回页眉、正文 Markdown 和页脚。</small></label>
+        <label><span>模型推理程度</span><input value={settings.reasoning_effort} onChange={(event) => update('reasoning_effort', event.target.value)} placeholder={isGemini ? '留空使用默认；或填写级别、整数预算' : '例如 low、medium、high'} disabled={saving} /><small>{isGemini ? 'Gemini 3：minimal、low、medium、high 对应 thinkingLevel；Gemini 2.5：整数 ≥ -1 对应 thinkingBudget（0 关闭，-1 动态）。具体支持受模型限制，留空使用服务默认值。' : '手动填写模型供应商支持的值；留空则使用服务默认值。'}</small></label>
         <div className="field-grid compact-grid">
           <label><span>超时秒数</span><input type="number" min={5} max={600} value={settings.timeout_seconds} onChange={(event) => update('timeout_seconds', Number(event.target.value))} disabled={saving} /></label>
         </div>
@@ -255,7 +298,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
         </label>
         <label className="check-row">
           <input type="checkbox" checked={settings.context_reuse_enabled} onChange={(event) => update('context_reuse_enabled', event.target.checked)} disabled={saving} aria-describedby="context-reuse-help" />
-          <span>上下文复用（实验性）<small id="context-reuse-help">让相邻页面共享识别上下文。需要模型服务支持保存并续接对话，历史内容仍占用上下文和用量。</small></span>
+          <span>上下文复用（实验性）<small id="context-reuse-help">{isGemini ? '本机会保留同组页面的识别历史，每次请求重传完整历史和图片；历史内容仍占用上下文和用量。' : '让相邻页面共享识别上下文。需要模型服务支持保存并续接对话，历史内容仍占用上下文和用量。'}</small></span>
         </label>
         {settings.context_reuse_enabled && <label className="number-field">
           <span>每条对话最多识别页数</span>
@@ -265,7 +308,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
           <small id="context-reuse-pages-help">含首张页面。按编排顺序连续分组，组间并行、组内依次识别，最终页序不变；每次开始处理都会建立新对话。</small>
         </label>}
         {testResult && <div className={testResult.ok ? 'inline-result success-box' : 'inline-result error-box'}>{testResult.message}</div>}
-        <div className="button-row"><button className="primary" onClick={save} disabled={saving || modelsLoading}>{saving ? '请稍候…' : '保存设置'}</button><button onClick={test} disabled={saving || modelsLoading || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存当前改动' : undefined}>主动测试连接</button></div>
+        <div className="button-row"><button className="primary" onClick={save} disabled={saving || modelsLoading || needsNewKey}>{saving ? '请稍候…' : '保存设置'}</button><button onClick={test} disabled={saving || modelsLoading || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存当前改动' : undefined}>主动测试连接</button></div>
         {hasUnsavedChanges && <p className="settings-warning">有未保存改动。请先保存，再测试模型连接。</p>}
         <p className="settings-footnote">获取模型只查询列表，不保存设置或发送推理请求。保存设置不会联系模型服务。主动测试使用已保存配置发送请求，可能产生供应商用量。</p>
       </div>
@@ -295,6 +338,21 @@ function draftFromPage(page: Page | null): PageDraft {
     : { text: '', page_kind: 'content', cover_fields: [] }
 }
 
+function PaperSizeControl({ value, saving, disabled, onChange }: {
+  value: PaperSize
+  saving: boolean
+  disabled: boolean
+  onChange: (size: PaperSize) => void
+}) {
+  return <div className="book-paper-control">
+    <label htmlFor="book-paper-size">书本纸张</label>
+    <select id="book-paper-size" value={value} disabled={disabled} aria-describedby="book-paper-note" onChange={(event) => onChange(event.target.value as PaperSize)}>
+      {Object.entries(PAPER_SIZES).map(([size, paper]) => <option key={size} value={size}>{paper.label}</option>)}
+    </select>
+    <small id="book-paper-note" aria-live="polite">{saving ? '正在保存纸张尺寸…' : '整本书生效；预览、HTML 和打印使用同一纸张。'}</small>
+  </div>
+}
+
 export default function App() {
   const [view, setView] = useState<WorkspaceView>('upload')
   const [books, setBooks] = useState<Book[]>([])
@@ -310,6 +368,8 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [layoutSaving, setLayoutSaving] = useState(false)
+  const [printVersion, setPrintVersion] = useState(false)
   const [actionBusy, setActionBusy] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [newProject, setNewProject] = useState(false)
@@ -380,19 +440,21 @@ export default function App() {
     setUploadError('')
     setDetail(null)
     setSelectedPageNumber(1)
+    setPrintVersion(false)
     if (selectedBookId) void loadDetail(selectedBookId, false, true)
   }, [selectedBookId, loadDetail])
   useEffect(() => {
-    if (!selectedBookId || actionBusy || !['processing', 'pausing'].includes(detail?.book.status ?? '')) return
+    if (!selectedBookId || actionBusy || layoutSaving || !['processing', 'pausing'].includes(detail?.book.status ?? '')) return
     const timer = window.setInterval(() => void loadDetail(selectedBookId, true), 2000)
     return () => window.clearInterval(timer)
-  }, [selectedBookId, detail?.book.status, actionBusy, loadDetail])
+  }, [selectedBookId, detail?.book.status, actionBusy, layoutSaving, loadDetail])
 
   const sourcePage = useMemo(() => detail?.pages.find((page) => page.number === selectedPageNumber) ?? null, [detail, selectedPageNumber])
+  const sourcePageHasResult = sourcePage && (sourcePage.status === 'ready' || Boolean(sourcePage.text || sourcePage.cover_fields.length || sourcePage.header_segments.length || sourcePage.footer_segments.length))
   const pendingPages = detail?.pages.filter((page) => page.status !== 'ready') ?? []
-  const pagesToProcess = (pendingPages.length ? pendingPages : detail?.pages ?? []).map((page) => page.number)
+  const pagesToProcess = pendingPages.map((page) => page.number)
   const isRunning = detail?.book.status === 'processing' || detail?.book.status === 'pausing'
-  const busy = actionBusy || saving || uploading || deleting || organizerBusy
+  const busy = actionBusy || saving || layoutSaving || uploading || deleting || organizerBusy
   const processLocked = isRunning || busy
   const editLocked = isRunning || busy || sourcePage?.status === 'processing'
   const progress = detail?.book.selected_page_count ? Math.round(detail.book.completed_pages / detail.book.selected_page_count * 100) : 0
@@ -505,10 +567,9 @@ export default function App() {
     setNotice({ kind: 'success', text: `编排已确认，共 ${value.pages.length} 页。可以开始识别并逐页校对。` })
   }
 
-  const processBook = async () => {
-    if (!detail?.book.selection_confirmed || processLocked || pagesToProcess.length === 0) return
+  const processPages = async (pages: number[]) => {
+    if (!detail?.book.selection_confirmed || processLocked || pages.length === 0) return
     const bookId = detail.book.id
-    const pages = pagesToProcess
     const targets = detail.pages.filter((page) => pages.includes(page.number))
     const discardDraft = dirty && pages.includes(selectedPageNumber)
     if ((targets.some((page) => page.status === 'ready' || Boolean(page.text || page.cover_fields.length || page.header_segments.length || page.footer_segments.length)) || discardDraft)
@@ -568,6 +629,22 @@ export default function App() {
     }
   }
 
+  const savePaperSize = async (paperSize: PaperSize) => {
+    if (!detail || layoutSaving || paperSize === (detail.book.paper_size ?? 'a4')) return
+    setLayoutSaving(true)
+    detailRequestRef.current += 1
+    try {
+      const saved = await api.saveBookLayout(detail.book.id, paperSize)
+      setDetail((current) => current?.book.id === saved.id ? { ...current, book: saved } : current)
+      setBooks((current) => current.map((book) => book.id === saved.id ? saved : book))
+      setNotice({ kind: 'success', text: `已将整本书纸张设为 ${PAPER_SIZES[saved.paper_size].label}。` })
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorText(error) })
+    } finally {
+      setLayoutSaving(false)
+    }
+  }
+
   const savePage = async () => {
     if (!detail || !sourcePage) return
     setSaving(true)
@@ -595,7 +672,7 @@ export default function App() {
       const data = await api.exportBook(detail.book.id)
       const name = safeFilename(data.book.title)
       if (kind === 'json') downloadText(name + '.json', JSON.stringify(data, null, 2), 'application/json;charset=utf-8')
-      if (kind === 'html') downloadText(name + '.html', buildStandaloneHtml(data), 'text/html;charset=utf-8')
+      if (kind === 'html') downloadText(name + '.html', buildStandaloneHtml(data, printVersion), 'text/html;charset=utf-8')
       setNotice({ kind: 'success', text: (kind === 'html' ? '独立 HTML' : 'JSON') + ' 已下载。' })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
@@ -613,7 +690,7 @@ export default function App() {
           <button className={view === 'settings' ? 'nav-active' : ''} onClick={() => changeView('settings')} disabled={busy}>设置</button>
         </nav>
       </header>
-      {notice && <div className={'notice ' + notice.kind + ' no-print'} role="status"><span>{notice.text}</span><button onClick={() => setNotice(null)} aria-label="关闭提示">×</button></div>}
+      {notice && <div className={'notice global-notice ' + notice.kind + ' no-print'} role="status"><span>{notice.text}</span><button onClick={() => setNotice(null)} aria-label="关闭提示">×</button></div>}
       {view === 'settings' ? <SettingsView onNotice={showNotice} /> : (
         <div className="layout">
           <aside className="library no-print">
@@ -672,16 +749,27 @@ export default function App() {
                   </section>
                 ) : view === 'organize' ? <ProjectOrganizer key={detail.book.id} bookId={detail.book.id} onConfirmed={confirmArrangement} onNotice={showNotice} disabled={processLocked} onDirtyChange={setOrganizerDirty} onBusyChange={setOrganizerBusy} />
                   : view === 'preview' ? <>
-                    <div className="preview-toolbar no-print"><div><p className="eyebrow">整书预览</p><h2>按已确认的编排阅读</h2><p>共 {detail.pages.length} 页；下方顺序与已确认的编排及导出顺序一致。</p><UsageView usage={detail.book.usage} /></div><div className="preview-actions"><div className="button-row"><button onClick={() => void exportData('json')} disabled={busy}>下载 JSON</button><button onClick={() => void exportData('html')} disabled={busy}>下载独立 HTML</button><button className="primary" onClick={() => window.print()} disabled={busy}>打印 / 存为 PDF</button></div></div><p className="export-limit">独立 HTML 不加载远程资源，公式以 MathML 保存，离线显示取决于浏览器数学字体。</p></div>
-                    <BookContent detail={detail} />
+                    <div className="preview-toolbar no-print">
+                      <div><p className="eyebrow">整书预览</p><h2>按已确认的编排阅读</h2><p>共 {detail.pages.length} 个源页面；长正文会按纸张尺寸自然跨页。</p><UsageView usage={detail.book.usage} /></div>
+                      <div className="preview-actions">
+                        <PaperSizeControl value={detail.book.paper_size ?? 'a4'} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
+                        <label className="print-version-control">
+                          <input type="checkbox" checked={printVersion} disabled={busy} onChange={(event) => setPrintVersion(event.target.checked)} aria-describedby="print-version-note" />
+                          <span><strong>打印版本</strong><small id="print-version-note">按源页识别的左右位置预留装订边距；无页脚、未知页侧和封面封底保持居中。</small></span>
+                        </label>
+                        <div className="button-row"><button onClick={() => void exportData('json')} disabled={busy}>下载 JSON</button><button onClick={() => void exportData('html')} disabled={busy}>下载独立 HTML</button><button className="primary" onClick={() => window.print()} disabled={busy}>打印 / 存为 PDF</button></div>
+                      </div>
+                      <p className="export-limit">独立 HTML 不加载远程资源，公式以 MathML 保存，离线显示取决于浏览器数学字体。打印时请使用所选纸张，关闭浏览器页眉和页脚。{printVersion && <><br />长正文续页沿用源页版式。屏幕按源页展示，实际分页以打印预览为准。</>}</p>
+                    </div>
+                    <BookContent detail={detail} printVersion={printVersion} />
                   </> : <>
-                    <div className="proofing-toolbar no-print"><div><p>{pendingPages.length ? `待处理 ${pendingPages.length} 页` : detail.pages.length ? '编排中的页面均已完成' : '编排暂无页面'}</p><UsageView usage={detail.book.usage} /></div><div className="button-row"><button onClick={() => changeView('organize')} disabled={processLocked}>修改页面编排</button><button onClick={processBook} className="primary" disabled={processLocked || pagesToProcess.length === 0}>{isRunning ? '处理中…' : pendingPages.length ? '识别未完成页' : '重新识别全部页'}</button>{isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}</div></div>
+                    <div className="proofing-toolbar no-print"><div><p>{pendingPages.length ? `待处理 ${pendingPages.length} 页` : detail.pages.length ? '编排中的页面均已完成' : '编排暂无页面'}</p><UsageView usage={detail.book.usage} /></div><PaperSizeControl value={detail.book.paper_size ?? 'a4'} saving={layoutSaving} disabled={busy} onChange={savePaperSize} /><div className="button-row"><button onClick={() => changeView('organize')} disabled={processLocked}>修改页面编排</button>{pagesToProcess.length > 0 && <button onClick={() => void processPages(pagesToProcess)} className="primary" disabled={processLocked}>{isRunning ? '处理中…' : '识别未完成页'}</button>}{isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}</div></div>
                     <div className="progress-track" aria-label={'编排已完成比例 ' + progress + '%'}><span style={{ width: progress + '%' }} /></div>
                     {detail.book.error && <div className="error-panel"><strong>处理失败</strong><span>{detail.book.error}</span></div>}
                     <div className="workspace-grid">
                       <aside className="page-rail" aria-label="已编排页面">{detail.pages.map((page, index) => <div className="page-row unconfirmed" key={page.number}><button className={page.number === selectedPageNumber ? 'page-link selected' : 'page-link'} onClick={() => choosePage(page)} disabled={busy} aria-current={page.number === selectedPageNumber ? 'page' : undefined}><span className="page-order-label">编排第 {index + 1} 页</span><span className="page-source-name" title={sourceLabel(page)}>{sourceLabel(page)}</span><span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></button></div>)}</aside>
                       {sourcePage ? <div className="proofing-area">
-                        <div className="page-heading"><div><p className="eyebrow">编排第 {detail.pages.findIndex((page) => page.number === sourcePage.number) + 1} 页</p><h2 className="proofing-source-title">{sourceLabel(sourcePage)}</h2><span className={statusClass(sourcePage.status)}>{STATUS_LABEL[sourcePage.status] ?? sourcePage.status}</span></div><UsageView usage={sourcePage.usage} attempts={sourcePage.attempts} /></div>
+                        <div className="page-heading"><div><p className="eyebrow">编排第 {detail.pages.findIndex((page) => page.number === sourcePage.number) + 1} 页</p><div className="button-row"><h2 className="proofing-source-title">{sourceLabel(sourcePage)}</h2><span className={statusClass(sourcePage.status)}>{STATUS_LABEL[sourcePage.status] ?? sourcePage.status}</span><button onClick={() => void processPages([sourcePage.number])} disabled={processLocked} title="仅识别当前页面">{sourcePageHasResult ? '重新识别本页' : '识别本页'}</button></div></div><UsageView usage={sourcePage.usage} attempts={sourcePage.attempts} /></div>
                         {sourcePage.error && <div className="page-error">{sourcePage.error}</div>}
                         <div className="proofing-grid">
                           <section className="text-panel">
@@ -692,7 +780,8 @@ export default function App() {
                           <section className="render-panel">
                             <div className="panel-title"><strong>排版预览</strong><a href={api.pagePreviewUrl(detail.book.id, sourcePage.number)} target="_blank" rel="noreferrer">查看原页</a></div>
                             <div className="page-render">
-                              <PageContent page={{ ...sourcePage, ...pageDraft }} />
+                              <p className="page-layout-note">{pageDraft.page_kind === 'front_cover' ? '封面版式 · 自动应用' : pageDraft.page_kind === 'back_cover' ? '封底版式 · 自动应用' : '正文版式'}<span>{PAPER_SIZES[detail.book.paper_size ?? 'a4'].label}</span></p>
+                              <PageContent page={{ ...sourcePage, ...pageDraft }} paperSize={detail.book.paper_size} />
                               {pageDraft.page_kind === 'content'
                                 ? !pageDraft.text && <p className="empty-page">本页暂无正文</p>
                                 : !pageDraft.cover_fields.some((field) => field.text.trim()) && <p className="empty-page">本页暂无书目信息</p>}

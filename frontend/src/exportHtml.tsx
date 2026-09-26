@@ -8,9 +8,9 @@ function escapeHtml(value: string): string {
     .replaceAll('"', '&quot;').replaceAll("'", '&#39;')
 }
 
-export function buildStandaloneHtml(detail: BookDetail): string {
+export function buildStandaloneHtml(detail: BookDetail, printVersion = false): string {
   const title = escapeHtml(detail.book.title)
-  const content = renderToStaticMarkup(<BookContent detail={detail} />)
+  const content = renderToStaticMarkup(<BookContent detail={detail} printVersion={printVersion} />)
   return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>' + title + '</title><style>' + bookCss + '</style></head>' +

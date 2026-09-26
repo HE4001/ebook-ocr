@@ -1,4 +1,4 @@
-import type { Arrangement, Book, BookDetail, Page, PageDraft, Settings } from './types'
+import type { Arrangement, Book, BookDetail, Page, PageDraft, PaperSize, Settings } from './types'
 
 const API_PREFIX = '/api'
 
@@ -56,6 +56,11 @@ export const api = {
     }),
   pagePreviewUrl: (id: string, number: number) => `${API_PREFIX}/books/${encodeURIComponent(id)}/pages/${number}/preview`,
   getBook: (id: string) => request<BookDetail>(`/books/${encodeURIComponent(id)}`),
+  saveBookLayout: (id: string, paperSize: PaperSize) => request<Book>(`/books/${encodeURIComponent(id)}/layout`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paper_size: paperSize }),
+  }),
   deleteBook: (id: string) => request<void>(`/books/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   uploadBook: (file: File) => {
     const form = new FormData()
@@ -95,6 +100,7 @@ export const api = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        api_protocol: settings.api_protocol,
         base_url: settings.base_url,
         models_path: settings.models_path,
         responses_path: settings.responses_path,
@@ -115,6 +121,7 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        api_protocol: settings.api_protocol,
         base_url: settings.base_url,
         models_path: settings.models_path,
         api_key: settings.api_key || '',

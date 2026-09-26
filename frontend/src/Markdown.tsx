@@ -2,7 +2,8 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import type { BookDetail, CoverField, MarginSegment, Page } from './types'
+import { paperPrintCss, paperStyle } from './paper'
+import type { BookDetail, CoverField, MarginSegment, Page, PaperSize } from './types'
 
 function safeUrl(url: string): string {
   const value = url.trim()
@@ -59,7 +60,7 @@ function CoverContent({ fields }: { fields: CoverField[] }) {
 
   return <div className="cover-content">
     {groups.map(({ name, kinds }) => {
-      const entries = fields.filter((field) => kinds.includes(field.kind) && field.text.trim())
+      const entries = kinds.flatMap((kind) => fields.filter((field) => field.kind === kind && field.text.trim()))
       return entries.length > 0 && <div className={`cover-${name}`} key={name}>
         {entries.map((field, index) => <p className={`cover-field-${field.kind}`} key={index}>{field.text}</p>)}
       </div>
@@ -67,8 +68,9 @@ function CoverContent({ fields }: { fields: CoverField[] }) {
   </div>
 }
 
-export function PageContent({ page, text = page.text }: { page: Page; text?: string }) {
-  return <div className="book-page-entry">
+export function PageContent({ page, text = page.text, paperSize = 'a4' }: { page: Page; text?: string; paperSize?: PaperSize }) {
+  const pageSide = page.page_kind === 'content' && page.footer_segments.length > 0 ? page.page_side ?? 'unknown' : 'unknown'
+  return <div className="book-page-entry" style={paperStyle(paperSize)} data-page-side={pageSide}>
     <div className="book-page-number">{page.source_filename} · 第 {page.source_page} 页</div>
     <section className={`book-page book-page-${page.page_kind}`} data-page={page.number} aria-label={`${page.source_filename} 第 ${page.source_page} 页排版`}>
       {page.page_kind === 'content' ? <>
@@ -80,9 +82,10 @@ export function PageContent({ page, text = page.text }: { page: Page; text?: str
   </div>
 }
 
-export function BookContent({ detail }: { detail: BookDetail }) {
-  return <article className="book-preview" id="print-manuscript">
+export function BookContent({ detail, printVersion = false }: { detail: BookDetail; printVersion?: boolean }) {
+  return <article className={`book-preview${printVersion ? ' book-preview-print' : ''}`} id="print-manuscript" style={paperStyle(detail.book.paper_size)}>
+    <style>{paperPrintCss(detail.book.paper_size, printVersion)}</style>
     <h1 className="book-title">{detail.book.title}</h1>
-    {detail.pages.map((page) => <PageContent key={page.number} page={page} />)}
+    {detail.pages.map((page) => <PageContent key={page.number} page={page} paperSize={detail.book.paper_size} />)}
   </article>
 }

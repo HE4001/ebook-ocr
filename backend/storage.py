@@ -8,11 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import Book, CoverField, MarginSegment, Page, PageKind, SourceFile, StructuredPageResult, Usage
+from .models import Book, CoverField, MarginSegment, Page, PageKind, PaperSize, SourceFile, StructuredPageResult, Usage
 from .prompts import legacy_blocks_to_markdown
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "api_protocol": "openai_responses",
     "base_url": "https://api.openai.com/v1",
     "responses_path": "/responses",
     "models_path": "/models",
@@ -48,7 +49,8 @@ class Storage:
                     id TEXT PRIMARY KEY, title TEXT NOT NULL, filename TEXT NOT NULL,
                     status TEXT NOT NULL, page_count INTEGER NOT NULL,
                     completed_pages INTEGER NOT NULL DEFAULT 0, error TEXT,
-                    created_at TEXT NOT NULL, selection_confirmed INTEGER NOT NULL DEFAULT 0
+                    created_at TEXT NOT NULL, selection_confirmed INTEGER NOT NULL DEFAULT 0,
+                    paper_size TEXT NOT NULL DEFAULT 'a4'
                 );
                 CREATE TABLE IF NOT EXISTS pages (
                     book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
@@ -57,6 +59,7 @@ class Storage:
                     extraction_text TEXT NOT NULL DEFAULT '', extraction_json TEXT,
                     blocks_json TEXT NOT NULL DEFAULT '[]', text TEXT NOT NULL DEFAULT '',
                     page_kind TEXT NOT NULL DEFAULT 'content',
+                    page_side TEXT NOT NULL DEFAULT 'unknown',
                     cover_fields_json TEXT NOT NULL DEFAULT '[]',
                     header_segments_json TEXT NOT NULL DEFAULT '[]',
                     footer_segments_json TEXT NOT NULL DEFAULT '[]',
@@ -116,6 +119,8 @@ class Storage:
                 )
             if "page_kind" not in columns:
                 connection.execute("ALTER TABLE pages ADD COLUMN page_kind TEXT NOT NULL DEFAULT 'content'")
+            if "page_side" not in columns:
+                connection.execute("ALTER TABLE pages ADD COLUMN page_side TEXT NOT NULL DEFAULT 'unknown'")
             if "cover_fields_json" not in columns:
                 connection.execute("ALTER TABLE pages ADD COLUMN cover_fields_json TEXT NOT NULL DEFAULT '[]'")
             if "selected" not in columns:
@@ -128,6 +133,8 @@ class Storage:
                 connection.execute("ALTER TABLE pages ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
                 connection.execute("UPDATE pages SET position = number")
             book_columns = {row["name"] for row in connection.execute("PRAGMA table_info(books)")}
+            if "paper_size" not in book_columns:
+                connection.execute("ALTER TABLE books ADD COLUMN paper_size TEXT NOT NULL DEFAULT 'a4'")
             if "selection_confirmed" not in book_columns:
                 connection.execute(
                     "ALTER TABLE books ADD COLUMN selection_confirmed INTEGER NOT NULL DEFAULT 0"
@@ -362,6 +369,12 @@ class Storage:
             row = connection.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
             return self._book(connection, row) if row else None
 
+    def save_layout(self, book_id: str, paper_size: PaperSize) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE books SET paper_size = ? WHERE id = ?", (paper_size, book_id),
+            )
+
     def delete_book(self, book_id: str) -> bool:
         book_dir = self.books_root / book_id
         if book_dir.resolve() != self.books_root.resolve() / book_id:
@@ -509,12 +522,13 @@ class Storage:
         with self._connect() as connection:
             connection.execute(
                 "UPDATE pages SET status = 'ready', error = NULL, text = ?, "
-                "page_kind = ?, cover_fields_json = ?, "
+                "page_kind = ?, page_side = ?, cover_fields_json = ?, "
                 "header_segments_json = ?, footer_segments_json = ?, extraction_json = NULL "
                 "WHERE book_id = ? AND number = ?",
                 (
                     result.body_markdown,
                     result.page_kind,
+                    result.page_side,
                     json.dumps([field.model_dump() for field in result.cover_fields], ensure_ascii=False),
                     json.dumps([segment.model_dump() for segment in result.header_segments], ensure_ascii=False),
                     json.dumps([segment.model_dump() for segment in result.footer_segments], ensure_ascii=False),
@@ -544,7 +558,7 @@ class Storage:
     ) -> None:
         with self._connect() as connection:
             page = connection.execute(
-                "SELECT page_kind, cover_fields_json, header_segments_json, footer_segments_json FROM pages "
+                "SELECT page_kind, page_side, cover_fields_json, header_segments_json, footer_segments_json FROM pages "
                 "WHERE book_id = ? AND number = ? AND selected = 1",
                 (book_id, number),
             ).fetchone()
@@ -555,6 +569,7 @@ class Storage:
                 if cover_fields:
                     raise ValueError("正文页不能包含封面书目信息")
                 fields_json = "[]"
+                page_side = page["page_side"]
                 header_json = page["header_segments_json"]
                 footer_json = page["footer_segments_json"]
             else:
@@ -565,11 +580,12 @@ class Storage:
                     if cover_fields is not None else page["cover_fields_json"]
                 )
                 header_json = footer_json = "[]"
+                page_side = "unknown"
             connection.execute(
-                "UPDATE pages SET status = 'ready', error = NULL, text = ?, page_kind = ?, "
+                "UPDATE pages SET status = 'ready', error = NULL, text = ?, page_kind = ?, page_side = ?, "
                 "cover_fields_json = ?, header_segments_json = ?, footer_segments_json = ? "
                 "WHERE book_id = ? AND number = ?",
-                (text, kind, fields_json, header_json, footer_json, book_id, number),
+                (text, kind, page_side, fields_json, header_json, footer_json, book_id, number),
             )
         self.refresh_book(book_id, processing=False)
 
@@ -663,6 +679,7 @@ class Storage:
             source_id=row["source_id"], source_filename=row["source_filename"], source_page=row["source_page"],
             text=row["text"],
             page_kind=row["page_kind"],
+            page_side=row["page_side"],
             cover_fields=[CoverField.model_validate(value) for value in json.loads(row["cover_fields_json"])],
             header_segments=[MarginSegment.model_validate(value) for value in
                              json.loads(row["header_segments_json"])],

@@ -230,6 +230,7 @@ class BackendTests(unittest.TestCase):
                             }]},
                             {"type": "message", "content": [{
                                 "type": "output_text", "text": json.dumps({
+                                    "page_kind": "content", "page_side": "unknown",
                                     "header_segments": [{"kind": "text", "text": "原书页眉"}],
                                     "body_markdown": "# 标题\n\n正文 **原文**",
                                     "footer_segments": [{"kind": "page_number", "text": "12"}],
@@ -324,6 +325,7 @@ class BackendTests(unittest.TestCase):
                         "input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
                     "output": [{"type": "message", "content": [{
                         "type": "output_text", "text": json.dumps({
+                            "page_kind": "content", "page_side": "unknown",
                             "header_segments": [], "body_markdown": "", "footer_segments": [],
                         })}]}],
                 }))
@@ -479,7 +481,7 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(set(detail["pages"][0]), {
                 "number", "status", "error", "text", "header_segments",
                 "footer_segments", "usage", "attempts", "source_id",
-                "source_filename", "source_page", "page_kind", "cover_fields"})
+                "source_filename", "source_page", "page_kind", "page_side", "cover_fields"})
             self.assertEqual(client.put(f"/api/books/{book_id}/arrangement", json={
                 "file_order": ["legacy"], "page_order": [1],
             }).status_code, 200)
