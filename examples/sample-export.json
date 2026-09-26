@@ -21,10 +21,36 @@
       "status": "ready",
       "error": null,
       "text": "# 第一章 示例\n\n这是正文，用来说明页面 Markdown 和固定用量契约。\n\n> 可靠的排版应保留来源文字。\n\n**实例：** 先校对原文，再导出 HTML。\n\n公式：$E = mc^2$。\n\n| 阶段 | 结果 |\n| --- | --- |\n| 提取 | 保留页面文字 |\n| 校对 | 保存人工修改 |",
-      "header_segments": [{"kind": "text", "text": "识别与排版示例"}],
+      "header_segments": [
+        {
+          "kind": "text",
+          "text": "识别与排版示例",
+          "alignment": "center",
+          "row": 1,
+          "font_size": "small",
+          "bold": false,
+          "italic": false
+        }
+      ],
       "footer_segments": [
-        {"kind": "text", "text": "示例页面"},
-        {"kind": "page_number", "text": "1"}
+        {
+          "kind": "text",
+          "text": "示例页面",
+          "alignment": "left",
+          "row": 1,
+          "font_size": "small",
+          "bold": false,
+          "italic": false
+        },
+        {
+          "kind": "page_number",
+          "text": "1",
+          "alignment": "center",
+          "row": 1,
+          "font_size": "small",
+          "bold": false,
+          "italic": false
+        }
       ],
       "usage": {
         "input_tokens": 1234,

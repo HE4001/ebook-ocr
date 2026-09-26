@@ -13,7 +13,7 @@
 | Responses 客户端 | 组合 `base_url + responses_path`，发起带 Bearer 的非流式 POST 并读取供应商 usage | 只支持通用 Responses API；不自动切换 Chat Completions、不开 provider 框架或跟随重定向 |
 | 页面代理 | 每次请求只处理一页图片，输出结构化页眉、正文 Markdown 和页脚 | 每页独立上下文；应用内模型请求不创建 Codex 任务，不携带其他页聊天历史 |
 | 流程协调 | 按当前页、手动页码列表或整本范围串行处理；累计尝试和已知用量 | 可重复处理已完成页；成功替换旧文本，失败保留旧文本；未知请求不会伪造为零用量 |
-| 排版与导出 | 前端生成语义化 HTML/CSS、Markdown 与固定字段 JSON | 公式和表格按页面文本保留；PDF 使用浏览器打印，不承诺后端 PDF 引擎 |
+| 排版与导出 | 前端用同一套页面结构与模型输出的页眉页脚格式生成单页预览、整书预览和独立 HTML；另提供 Markdown 与固定字段 JSON | 页眉置顶、页脚置底、正文自然伸展；不精确复刻源版面或承诺每个源页对应一张打印纸；PDF 使用浏览器打印 |
 
 ## 数据流
 
@@ -35,9 +35,9 @@ PDF / PNG / JPEG
 
 页面代理的单次上下文包含文件名、页码、总页数、本页图片和转录指令。页面中的命令都属于待转录资料，不改变任务。代理只转录原书排印内容，排除后加手写批注等类似笔迹；按原页阅读顺序把页眉、正文、页脚分开，脚注和图注留在正文。不可读的原文局部写 `[无法辨认]`，空白页返回空语段和空正文。
 
-模型返回 `header_segments`、`body_markdown`、`footer_segments`，后端按 JSON Schema 请求并校验。只有正文使用 Markdown；正文中的公式行内使用 `$...$`，独立公式的 `$$` 分隔符各自独占一行，中间保留 LaTeX。页眉页脚保存为纯文本语段，不再混入正文 Markdown。
+模型返回 `header_segments`、`body_markdown`、`footer_segments`，后端按严格 JSON Schema 请求并校验。每条页眉或页脚语段包含必填的 `kind`、`text`、`alignment`、`row`、`font_size`、`bold`、`italic`；对齐为 `left|center|right`，行次为 1–10，字号为 `small|normal`，粗体和斜体为布尔值。旧保存结果缺少格式字段时使用居中、第一行、小号字、非粗体、非斜体的默认值。只有正文使用 Markdown；正文中的公式行内使用 `$...$`，独立公式的 `$$` 分隔符各自独占一行，中间保留 LaTeX。页眉页脚与正文分别保存。
 
-`Page` 固定包含 `number`、`status`、`error`、`text`、`usage` 和 `attempts`。`Usage` 为 `{input_tokens, output_tokens, total_tokens, complete}`：供应商没有返回的字段保持 `null`，不会估算或显示为零；一次或多次重试只累加已知值，任意尝试缺少用量或无法确认消耗时 `complete` 为 `false`。`Book.usage` 是全书已尝试页面的合计。
+`Page` 固定包含 `number`、`status`、`error`、`text`、`header_segments`、`footer_segments`、`usage` 和 `attempts`。`Usage` 为 `{input_tokens, output_tokens, total_tokens, complete}`：供应商没有返回的字段保持 `null`，不会估算或显示为零；一次或多次重试只累加已知值，任意尝试缺少用量或无法确认消耗时 `complete` 为 `false`。`Book.usage` 是全书已尝试页面的合计。
 
 ## HTTP 契约索引
 
@@ -61,7 +61,7 @@ PDF / PNG / JPEG
 
 默认范围是当前页，用户也可手动选择多页或整本。页面可以重复处理；提示覆盖后，成功结果替换旧文本，失败时保留旧文本，`attempts` 和已知 `usage` 累计。若处理范围涉及未保存草稿，前端必须先让用户保存或处理提示，不可静默丢弃。处理所选范围时，书籍状态保持 `processing` 或 `pausing`，直到本次处理结束；所选页成功而其他页面仍为未处理状态时，书籍回到 `uploaded` 且无错误。暂停时书籍先进入 `pausing`，当前页结束后进入 `paused`。暂停保留已有结果及请求用量；再次点击“处理”按当前选择范围发起，不承诺恢复此前队列。已暂停状态在重启后保留。
 
-整书预览不提供 Markdown 下载按钮；`GET /api/books/{id}/export.md` 接口仍保留，按源页顺序合并已保存正文。页眉页脚通过 JSON 和 HTML 导出保留。
+单页预览、整书预览和独立 HTML 共用页眉、正文、页脚结构；每条页眉或页脚语段按模型输出的 `alignment`、`row`、`font_size`、`bold`、`italic` 排版，不提供整页预设，也不在 `localStorage` 保存排版选项。来源页序号位于纸张外并在打印时隐藏。整书预览不提供 Markdown 下载按钮；`GET /api/books/{id}/export.md` 接口仍保留，按源页顺序合并已保存正文。页眉页脚格式通过 JSON 和 HTML 导出保留。
 
 设置中的 `reasoning_effort` 是可选字符串，默认值为空。空值时识别和连接测试请求省略 `reasoning`；非空时传递 `reasoning: {"effort": value}`。不限制输入枚举，实际支持情况由服务和模型决定。`max_output_tokens` 为正整数，默认 `12000`，同时用于页面识别和文本连接测试，额度包含推理和正文；截断提示应提高额度或降低推理，已返回 usage 仍计入。删除接口成功返回 `204 No Content`；未知书籍返回 `404`，正在处理的同一本书返回 `409`。删除只作用于目标书籍，不改变其他书籍、全局设置或 API 密钥。
 

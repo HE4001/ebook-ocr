@@ -29,9 +29,9 @@
 
 ## 页面结果与校对
 
-- [ ] `Page` 返回 `number`、`status`、`error`、`text`、`header_segments`、`footer_segments`、`usage`、`attempts`；不要求用户编辑坐标或图片块。
+- [ ] `Page` 返回 `number`、`status`、`error`、`text`、`header_segments`、`footer_segments`、`usage`、`attempts`；页眉页脚语段含 `kind`、`text`、`alignment`、`row`、`font_size`、`bold`、`italic`，旧结果缺少格式字段时采用文档默认值。
 - [ ] 正文文本保留原页阅读顺序、标题、列表、引用、公式、表格、图注和脚注；原书页眉、页脚及所在页码单独保留为语段。
-- [ ] 页面代理请求使用 JSON Schema；页眉与页脚保存为纯文本语段，只有正文按 Markdown 保存，空白页返回空语段和空正文，手写批注不进入结果。
+- [ ] 页面代理请求使用严格 JSON Schema，要求页眉页脚语段所有字段；页眉页脚保存为纯文本语段及格式信息，只有正文按 Markdown 保存，空白页返回空语段和空正文，手写批注不进入结果。
 - [ ] 人工 PUT 只提交 `{text}`，运行中的页面拒绝修改。
 - [ ] 应用内模型请求不创建 Codex 任务，也不携带其他页面聊天历史。
 
@@ -41,6 +41,8 @@
 - [ ] 自动或手动重试累计各次已知用量；拒绝、incomplete、缺少正文带有 usage 时也计入；未知消耗使 `complete=false`。
 - [ ] JSON 导出包含 `book.usage`、`pages[].usage` 和 `pages[].attempts`，字段固定且能通过 [示例 JSON](../examples/sample-export.json) 解析。
 - [ ] 整书预览提供 JSON、HTML 和浏览器打印；没有 Markdown 下载按钮，后端 Markdown 导出接口仍保留。
+- [ ] 不提供整页排版预设或保存到 `localStorage` 的排版选项；单页、整书预览和独立 HTML 按模型输出的页眉页脚 `alignment`、`row`、`font_size`、`bold`、`italic` 排版，来源页序号在纸张外显示并在打印时隐藏，页眉在顶部、页脚在底部，正文自然伸展。
+- [ ] 排版不宣称精确复刻源页版面或保证每个源页打印成单独一张纸。
 - [ ] 不宣称支持 EPUB/MOBI、后端 PDF 排版引擎、自动跨页合并、自动删页眉脚注、图表重绘或其他契约之外的能力。
 
 ## 最小验证记录

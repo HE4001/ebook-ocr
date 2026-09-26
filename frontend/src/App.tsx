@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
-import { BookContent, MarginContent, Markdown } from './Markdown'
+import { BookContent, PageContent } from './Markdown'
 import { buildStandaloneHtml, downloadText, safeFilename } from './exportHtml'
 import type { Book, BookDetail, Notice, Page, Settings, Usage } from './types'
 
@@ -197,6 +197,12 @@ export default function App() {
   const selectedBookIdRef = useRef<string | null>(null)
   const showNotice = useCallback((value: Notice) => setNotice(value), [])
 
+  useEffect(() => {
+    if (!notice) return
+    const timer = window.setTimeout(() => setNotice(null), 5000)
+    return () => window.clearTimeout(timer)
+  }, [notice])
+
   const loadBooks = useCallback(async () => {
     try {
       const value = await api.listBooks()
@@ -386,7 +392,8 @@ export default function App() {
   const editLocked = isRunning || actionBusy || deleting || sourcePage?.status === 'processing'
   const progress = detail?.book.page_count ? Math.round(detail.book.completed_pages / detail.book.page_count * 100) : 0
   const oldBackendContract = Boolean(detail && (
-    !detail.book.usage || detail.pages.some((page) => typeof page.text !== 'string' || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage)
+    !detail.book.usage || detail.pages.some((page) => typeof page.text !== 'string' || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage
+      || [...page.header_segments, ...page.footer_segments].some((segment) => !segment.alignment || !segment.row))
   ))
   const bookControlsVisible = Boolean(view === 'workspace' && selectedBookId && !detailLoading && detail?.book.id === selectedBookId && !oldBackendContract)
   const noticeView = notice && <div className={'notice ' + notice.kind + ' no-print'} role="status"><span>{notice.text}</span><button onClick={() => setNotice(null)} aria-label="关闭提示">×</button></div>
@@ -423,8 +430,8 @@ export default function App() {
               : view === 'preview' ? (
                 <>
                   <div className="preview-toolbar no-print">
-                    <div><p className="eyebrow">整书预览</p><h1>{detail.book.title}</h1><p>按源页顺序显示文本，保留页眉、页脚、页码及 Markdown 格式。</p><UsageView usage={detail.book.usage} /></div>
-                    <div className="button-row"><button onClick={() => void exportData('json')} disabled={actionBusy}>下载 JSON</button><button onClick={() => void exportData('html')} disabled={actionBusy}>下载独立 HTML</button><button className="primary" onClick={printBook} disabled={actionBusy}>打印 / 存为 PDF</button></div>
+                    <div><p className="eyebrow">整书预览</p><h1>{detail.book.title}</h1><p>按源页顺序显示识别内容；页眉页脚和原书页码位于纸张内。</p><UsageView usage={detail.book.usage} /></div>
+                    <div className="preview-actions"><div className="button-row"><button onClick={() => void exportData('json')} disabled={actionBusy}>下载 JSON</button><button onClick={() => void exportData('html')} disabled={actionBusy}>下载独立 HTML</button><button className="primary" onClick={printBook} disabled={actionBusy}>打印 / 存为 PDF</button></div></div>
                     <p className="export-limit">独立 HTML 不加载远程资源，公式以 MathML 保存，离线显示取决于浏览器数学字体。</p>
                   </div>
                   <BookContent detail={detail} />
@@ -460,7 +467,7 @@ export default function App() {
                         {sourcePage.error && <div className="page-error">{sourcePage.error}</div>}
                         <div className="proofing-grid">
                           <section className="text-panel"><div className="panel-title"><strong>正文 Markdown 源文本</strong><button className="primary" onClick={savePage} disabled={!dirty || saving || editLocked}>{saving ? '保存中…' : '保存本页'}</button></div>{editLocked && <div className="lock-note">{deleting ? '删除中，本页暂不可编辑。' : '处理运行中，本页暂不可编辑。'}</div>}<textarea aria-label="本页正文 Markdown 源文本" value={draftText} onChange={(event) => { setDraftText(event.target.value); setDirty(true) }} disabled={editLocked} spellCheck={false} placeholder="本页暂无正文" /></section>
-                          <section className="render-panel"><div className="panel-title"><strong>预览</strong><span>正文按 Markdown 显示</span></div><div className="page-render">{sourcePage.header_segments.length > 0 && <><p className="margin-caption">原书页眉</p><MarginContent segments={sourcePage.header_segments} placement="header" /></>}{draftText ? <Markdown text={draftText} /> : <p className="empty-page">本页暂无正文</p>}{sourcePage.footer_segments.length > 0 && <><p className="margin-caption">原书页脚</p><MarginContent segments={sourcePage.footer_segments} placement="footer" /></>}</div></section>
+                          <section className="render-panel"><div className="panel-title"><strong>预览</strong></div><div className="page-render"><PageContent page={sourcePage} text={draftText} />{!draftText && <p className="empty-page">本页暂无正文</p>}</div></section>
                         </div>
                       </div>
                     ) : <div className="center-state">暂无页面。</div>}

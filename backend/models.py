@@ -38,6 +38,11 @@ class MarginSegment(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["text", "page_number"]
     text: str = Field(max_length=50_000)
+    alignment: Literal["left", "center", "right"] = "center"
+    row: int = Field(default=1, ge=1, le=10)
+    font_size: Literal["small", "normal"] = "small"
+    bold: bool = False
+    italic: bool = False
 
 
 class Page(BaseModel):

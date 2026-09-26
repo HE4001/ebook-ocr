@@ -43,7 +43,15 @@ export type Page = {
   attempts: number
 }
 
-export type MarginSegment = { kind: 'text' | 'page_number'; text: string }
+export type MarginSegment = {
+  kind: 'text' | 'page_number'
+  text: string
+  alignment: 'left' | 'center' | 'right'
+  row: number
+  font_size: 'small' | 'normal'
+  bold: boolean
+  italic: boolean
+}
 
 export type BookDetail = { book: Book; pages: Page[] }
 export type Notice = { kind: 'success' | 'error' | 'info'; text: string } | null
