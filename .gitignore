@@ -42,6 +42,9 @@ cache/
 tmp/
 *.log
 
+# Local notes
+新建 文本文档.txt
+
 # Operating-system files
 .DS_Store
 Thumbs.db
