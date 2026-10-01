@@ -14,8 +14,10 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel
 
 from .importers import ImportFailure, import_document, prepare_source_preview
+from .latex_diagnostics import layout_warnings
 from .latex_export import LatexCompileError, build_latex, compile_pdf
 from .models import (
     Arrangement,
@@ -50,6 +52,11 @@ COMPILED_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 class RuntimeSecrets:
     api_key: str = ""
+
+
+class PdfCompileResult(BaseModel):
+    pdf_url: str
+    warnings: list[str]
 
 
 def _valid_book_id(value: str) -> str:
@@ -142,7 +149,9 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    async def compiled_pdf(detail: BookDetail, print_version: bool) -> dict[str, str]:
+    async def compiled_pdf(
+        detail: BookDetail, print_version: bool, page_order: list[int] | None = None,
+    ) -> PdfCompileResult:
         source = latex_source(detail, print_version)
         digest = sha256(source.encode("utf-8")).hexdigest()
         output_dir = storage.books_root / detail.book.id / "latex-cache" / digest
@@ -152,7 +161,13 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                     await compile_pdf(source, output_dir)
                 except LatexCompileError as exc:
                     raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"pdf_url": f"/api/books/{detail.book.id}/compiled/{digest}.pdf"}
+        return PdfCompileResult(
+            pdf_url=f"/api/books/{detail.book.id}/compiled/{digest}.pdf",
+            warnings=layout_warnings(
+                output_dir / "compiled.log", source,
+                page_order if page_order is not None else list(range(1, len(detail.pages) + 1)),
+            ),
+        )
 
     async def read_upload(file: UploadFile) -> tuple[str, bytes]:
         filename = Path(file.filename or "").name
@@ -551,14 +566,14 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         )
 
     @app.post("/api/books/{book_id}/compile")
-    async def compile_book(book_id: str, print_version: bool = False) -> dict[str, str]:
+    async def compile_book(book_id: str, print_version: bool = False) -> PdfCompileResult:
         ensure_arranged(ensure_book(book_id))
         return await compiled_pdf(book_detail(book_id), print_version)
 
     @app.post("/api/books/{book_id}/pages/{number}/compile")
     async def compile_page(
         book_id: str, number: int, update: PageUpdate, print_version: bool = False,
-    ) -> dict[str, str]:
+    ) -> PdfCompileResult:
         detail = book_detail(book_id)
         ensure_arranged(detail.book)
         page = next((page for page in detail.pages if page.number == number), None)
@@ -578,7 +593,8 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                 "header_segments": [], "footer_segments": [],
             }
         draft = detail.model_copy(update={"pages": [page.model_copy(update=changes)]})
-        return await compiled_pdf(draft, print_version)
+        page_order = next(index + 1 for index, item in enumerate(detail.pages) if item.number == number)
+        return await compiled_pdf(draft, print_version, page_order=[page_order])
 
     @app.get("/api/books/{book_id}/compiled/{digest}.pdf")
     async def get_compiled_pdf(book_id: str, digest: str) -> FileResponse:

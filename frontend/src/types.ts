@@ -103,5 +103,6 @@ export type SourceFile = {
 }
 
 export type BookDetail = { book: Book; pages: Page[]; files: SourceFile[] }
+export type PdfCompileResult = { pdf_url: string; warnings: string[] }
 export type Arrangement = { book: Book; files: SourceFile[]; pages: Page[]; order: number[] }
 export type Notice = { kind: 'success' | 'error' | 'info'; text: string } | null

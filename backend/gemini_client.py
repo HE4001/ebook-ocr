@@ -10,8 +10,8 @@ from urllib.parse import quote
 import httpx
 from pydantic import ValidationError
 
-from .models import PageKind, SpecialPageResult, StructuredPageResult
-from .prompts import PAGE_RESPONSE_SCHEMA, SPECIAL_PAGE_RESPONSE_SCHEMA
+from .models import EmphasisResult, PageKind, SpecialPageResult, StructuredPageResult
+from .prompts import EMPHASIS_RESPONSE_SCHEMA, PAGE_RESPONSE_SCHEMA, SPECIAL_PAGE_RESPONSE_SCHEMA
 from .responses_client import (
     MAX_OUTPUT_CHARS,
     MAX_RESPONSE_BYTES,
@@ -177,6 +177,21 @@ class GeminiClient:
         if result.page_kind != page_kind:
             raise ModelServiceError("特殊页面代理返回的页面类型与分流类型不一致")
         return result
+
+    async def request_emphasis(
+        self,
+        model: str,
+        input_value: list[dict[str, Any]],
+        on_attempt_start: Callable[[], int] | None = None,
+        on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
+    ) -> EmphasisResult:
+        payload = self._page_payload(input_value, EMPHASIS_RESPONSE_SCHEMA)
+        data = await self._post(model, payload, on_attempt_start, on_attempt_end)
+        response_text = self.extract_output_text(data)
+        try:
+            return EmphasisResult.model_validate(json.loads(response_text))
+        except (ValueError, ValidationError) as exc:
+            raise ModelServiceError("字重复核返回的范围结构无效") from exc
 
     async def test_connection(self, model: str) -> None:
         payload: dict[str, Any] = {

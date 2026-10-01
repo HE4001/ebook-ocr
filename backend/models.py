@@ -300,6 +300,18 @@ class SpecialPageResult(BaseModel):
         return self
 
 
+class EmphasisSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fragment: str = Field(min_length=1, max_length=1_000_000)
+    occurrence: StrictInt = Field(ge=1)
+    style: Literal["bold", "boldsymbol", "pmb"]
+
+
+class EmphasisResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    spans: list[EmphasisSpan] = Field(max_length=1000)
+
+
 class StructuredPageResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     page_kind: PageKind = "content"

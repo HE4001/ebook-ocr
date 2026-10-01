@@ -29,10 +29,10 @@ ALLOWED_COMMANDS = frozenset("""
     underline sout textsuperscript textsubscript textbackslash textasciicircum
     textasciitilde textbar textless textgreater textbraceleft textbraceright
     textendash textemdash textquotedblleft textquotedblright textquoteleft
-    textquoteright textbullet textcopyright textregistered texttrademark
+    textquoteright textbullet textcopyright textregistered texttrademark S
     par noindent indent newline linebreak pagebreak clearpage newpage item null
     raggedright raggedleft centering normalfont rmfamily sffamily ttfamily
-    bfseries mdseries itshape upshape slshape scshape songti heiti kaishu
+    bfseries boldmath mdseries itshape upshape slshape scshape songti heiti kaishu
     tiny scriptsize footnotesize small normalsize large Large LARGE huge Huge
     setlength parindent parskip ccwd linewidth textwidth baselineskip
     dimexpr relax tabcolsep arrayrulewidth
@@ -45,7 +45,7 @@ ALLOWED_COMMANDS = frozenset("""
     overline underline widehat widetilde hat tilde bar vec dot ddot dddot
     ddddot breve check acute grave mathring overrightarrow overleftarrow
     overleftrightarrow underbrace overbrace overset underset stackrel
-    text mbox mathrm mathbf mathit mathsf mathtt mathnormal mathcal mathbb
+    text mbox mathrm mathbf mathit mathsf mathtt mathnormal mathcal mathscr mathbb
     mathfrak boldsymbol pmb operatorname substack displaystyle textstyle
     scriptstyle scriptscriptstyle ensuremath phantom hphantom vphantom smash
     tag notag nonumber intertext
@@ -64,7 +64,7 @@ ALLOWED_COMMANDS = frozenset("""
     pm mp times div ast star circ odot oplus ominus otimes oslash bigcirc
     cap cup uplus sqcap sqcup vee wedge setminus smallsetminus wr
     bigcap bigcup bigvee bigwedge biguplus bigoplus bigotimes bigodot
-    le leq ge geq neq ne equiv approx sim simeq cong asymp propto
+    le leq leqslant ge geq geqslant neq ne equiv approx sim simeq cong asymp propto
     ll gg lesssim gtrsim lessapprox gtrapprox prec succ preceq succeq
     subset supset subseteq supseteq subsetneq supsetneq nsubseteq nsupseteq
     sqsubset sqsupset sqsubseteq sqsupseteq in ni notin owns parallel nparallel

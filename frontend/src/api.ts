@@ -1,4 +1,4 @@
-import type { Arrangement, Book, BookDetail, LayoutSettings, Page, PageDraft, PaperSize, Settings } from './types'
+import type { Arrangement, Book, BookDetail, LayoutSettings, Page, PageDraft, PaperSize, PdfCompileResult, Settings } from './types'
 
 const API_PREFIX = '/api'
 
@@ -62,8 +62,8 @@ export const api = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(changes),
   }),
-  compileBook: (id: string, printVersion: boolean) => request<{ pdf_url: string }>(`/books/${encodeURIComponent(id)}/compile?print_version=${printVersion}`, { method: 'POST' }),
-  compilePage: (id: string, number: number, draft: PageDraft, printVersion: boolean) => request<{ pdf_url: string }>(`/books/${encodeURIComponent(id)}/pages/${number}/compile?print_version=${printVersion}`, {
+  compileBook: (id: string, printVersion: boolean) => request<PdfCompileResult>(`/books/${encodeURIComponent(id)}/compile?print_version=${printVersion}`, { method: 'POST' }),
+  compilePage: (id: string, number: number, draft: PageDraft, printVersion: boolean) => request<PdfCompileResult>(`/books/${encodeURIComponent(id)}/pages/${number}/compile?print_version=${printVersion}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(draft),

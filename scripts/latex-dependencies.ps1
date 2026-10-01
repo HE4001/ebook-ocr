@@ -88,6 +88,11 @@ function Get-MissingLatexDependencies {
         @{ Packages = @('geometry'); Files = @('geometry.sty') },
         @{ Packages = @('amsmath'); Files = @('amsmath.sty') },
         @{ Packages = @('amsfonts'); Files = @('amssymb.sty') },
+        @{ Packages = @('jknapltx'); Files = @('mathrsfs.sty', 'ursfs.fd') },
+        @{ Packages = @('rsfs'); Files = @(
+            'rsfs5.tfm', 'rsfs7.tfm', 'rsfs10.tfm',
+            'rsfs5.pfb', 'rsfs7.pfb', 'rsfs10.pfb', 'rsfs.map'
+        ) },
         @{ Packages = @('tools'); Files = @('longtable.sty', 'array.sty') },
         @{ Packages = @('fancyhdr'); Files = @('fancyhdr.sty') },
         @{ Packages = @('ulem'); Files = @('ulem.sty') },

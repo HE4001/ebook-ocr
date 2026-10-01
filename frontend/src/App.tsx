@@ -326,7 +326,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
 }
 
 type WorkspaceView = 'upload' | 'organize' | 'workspace' | 'preview' | 'settings'
-type PdfResult = { key: string; url: string | null; error: string | null }
+type PdfResult = { key: string; url: string | null; error: string | null; warnings: string[] }
 
 function projectView(book: Book): WorkspaceView {
   if (!book.upload_confirmed) return 'upload'
@@ -508,6 +508,7 @@ export default function App() {
   }), [detail, effectivePrintVersion])
   const pagePdfKey = useMemo(() => JSON.stringify(detail && sourcePage && {
     id: detail.book.id, paper_size: detail.book.paper_size, layout: detail.book.layout,
+    page_order: detail.pages.findIndex((page) => page.number === sourcePage.number) + 1,
     print_version: effectivePrintVersion, page: { ...pagePrintContent(sourcePage), ...outputDraft(pageDraft) },
   }), [detail, sourcePage, pageDraft, effectivePrintVersion])
   useEffect(() => { setBookPdf(null) }, [bookPdfKey])
@@ -740,9 +741,9 @@ export default function App() {
     setBookPdf(null)
     try {
       const result = await api.compileBook(detail!.book.id, effectivePrintVersion)
-      setBookPdf({ key, url: result.pdf_url, error: null })
+      setBookPdf({ key, url: result.pdf_url, error: null, warnings: result.warnings })
     } catch (error) {
-      setBookPdf({ key, url: null, error: errorText(error) })
+      setBookPdf({ key, url: null, error: errorText(error), warnings: [] })
     } finally {
       setCompiling(null)
     }
@@ -754,9 +755,9 @@ export default function App() {
     setPagePdf(null)
     try {
       const result = await api.compilePage(detail!.book.id, sourcePage!.number, outputDraft(pageDraft), effectivePrintVersion)
-      setPagePdf({ key, url: result.pdf_url, error: null })
+      setPagePdf({ key, url: result.pdf_url, error: null, warnings: result.warnings })
     } catch (error) {
-      setPagePdf({ key, url: null, error: errorText(error) })
+      setPagePdf({ key, url: null, error: errorText(error), warnings: [] })
     } finally {
       setCompiling(null)
     }
@@ -886,7 +887,7 @@ export default function App() {
                       </div>
                       <LayoutSettingsForm key={detail.book.id} layout={detail.book.layout} paperSize={detail.book.paper_size} dirty={layoutDirty} saving={layoutSaving} disabled={busy} onDirtyChange={setLayoutDirty} onSave={saveLayoutSettings} />
                     </section>
-                    <div className="book-pdf-preview"><PdfPreview url={currentBookPdf?.url ?? null} error={currentBookPdf?.error ?? null} loading={compiling === 'book'} title="整书 PDF 预览" emptyMessage={layoutDirty ? '先保存排版设置，再生成整书 PDF。' : '点击“生成/更新 PDF”查看当前书稿；内容或排版变化后需重新生成。'} /></div>
+                    <div className="book-pdf-preview"><PdfPreview url={currentBookPdf?.url ?? null} error={currentBookPdf?.error ?? null} warnings={currentBookPdf?.warnings ?? []} loading={compiling === 'book'} title="整书 PDF 预览" emptyMessage={layoutDirty ? '先保存排版设置，再生成整书 PDF。' : '点击“生成/更新 PDF”查看当前书稿；内容或排版变化后需重新生成。'} /></div>
                   </> : <>
                     <section className="proofing-toolbar no-print" aria-label="逐页校对工具栏">
                       <div className="proofing-controls">
@@ -922,7 +923,7 @@ export default function App() {
                             <div className="page-render">
                               <p className="page-layout-note">{pageDraft.page_kind === 'front_cover' ? '封面模板' : pageDraft.page_kind === 'back_cover' ? '封底模板' : '正文模板'}{effectivePrintVersion ? ' · 装订版' : ''}<span>{PAPER_SIZES[detail.book.paper_size].label}</span></p>
                               <p className="page-preview-note">预览使用当前草稿和已保存的整书排版，更新 PDF 不会保存本页修改。</p>
-                              <PdfPreview url={currentPagePdf?.url ?? null} error={currentPagePdf?.error ?? null} loading={compiling === 'page'} title={`${sourceLabel(sourcePage)} PDF 预览`} emptyMessage="点击“更新本页 PDF”预览当前草稿；正文或版式变化后需重新更新。" />
+                              <PdfPreview url={currentPagePdf?.url ?? null} error={currentPagePdf?.error ?? null} warnings={currentPagePdf?.warnings ?? []} loading={compiling === 'page'} title={`${sourceLabel(sourcePage)} PDF 预览`} emptyMessage="点击“更新本页 PDF”预览当前草稿；正文或版式变化后需重新更新。" />
                             </div>
                           </section>
                         </div>

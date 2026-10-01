@@ -7,12 +7,15 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .emphasis import apply_emphasis
 from .importers import prepare_source_page
 from .gemini_client import GeminiClient, GeminiConfig
+from .latex_content import validate_latex_fragment
 from .model_client import create_model_client
 from .models import PageKind, StructuredPageResult
 from .prompts import (
-    PAGE_AGENT_PROMPT, PAGE_CONTEXT_AGENT_PROMPT, SPECIAL_PAGE_AGENT_PROMPT, page_context,
+    EMPHASIS_AGENT_PROMPT, PAGE_AGENT_PROMPT, PAGE_CONTEXT_AGENT_PROMPT,
+    SPECIAL_PAGE_AGENT_PROMPT, page_context,
 )
 from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig
 from .storage import Storage
@@ -27,15 +30,16 @@ def _prepare_page(book_dir: Path, record: dict[str, Any]) -> tuple[int, int, str
         return prepare_source_page(book_dir, record)
 
 
+def _independent_client(config: ResponsesConfig | GeminiConfig) -> ResponsesClient | GeminiClient:
+    config = replace(config, context_reuse_enabled=False)
+    return GeminiClient(config) if isinstance(config, GeminiConfig) else ResponsesClient(config)
+
+
 class SpecialPageAgent:
     """使用独立上下文读取当前特殊页的书目信息。"""
 
     def __init__(self, config: ResponsesConfig | GeminiConfig, storage: Storage):
-        config = replace(config, context_reuse_enabled=False)
-        if isinstance(config, GeminiConfig):
-            self.client: ResponsesClient | GeminiClient = GeminiClient(config)
-        else:
-            self.client = ResponsesClient(config)
+        self.client = _independent_client(config)
         self.storage = storage
 
     async def run(
@@ -100,6 +104,31 @@ class PageAgent:
             ),
         )
         if result.page_kind == "content":
+            if result.body_latex.strip():
+                review_client = _independent_client(self.client.config)
+                review_input = [
+                    {"role": "system", "content": [
+                        {"type": "input_text", "text": EMPHASIS_AGENT_PROMPT},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "input_text", "text": source_context},
+                        {"type": "input_text", "text": result.body_latex},
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{image_data}",
+                         "detail": "high"},
+                    ]},
+                ]
+                emphasis = await review_client.request_emphasis(
+                    model, review_input,
+                    on_attempt_start=lambda: self.storage.begin_attempt(book_id, number),
+                    on_attempt_end=lambda attempt, usage, returned: self.storage.finish_attempt(
+                        book_id, number, attempt, usage, returned
+                    ),
+                )
+                result = StructuredPageResult.model_validate({
+                    **result.model_dump(),
+                    "body_latex": apply_emphasis(result.body_latex, emphasis),
+                })
+                validate_latex_fragment(result.body_latex)
             return result
         special_agent = SpecialPageAgent(self.client.config, self.storage)
         return await special_agent.run(

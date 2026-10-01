@@ -14,7 +14,7 @@ PDF 只在用户点击更新时编译。草稿、已保存内容、纸型、排�
 
 ## 编译环境
 
-PDF 预览与下载需要 XeLaTeX、`ctexbook`、Fandol 字体，以及模板所需宏包。模板使用 `geometry`、`amsmath`、`amssymb`、`longtable`、`array`、`fancyhdr`、`ulem` 和 `hyperref`。可使用包含这些组件的 TeX Live 或 MiKTeX 环境；Windows 一键启动负责准备编译依赖，直接运行后端只查找编译器，不下载发行版或宏包。
+PDF 预览与下载需要 XeLaTeX、`ctexbook`、Fandol 字体，以及模板所需宏包。模板使用 `geometry`、`amsmath`、`amssymb`、`mathrsfs`、`longtable`、`array`、`fancyhdr`、`ulem` 和 `hyperref`。`mathrsfs` 提供 `\mathscr`，TeX Live 需具备 `jknapltx` 宏包和 `rsfs` 字体包。可使用包含这些组件的 TeX Live 或 MiKTeX 环境；Windows 一键启动负责准备编译依赖，直接运行后端只查找编译器，不下载发行版或宏包。
 
 一键入口仍是双击 `ocr.bat` 后按回车，或执行 `ocr.bat Start` / `ocr.bat Restart`，无需额外安装菜单。`scripts/start.ps1` 在真实启动服务前调用 `scripts/latex-dependencies.ps1` 的 `Initialize-LatexDependencies`。已有服务正常运行时 `Start` 直接返回，不修改运行中服务的依赖；`Restart` 停止服务后重新准备。
 
@@ -40,7 +40,7 @@ PDF 预览与下载需要 XeLaTeX、`ctexbook`、Fandol 字体，以及模板所
 
 ## 正文片段与校对
 
-正文中不要填 `\documentclass`、`\usepackage`、`\begin{document}` 或 `\end{document}`。字体、纸张和模板由应用管理。编辑区提供“居中”“左对齐”“右对齐”“无缩进”“段落分隔”“公式”按钮，选择文字后可插入对应语法。
+正文中不要填 `\documentclass`、`\usepackage`、`\begin{document}` 或 `\end{document}`。字体、纸张和模板由应用管理。编辑区提供“居中”“左对齐”“右对齐”“无缩进”“加粗”“文字与公式加粗”“斜体”“段落分隔”“公式”按钮，选择相应范围后可插入对应语法。
 
 | 内容 | 写法 |
 | --- | --- |
@@ -49,14 +49,16 @@ PDF 预览与下载需要 XeLaTeX、`ctexbook`、Fandol 字体，以及模板所
 | 对齐 | `center`、`flushleft`、`flushright` 环境 |
 | 不缩进 | 段落前使用 `\noindent` |
 | 强调 | `\textbf{文字}`、`\textit{文字}`、`\underline{文字}`，只保留原页实际强调 |
+| 文字与公式同时加粗 | `{\bfseries\boldmath 文字与完整公式区域}`，声明必须位于数学模式外，范围在原文强调结束处闭合 |
 | 行内公式 | `\(x^2 + y^2\)` |
 | 独立公式 | `\[...\]` 或 `equation*` 环境；可见原编号可用 `\tag{原编号}` |
+| 公式与同句文字 | “如下：”“则”等题干、公式和“称为”“其中”等续文之间只换行；真正换段、换题时才空一行 |
 | 引用与列表 | `quote`、`itemize`、`enumerate`、`description`；有序项用 `\item[原序号]` 保留印刷编号 |
 | 表格 | 简表用 `tabular`，长表用 `longtable`；列用 `l`、`c`、`r`，单元格以 `&` 分隔、行末 `\\` |
 | 代码 | 行内 `\texttt{转义后的代码}`，原样多行使用 `verbatim` |
 | 脚注 | 正文标号用 `\textsuperscript{原标号}`，注释文字按原标号留在该源页正文末尾 |
 
-印刷脚注不使用自动编号的 `\footnote`，不猜测归属或重新挂接。图注、表注保留可见文字和标号，不生成原书没有的标题、编号、图片或目录。数学表达式使用 LaTeX 数学模式；公式中不可读的局部写 `\text{[无法辨认]}`。正文不可读的局部写 `[无法辨认]`，后加手写批注不转录。
+印刷脚注不使用自动编号的 `\footnote`，不猜测归属或重新挂接。图注、表注保留可见文字和标号，不生成原书没有的标题、编号、图片或目录。节号可写为 `\S`；数学模式支持 `\leqslant`、`\geqslant` 与 `\mathscr{R}` 等花体字母，按原页可见字形选择。数学表达式使用 LaTeX 数学模式；公式中不可读的局部写 `\text{[无法辨认]}`。正文不可读的局部写 `[无法辨认]`，后加手写批注不转录。
 
 普通文字中的特殊字符需要转义：`#`、`$`、`%`、`&`、`_`、`{`、`}` 分别写成 `\#`、`\$`、`\%`、`\&`、`\_`、`\{`、`\}`；字面反斜杠用 `\textbackslash{}`，波浪号用 `\textasciitilde{}`，脱字符用 `\textasciicircum{}`。数学模式与 `verbatim` 遵守各自语法。不要把 Markdown 标题、表格或美元公式定界符当作新正文语法。
 
@@ -74,7 +76,52 @@ PDF 预览与下载需要 XeLaTeX、`ctexbook`、Fandol 字体，以及模板所
 \noindent\textsuperscript{1} 原页脚注文字。
 ```
 
-完整受支持集合以 [backend/latex_content.py](../backend/latex_content.py) 为准，识别约定见 [backend/prompts.py](../backend/prompts.py)。允许集合涵盖常用文字格式、列表、表格和 `amsmath` / `amssymb` 公式，并不接受任意 LaTeX 工程或自定义宏。宽表、复杂合并单元格、图形和跨页内容仍需人工校对；图形只保留可辨文字、标签和图注。
+完整受支持集合以 [backend/latex_content.py](../backend/latex_content.py) 为准，识别约定见 [backend/prompts.py](../backend/prompts.py)。允许集合涵盖常用文字格式、列表、表格、`amsmath` / `amssymb` 公式和 `mathrsfs` 花体字母，并不接受任意 LaTeX 工程或自定义宏。宽表、复杂合并单元格、图形和跨页内容仍需人工校对；图形只保留可辨文字、标签和图注。
+
+## 加粗、斜体与字体变化
+
+正文加黑遗漏可能发生在局部词句，也可能漏掉整段字重，尤其是文字与公式混排的段落。识别提示要求主动逐段检查整段、局部词句、条件和数学符号，与附近同字号、同字体的字形比较字重和倾斜。强调范围精确到可见字符，跨印刷折行继续保留，到下一段重新核对。标题、定义或例题名称的语义，字号和扫描深浅都不能直接作为加粗依据；页眉页脚的 `bold`、`italic` 也按实际可辨字形记录。
+
+新的自动识别先正常转录正文，再以当前页原图和已转录的正文执行独立字重复核。复核目前只补遗漏的加黑，返回追加式的 `fragment`、`occurrence`、`style`：`fragment` 必须是现有正文中的原样 LaTeX 片段，`occurrence` 定位同一片段的具体出现，`style` 表示需补充的加黑方式。后端精确匹配后，只在该范围添加有界格式，不改原文字符、公式内容或数学结构；复核不是重新生成正文。每个有正文的普通内容页增加一次模型请求；空正文、封面和封底不做该复核。
+
+纯文字用 `\textbf{原文}`、`\textit{原文}`；既粗且斜用 `\textbf{\textit{原文}}`，避免无界的 `\bfseries`、`\itshape`。`\textbf` 只改变文字字重，不能自动使其中的数学符号变粗。原页整段文字与公式同时加黑时，复核和人工校对支持标准有界组 `{\bfseries\boldmath 原文与完整公式}`；`\boldmath` 必须在数学模式外使用，花括号在实际强调范围结束处闭合，不沿用到后续正文。编辑器保留纯文字“加粗”，另提供“文字与公式加粗”：选中包含完整公式定界符或环境的文字与公式区域后使用，只添加上述分组，不额外插入段落命令。
+
+原文只是局部楷体或黑体变化时，可用 `{\kaishu 原文}`、`{\heiti 原文}` 保留，楷体本身不是斜体，真正的字符倾斜才使用 `\textit`。数学变量的通常斜体由数学模式产生；公式内部可辨粗正体字母用 `\mathbf{A}`，粗斜变量或希腊符号用 `\boldsymbol{x}`、`\boldsymbol{\alpha}`，不在数学模式内部使用文字与公式加粗分组。当前 `mathrsfs` 的花体和 AMS 双线字体没有真实粗体，`\boldmath` 或 `\boldsymbol` 不会让 `\mathscr`、`\mathbb` 自动变粗；原页确有局部加黑时可用 `\pmb{\mathscr{A}}`、`\pmb{\mathbb{R}}` 叠印近似。`\pmb` 仅用于局部符号，不包装整条复杂公式，显示效果仍需人工校对；部分大型数学符号也没有对应粗体字形。
+
+旧页不会自动执行新的字重复核。原页有强调而正文没有对应命令，属于识别遗漏，需要重新识别或对照原页人工编辑；已有中文强调命令或页眉页脚的 `bold`/`italic` 为 `true`，但 PDF 未显示对应字形时，更新 PDF 可使用现有字体映射。旧正文若用 `\textbf` 包住文字与公式，仍需按原图修改为适当的有界分组或数学粗体命令。人工校对后保存，再更新 PDF。
+
+模板已有宋体、黑体真实粗体映射，楷体没有粗体变体时采用适度合成粗体。中文斜体保留所选字体并作倾斜，粗斜体同时使用对应粗体和倾斜，不用楷体替代真正的倾斜；本轮无需修改模板或新增字体、编译依赖。字体映射只改善已有样式的渲染，不推测原文未记录的格式。
+
+本轮字重复核、正文命令范围和校对按钮修改仅作静态编码与审查，未运行测试、构建、类型检查、lint、试编译、导入验证、服务或模型调用；尚未验证实际识别与 PDF 显示效果。
+
+## 题目结构与公式重排
+
+未来识别按可见大题、子题层级生成嵌套 `enumerate`，每项用 `\item[原编号]` 保留印刷编号。段落边界由原文结构决定，独立公式前后不再一律空行。同句文字和公式可以仅换行相接；不同题、段落、列表和表格仍保留边界。
+
+相关无编号公式可使用同一个 `\[...\]` 中的 `gathered`；等式推导使用 `aligned` 在关系符前放 `&` 对齐。原页很长的横排公式可以按等号、关系符或原有运算连接处分行，完整保留运算符、各项、上下限、括号和条件。行内数学保持通常的 `textstyle`，普通括号使用适度大小。格式优化不能改写数学内容，也不能让模型猜纸型、物理行宽或添加大段长度设置。
+
+[backend/latex_layout.py](../backend/latex_layout.py) 的 `normalize_latex_layout` 在原始正文通过命令检查后，仅整理预览和 LaTeX/PDF 导出的副本。因此已识别页面也能使用这层整理，无需重新 OCR；校对区、数据库 `Page.text` 和 JSON 保留原正文，既有缓存文件不被改写。更新预览会按整理后的完整源码选择缓存或生成 PDF。
+
+自动整理的范围较窄：
+
+- 同一正文区域中，段首阿拉伯数字加 `.`、`．`、`、`、`)` 或 `）`，必须同样式且至少两项连续递增才整理成列表；编号原样放进 `\item[...]`。连续大题中，从 1 开始的连续右括号子题形成子列表。编号重置或跳号不会跨组嵌套，孤立编号不套列表。
+- 冒号、逗号、“则”或“称为”“其中”等明确续文支持同句连接时，公式相邻的多余空段改为单换行；其他段落边界保留。
+- 相邻简单、无编号的 `\[...\]` 可并成 `gathered`。有 `\tag`、末尾独立数字编号、现有环境、对齐符或已有多行结构的公式不自动并组。
+- 已有显式列表、表格、公式和其他环境的内部，以及 `verbatim`、`\verb` 和注释，整体保留。它们也截断自动编号整理的范围。
+
+自动整理不解析数学语义，不按字符长度切开公式，不代数改写或缩放公式，不删除内容、条件和原编号；罗马编号、混合编号样式及不明确的层级保留供人工校对。嵌套列表会收窄公式可用宽度，旧正文中的长单行公式仍可能超宽，不能把列表整理当成已解决长公式。校对时可按原运算结构改成多行，例如原式完整可写为：
+
+```latex
+\[
+\begin{aligned}
+E_1 &= (E_1-E_2)\cup(E_2-E_3)\cup\cdots\\
+    &\quad{}\cup(E_n-E_{n+1})\cup\cdots\\
+    &\quad{}\cup\left(\bigcap_{n=1}^{\infty}E_n\right),
+\end{aligned}
+\]
+```
+
+本轮题目与公式版式修改仅静态阅读、编码和差异审查，未运行测试、构建、类型检查、lint、脚本验证、导入运行、试编译、服务或模型调用。实际 PDF 排版尚未验证。
 
 ## 整书排版设置
 
@@ -119,11 +166,13 @@ JSON 保持 `{book,files,pages}` 结构，`book` 携带纸型、排版及 `conte
 | `PUT /api/books/{id}/layout` | 提交 `{paper_size?: PaperSize, layout?: LayoutSettings}`，至少一项，前端提交完整排版对象；返回 `Book` |
 | `GET /api/books/{id}/export` | 下载结构化 JSON |
 | `GET /api/books/{id}/export.tex?print_version=false` | 下载已保存整书 LaTeX，不调用编译器 |
-| `POST /api/books/{id}/compile?print_version=false` | 编译已保存整书，返回 `{pdf_url}` |
-| `POST /api/books/{id}/pages/{number}/compile?print_version=false` | 以 `PageUpdate` 请求体预览本页草稿，返回 `{pdf_url}`，不保存页面 |
+| `POST /api/books/{id}/compile?print_version=false` | 编译已保存整书，返回 `{pdf_url, warnings:string[]}` |
+| `POST /api/books/{id}/pages/{number}/compile?print_version=false` | 以 `PageUpdate` 请求体预览本页草稿，返回 `{pdf_url, warnings:string[]}`，不保存页面 |
 | `GET /api/books/{id}/compiled/{sha256}.pdf` | 内联读取成功生成的 PDF |
 
 输出使用 `backend/latex_export.py` 的 `build_latex(detail, print_version=False)` 与 `async compile_pdf(source, output_dir)`。缓存按完整源码的 SHA-256 保存在每书目录的 `latex-cache` 下，同一本书串行编译，完全相同的源码复用成功 PDF。本页草稿编译只取当前已选页，不改变状态、尝试次数或用量；已有缓存文件不表示新内容已生成，前端会随当前内容与排版变化更新预览状态。
+
+成功编译的 `warnings` 为字符串数组，无警告时为 `[]`。预览区非阻断地提示日志中的 `Overfull` 超宽或超高警告，PDF 仍可预览和下载；它提示需要校对的版面风险，不等同于编译失败。命中旧缓存时读取已有日志提取警告，不为补取警告自动重新编译；没有旧日志时不推测警告。
 
 ## 旧数据迁移与实现状态
 

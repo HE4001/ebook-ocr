@@ -387,6 +387,9 @@ input:disabled,textarea:disabled { background: #f1f0eb; color: #777; }
 .pdf-placeholder { display: grid; place-content: center; min-height: 240px; margin: 0; padding: 2rem 1.2rem; border: 1px dashed #bdbab0; border-radius: 6px; color: var(--muted); background: #fffefa; text-align: center; font-size: .85rem; line-height: 1.8; }
 .pdf-error { padding: 1rem; border: 1px solid #d7aaa5; border-radius: 6px; background: #fff5f4; color: #74211e; font-size: .83rem; overflow-wrap: anywhere; }
 .pdf-error p { margin: .5rem 0 0; white-space: pre-wrap; line-height: 1.65; }
+.pdf-warnings { margin-bottom: .75rem; padding: .85rem 1rem; border: 1px solid #e2c891; border-radius: 6px; background: #fbf0d9; color: #6d4814; font-size: .8rem; line-height: 1.65; }
+.pdf-warnings ul { margin: .45rem 0; padding-left: 1.3rem; }
+.pdf-warnings p { margin: .45rem 0 0; }
 .pdf-viewer-help { margin: .6rem 0 0; color: var(--muted); font-size: .75rem; line-height: 1.6; }
 .pdf-viewer-help a { color: var(--accent); }
 .render-panel .panel-title { flex-wrap: wrap; }

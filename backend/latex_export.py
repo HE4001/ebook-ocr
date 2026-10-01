@@ -11,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .latex_content import escape_latex, validate_latex_fragment
+from .latex_layout import normalize_latex_layout
 from .models import BookDetail, MarginSegment, Page
 
 
@@ -27,22 +28,76 @@ PAPER_SIZES = {
 _PREAMBLE = r"""\documentclass[UTF8,fontset=fandol,oneside,openany,linespread=1,autoindent=false]{ctexbook}
 \usepackage{geometry}
 \usepackage{amsmath,amssymb}
+\usepackage{mathrsfs}
 \usepackage{longtable,array}
 \usepackage{fancyhdr}
 \usepackage[normalem]{ulem}
 \usepackage[hidelinks]{hyperref}
+% Optional features apply to both bold and bold italic shapes.
+\newcommand{\EbookCJKFont}[4][]{%
+  #2{#3}[%
+    Extension=.otf,
+    BoldFont=#4,
+    BoldFeatures={#1},
+    ItalicFont=#3,
+    ItalicFeatures={FakeSlant=0.2},
+    BoldItalicFont=#4,
+    BoldItalicFeatures={FakeSlant=0.2,#1}%
+  ]%
+}
+\EbookCJKFont{\setCJKmainfont}{FandolSong-Regular}{FandolSong-Bold}
+\EbookCJKFont{\setCJKsansfont}{FandolHei-Regular}{FandolHei-Bold}
+\EbookCJKFont{\setCJKfamilyfont{zhsong}}{FandolSong-Regular}{FandolSong-Bold}
+\EbookCJKFont{\setCJKfamilyfont{zhhei}}{FandolHei-Regular}{FandolHei-Bold}
+\EbookCJKFont[FakeBold=1.5]{\setCJKfamilyfont{zhkai}}{FandolKai-Regular}{FandolKai-Regular}
+\raggedbottom
+\allowdisplaybreaks[1]
 \pagestyle{fancy}
 \fancyhf{}
 \renewcommand{\headrulewidth}{0pt}
 \renewcommand{\footrulewidth}{0pt}
 \ctexset{section={numbering=false},subsection={numbering=false},subsubsection={numbering=false},paragraph={numbering=false,afterskip=0.5em},subparagraph={numbering=false,afterskip=0.5em}}
+\makeatletter
+\newcommand{\EbookListLayout}[3]{%
+  \setlength{\leftmargin}{#1}%
+  \setlength{\labelsep}{0.5\ccwd}%
+  \setlength{\labelwidth}{\dimexpr\leftmargin-\labelsep\relax}%
+  \setlength{\itemindent}{0pt}%
+  \setlength{\listparindent}{0pt}%
+  \setlength{\topsep}{#2}%
+  \setlength{\partopsep}{0.1\ccwd}%
+  \setlength{\itemsep}{#3}%
+  \setlength{\parsep}{0.1\ccwd}%
+}
 \newcommand{\EbookLayout}[4]{%
-  \renewcommand{\normalsize}{\fontsize{#1bp}{#2bp}\selectfont}%
+  \renewcommand{\normalsize}{%
+    \fontsize{#1bp}{#2bp}\selectfont
+    \setlength{\abovedisplayskip}{0.5\ccwd plus 0.1\ccwd minus 0.05\ccwd}%
+    \setlength{\belowdisplayskip}{0.5\ccwd plus 0.1\ccwd minus 0.05\ccwd}%
+    \setlength{\abovedisplayshortskip}{0.25\ccwd plus 0.1\ccwd minus 0.05\ccwd}%
+    \setlength{\belowdisplayshortskip}{0.4\ccwd plus 0.1\ccwd minus 0.05\ccwd}%
+    \setlength{\jot}{0.25\ccwd}%
+    \let\@listi\@listI
+  }%
   \normalsize
   \setlength{\parindent}{#3\ccwd}%
   \setlength{\parskip}{#4bp}%
   \setlength{\emergencystretch}{2em}%
+  \setlength{\leftmargini}{2.5\ccwd}%
+  \setlength{\leftmarginii}{2\ccwd}%
+  \setlength{\leftmarginiii}{1.8\ccwd}%
+  \setlength{\leftmarginiv}{1.8\ccwd}%
+  \setlength{\leftmarginv}{1.5\ccwd}%
+  \setlength{\leftmarginvi}{1.5\ccwd}%
+  \def\@listI{\EbookListLayout{\leftmargini}{0.5\ccwd}{0.4\ccwd}}%
+  \let\@listi\@listI
+  \def\@listii{\EbookListLayout{\leftmarginii}{0.25\ccwd}{0.15\ccwd}}%
+  \def\@listiii{\EbookListLayout{\leftmarginiii}{0.2\ccwd}{0.1\ccwd}}%
+  \def\@listiv{\EbookListLayout{\leftmarginiv}{0.2\ccwd}{0.1\ccwd}}%
+  \def\@listv{\EbookListLayout{\leftmarginv}{0.2\ccwd}{0.1\ccwd}}%
+  \def\@listvi{\EbookListLayout{\leftmarginvi}{0.2\ccwd}{0.1\ccwd}}%
 }
+\makeatother
 \newcommand{\EbookMarginRow}[3]{%
   \noindent\makebox[\textwidth][l]{%
     \makebox[0pt][l]{\strut#1}%
@@ -176,7 +231,7 @@ def build_latex(detail: BookDetail, print_version: bool = False) -> str:
         parts.append(_page_setup(page, margin, font_size, layout.line_height, print_version))
         if page.page_kind == "content":
             validate_latex_fragment(page.text)
-            content = page.text if page.text.strip() else r"\null"
+            content = normalize_latex_layout(page.text) if page.text.strip() else r"\null"
             parts.extend((r"\begingroup", content, r"\par\endgroup"))
         else:
             parts.append(_cover(page, font_size, layout.line_height))

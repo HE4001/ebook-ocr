@@ -55,11 +55,14 @@ export function PageEditor({ draft, onChange, disabled }: {
           <button type="button" onClick={() => insert('\\begin{flushleft}\n', '\n\\end{flushleft}')}>左对齐</button>
           <button type="button" onClick={() => insert('\\begin{flushright}\n', '\n\\end{flushright}')}>右对齐</button>
           <button type="button" onClick={() => insert('\\noindent ')}>无缩进</button>
+          <button type="button" onClick={() => insert('\\textbf{', '}')}>加粗</button>
+          <button type="button" onClick={() => insert('{\\bfseries\\boldmath ', '}')}>文字与公式加粗</button>
+          <button type="button" onClick={() => insert('\\textit{', '}')}>斜体</button>
           <button type="button" onClick={() => insert('\n\n')}>段落分隔</button>
           <button type="button" onClick={() => insert('\\[\n', '\n\\]')}>公式</button>
         </div>
         <textarea ref={bodyInput} id="page-latex-body" aria-label="本页 LaTeX 正文" value={draft.text} onChange={(event) => onChange({ ...draft, text: event.target.value })} spellCheck={false} placeholder="本页暂无正文" />
-        <p className="latex-editor-hint">使用空行分段；选择文字后点击格式按钮。这里只编辑正文片段，页眉、页脚与封面由整书模板排版。</p>
+        <p className="latex-editor-hint">“加粗”用于纯文字；“文字与公式加粗”须选中完整的文字与公式区域。单独公式内的粗斜符号用 \boldsymbol，粗正体字母用 \mathbf；\mathscr、\mathbb 没有真实粗体，局部可用 \pmb 近似。使用空行分段；这里只编辑正文片段，页眉、页脚与封面由整书模板排版。</p>
       </div>
       : <div className="cover-editor">
         <p className="cover-editor-hint">只保留原页可见的书名、署名和出版信息。没有可辨认的信息时可留空。</p>
