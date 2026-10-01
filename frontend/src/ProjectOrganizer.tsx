@@ -50,7 +50,6 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
   const [sourceId, setSourceId] = useState('')
   const [view, setView] = useState<View>('source')
   const [pageIndex, setPageIndex] = useState(0)
-  const [marked, setMarked] = useState<Set<number>>(new Set())
   const [scope, setScope] = useState<ProcessScope | 'all'>('all')
   const [range, setRange] = useState('')
   const [rangeError, setRangeError] = useState('')
@@ -106,7 +105,7 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
   const sourceTree = useMemo(() => fileSubtree(sourceId, fileOrder, parents), [sourceId, fileOrder, parents])
   const sourcePages = useMemo(() => layout.filter((id) => sourceTree.has(pageById.get(id)!.source_id)), [layout, sourceTree, pageById])
   const visibleIds = view === 'source' ? sourcePages : order
-  const markedIds = visibleIds.filter((id) => marked.has(id))
+  const selectedIds = visibleIds.filter((id) => included.has(id))
   const dirty = !!arrangement && signature(fileOrder, parents, order) !== savedSignature
   const busy = disabled || saving
   const source = fileById.get(sourceId)
@@ -115,6 +114,7 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
   const displayedIds = visibleIds.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)
   const previewPage = previewId === null ? undefined : pageById.get(previewId)
   const previewPosition = previewId === null ? -1 : visibleIds.indexOf(previewId)
+  const insertHasAnchor = order.some((id) => !moving.includes(id))
   const anchorPage = pageById.get(order[Number(insertTarget) - 1])
   const embedTree = fileSubtree(embedFile, fileOrder, parents)
   const embedPages = layout.filter((id) => embedTree.has(pageById.get(id)!.source_id))
@@ -140,14 +140,12 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
     setSourceId(id)
     setView('source')
     setPageIndex(0)
-    setMarked(new Set())
     setRangeError('')
   }
 
   function chooseView(next: View) {
     setView(next)
     setPageIndex(0)
-    setMarked(new Set())
   }
 
   function reorderPage(from: number, to: number) {
@@ -156,18 +154,27 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
     announce('页面顺序已更新', [`page:${visibleIds[from]}`])
   }
 
-  function markRange() {
+  function selectRange() {
     const result = scope === 'all'
       ? { pages: Array.from({ length: source!.page_count }, (_, index) => index + 1), error: null }
       : resolvePageSelection(scope, range, source!.page_count)
     setRangeError(result.error ?? '')
     if (result.error) return
     const numbers = new Set(result.pages)
-    setMarked(new Set(layout.filter((id) => pageById.get(id)!.source_id === sourceId && numbers.has(pageById.get(id)!.source_page))))
+    const next = new Set(included)
+    layout.forEach((id) => {
+      const page = pageById.get(id)!
+      if (page.source_id === sourceId) {
+        if (numbers.has(page.source_page)) next.add(id)
+        else next.delete(id)
+      }
+    })
+    setIncluded(next)
+    announce(`当前文件已勾选 ${result.pages.length} 页`)
   }
 
-  function toggleMarked(id: number) {
-    setMarked((current) => {
+  function toggleIncluded(id: number) {
+    setIncluded((current) => {
       const next = new Set(current)
       if (next.has(id)) next.delete(id)
       else next.add(id)
@@ -175,19 +182,15 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
     })
   }
 
-  function addPages(ids: number[]) {
-    const added = ids.filter((id) => !included.has(id))
-    setLayout(insertPageBlock(layout, added, null))
-    setIncluded(new Set([...included, ...ids]))
-    setMarked(new Set())
-    announce(`已编入 ${added.length} 页`, added.map((id) => `page:${id}`))
+  function movePagesToEnd(ids: number[]) {
+    setLayout(insertPageBlock(layout, ids, null))
+    announce(`已将 ${ids.length} 页移至末尾`, ids.map((id) => `page:${id}`))
   }
 
   function removePages(ids: number[]) {
     const removed = new Set(ids)
     setIncluded(new Set([...included].filter((id) => !removed.has(id))))
-    setMarked(new Set())
-    announce('所选页面已从成书移出')
+    announce(`已取消当前视图 ${ids.length} 页的勾选`)
   }
 
   function openInsert(ids: number[]) {
@@ -201,11 +204,11 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
 
   function insertPages() {
     const target = Number(insertTarget)
-    if (order.length && (!Number.isInteger(target) || target < 1 || target > order.length)) {
+    if (insertHasAnchor && (!Number.isInteger(target) || target < 1 || target > order.length)) {
       setInsertError(`请输入 1 到 ${order.length} 之间的成书位置`)
       return
     }
-    const anchor = order.length ? order[target - 1] : null
+    const anchor = insertHasAnchor ? order[target - 1] : null
     if (anchor !== null && moving.includes(anchor)) {
       setInsertError('目标页也在本次移动中，请选择另一页作为插入位置')
       return
@@ -386,8 +389,8 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
 
   return <section ref={motionRef} className="organizer" aria-label="项目页面编排">
     <header className="organizer-heading">
-      <div><h2>把页面排成一本书</h2><p>新上传页面默认已编入，无需勾选；确认顺序后即可继续。图片与 PDF 可以混排和嵌入。</p></div>
-      <div className="organizer-count"><strong>{order.length}</strong><span>页已编入 / 共 {arrangement.pages.length} 页</span></div>
+      <div><h2>把页面排成一本书</h2><p>新上传页面默认全部勾选；只有勾选页会按当前顺序进入校对。图片与 PDF 可以混排和嵌入。</p></div>
+      <div className="organizer-count"><strong>{order.length}</strong><span>页已勾选 / 共 {arrangement.pages.length} 页</span></div>
     </header>
     <fieldset className="organizer-body" disabled={busy}>
       <legend className="organizer-sr-only">文件与页面编排</legend>
@@ -406,7 +409,7 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
               <button type="button" className="organizer-file-main" onClick={() => chooseSource(id)} aria-current={sourceId === id ? 'true' : undefined}>
                 <span className="organizer-file-number">{String(index + 1).padStart(2, '0')}</span>
                 <span className="organizer-file-info"><strong title={file.filename}>{file.filename}</strong>
-                  <span><span className={`organizer-kind ${file.kind}`}>{file.kind === 'pdf' ? 'PDF' : '图片'}</span> {file.page_count} 页 · 已编入 {order.filter((page) => pageById.get(page)!.source_id === id).length} 页</span>
+                  <span><span className={`organizer-kind ${file.kind}`}>{file.kind === 'pdf' ? 'PDF' : '图片'}</span> {file.page_count} 页 · 已勾选 {order.filter((page) => pageById.get(page)!.source_id === id).length} 页</span>
                   {parent && <span className="organizer-file-parent" title={fileById.get(parent)!.filename}>嵌入 {fileById.get(parent)!.filename}</span>}
                 </span>
               </button>
@@ -449,31 +452,30 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
           <span className="organizer-live-status" role="status" aria-live="polite">{liveMessage}</span>
         </div>
         {view === 'source' && source && <div className="organizer-range">
-          <label htmlFor="organizer-range-scope">批量勾选（可选）</label>
+          <label htmlFor="organizer-range-scope">批量选页</label>
           <select id="organizer-range-scope" value={scope} onChange={(event) => { setScope(event.target.value as ProcessScope | 'all'); setRangeError('') }}>
             <option value="all">全部页</option><option value="odd">单数页</option><option value="even">偶数页</option><option value="custom">自定义范围</option>
           </select>
           {scope === 'custom' && <input aria-label="源文件页码范围" aria-invalid={!!rangeError} value={range} placeholder="如 1,3,8-12" onChange={(event) => { setRange(event.target.value); setRangeError('') }} />}
-          <button type="button" onClick={markRange}>勾选页面</button>
-          <span className="organizer-help">仅当前文件自身，源页码 1–{source.page_count}；嵌入文件可单独勾选。</span>
+          <button type="button" onClick={selectRange}>应用范围</button>
+          <span className="organizer-help">替换当前文件自身的勾选，源页码 1–{source.page_count}；其他文件及嵌入文件的勾选保持不变。</span>
           {rangeError && <p className="organizer-error" role="alert">{rangeError}</p>}
         </div>}
         <div className="organizer-batch">
-          <label className="organizer-checkbox"><input type="checkbox" checked={displayedIds.length > 0 && displayedIds.every((id) => marked.has(id))} disabled={busy || !displayedIds.length}
+          <label className="organizer-checkbox"><input type="checkbox" checked={displayedIds.length > 0 && displayedIds.every((id) => included.has(id))} disabled={busy || !displayedIds.length}
             onChange={(event) => {
-              const next = new Set(marked)
+              const next = new Set(included)
               displayedIds.forEach((id) => event.target.checked ? next.add(id) : next.delete(id))
-              setMarked(next)
+              setIncluded(next)
             }} /><span>本屏</span></label>
-          <span className="organizer-marked">批量操作：已勾选 {markedIds.length} 页</span>
-          {view === 'source' && <button type="button" disabled={busy || !markedIds.some((id) => !included.has(id))} onClick={() => addPages(markedIds)}>加入末尾</button>}
-          <button type="button" disabled={busy || !markedIds.length} onClick={() => openInsert(markedIds)}>插入到…</button>
-          <button type="button" disabled={busy || !markedIds.some((id) => included.has(id))} onClick={() => removePages(markedIds)}>从成书移出</button>
-          {markedIds.length > 0 && <button type="button" className="organizer-quiet" onClick={() => setMarked(new Set())}>取消勾选</button>}
-          <p className="organizer-batch-note organizer-help">无需勾选即可确认编排。勾选仅用于批量移动、移出或重新加入，已移出的页面不会自动恢复。</p>
+          <span className="organizer-marked">当前视图已勾选 {selectedIds.length} 页</span>
+          <button type="button" disabled={busy || !selectedIds.length} onClick={() => movePagesToEnd(selectedIds)}>移至末尾</button>
+          <button type="button" disabled={busy || !selectedIds.length} onClick={() => openInsert(selectedIds)}>插入到…</button>
+          {selectedIds.length > 0 && <button type="button" className="organizer-quiet" onClick={() => removePages(selectedIds)}>取消当前视图勾选</button>}
+          <p className="organizer-batch-note organizer-help">勾选页将进入校对。批量移动和取消勾选作用于当前视图，包含其他屏；取消后可在文件视图重新勾选。</p>
         </div>
         {!visibleIds.length ? <div className="organizer-empty"><h3>{view === 'sequence' ? '成书中暂无页面' : '当前文件暂无页面'}</h3>
-          <p>{view === 'sequence' ? '已移出的页面不会自动恢复。返回文件视图，可用页面的“插入…”重新加入，或勾选后批量加入。' : '在左侧选择有页面的文件继续编排。'}</p>
+          <p>{view === 'sequence' ? '返回文件视图，勾选页面即可重新加入，或使用页面的“插入…”指定位置。' : '在左侧选择有页面的文件继续编排。'}</p>
           {view === 'sequence' && <button type="button" onClick={() => chooseView('source')}>返回文件选页</button>}</div>
           : <div className={`organizer-page-grid ${view === 'sequence' ? 'is-sequence' : ''}`}>
             {displayedIds.map((id, index) => {
@@ -481,10 +483,10 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
               const position = positions.get(id)
               const listIndex = currentPage * PAGE_SIZE + index
               return <article key={id} data-motion-key={`page:${id}`}
-                className={`organizer-page-card${marked.has(id) ? ' is-marked' : ''}${view === 'source' && page.source_id !== sourceId ? ' is-inserted' : ''}${dragClasses(`page:${id}`)}`}
+                className={`organizer-page-card${included.has(id) ? ' is-marked' : ''}${view === 'source' && page.source_id !== sourceId ? ' is-inserted' : ''}${dragClasses(`page:${id}`)}`}
                 draggable={!busy} onDragStart={(event) => startDrag(event, { kind: 'page', id })} onDragEnd={endDrag}
                 onDragOver={(event) => dragOverPage(event, id)} onDrop={(event) => dropPage(event, id)}>
-                <div className="organizer-card-top"><label className="organizer-checkbox"><input type="checkbox" checked={marked.has(id)} onChange={() => toggleMarked(id)} aria-label={`勾选 ${page.source_filename} 源第 ${page.source_page} 页`} />
+                <div className="organizer-card-top"><label className="organizer-checkbox"><input type="checkbox" checked={included.has(id)} onChange={() => toggleIncluded(id)} aria-label={`将 ${page.source_filename} 源第 ${page.source_page} 页编入校对`} />
                   <span>{view === 'sequence' ? <><b>{String(listIndex + 1).padStart(2, '0')}</b> 成书页</> : `文件内第 ${listIndex + 1} 位`}</span></label></div>
                 <div className="organizer-thumb"><PreviewImage key={id} bookId={bookId} page={page} />
                   <button type="button" className="organizer-preview-trigger" onClick={() => openPreview(id)} aria-label={`放大预览 ${page.source_filename} 源第 ${page.source_page} 页`}><span>放大预览</span></button>
@@ -522,7 +524,7 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
       </div>
     </fieldset>
     <footer className="organizer-save-bar">
-      <div><strong>{order.length} 页将按当前顺序成书</strong><span>{dirty ? '顺序已即时展示，确认后保存到项目' : '无需勾选，确认顺序后进入逐页校对。'}</span></div>
+      <div><strong>{order.length} 页将按当前顺序进入校对</strong><span>{!order.length ? '请至少勾选一页后确认编排。' : dirty ? '选页或顺序已更改，确认后保存到项目。' : '确认后保存当前勾选与顺序，进入逐页校对。'}</span></div>
       <button type="button" className="primary" disabled={busy || !order.length} onClick={() => void save()}>{saving ? '正在保存编排…' : '确认编排，进入校对'}</button>
     </footer>
     <dialog ref={previewDialog} className="organizer-dialog organizer-preview-dialog" aria-labelledby="organizer-preview-title" onClick={(event) => { if (event.target === event.currentTarget) previewDialog.current?.close() }}>
@@ -540,13 +542,13 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
         <div className="organizer-dialog-heading"><div><h3 id="organizer-insert-title">插入 {moving.length} 页</h3><p>已编入的页面会移动位置，未编入的页面会加入。</p></div></div>
         <div className="organizer-insert-body">
           <p className="organizer-insert-source">{moving.length > 0 && `${pageById.get(moving[0])!.source_filename} · 源第 ${pageById.get(moving[0])!.source_page} 页`}{moving.length > 1 && ` 等 ${moving.length} 页，保持当前先后顺序`}</p>
-          {order.length > 0 ? <>
+          {insertHasAnchor ? <>
             <div className="organizer-insert-fields"><label htmlFor="organizer-insert-position">成书第</label><input id="organizer-insert-position" type="number" min="1" max={order.length} value={insertTarget} onChange={(event) => { setInsertTarget(event.target.value); setInsertError('') }} /><span>页</span>
               <select aria-label="插在目标页之前或之后" value={insertSide} onChange={(event) => setInsertSide(event.target.value as Side)}><option value="before">之前</option><option value="after">之后</option></select>
             </div>
             {anchorPage && <div className="organizer-insert-anchor"><div className="organizer-anchor-thumb"><PreviewImage key={anchorPage.number} bookId={bookId} page={anchorPage} /></div>
               <p><span>目标页面</span><strong>{anchorPage.source_filename}</strong>源第 {anchorPage.source_page} 页 · 成书第 {insertTarget} 页</p></div>}
-          </> : <p>成书当前为空，这些页面将成为开头。</p>}
+          </> : <p>这些页面将按当前先后顺序放入成书。</p>}
           {insertError && <p className="organizer-error" role="alert">{insertError}</p>}
         </div>
         <div className="organizer-dialog-actions"><button type="button" onClick={() => insertDialog.current?.close()}>取消</button><button type="submit" className="primary" disabled={busy}>确认插入</button></div>

@@ -3,6 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSHOME "Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1") -Global -Force -ErrorAction Stop
 $script:Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $script:Frontend = Join-Path $script:Root "frontend"
 $script:LauncherDir = Join-Path $script:Root ".cache\launcher"
@@ -13,6 +14,7 @@ $script:FrontendOut = Join-Path $script:LauncherDir "frontend.out.log"
 $script:FrontendErr = Join-Path $script:LauncherDir "frontend.err.log"
 $script:StartedEntries = @()
 . (Join-Path $PSScriptRoot "launcher-processes.ps1")
+. (Join-Path $PSScriptRoot "latex-dependencies.ps1")
 
 function Get-RuntimeRoot {
     $profileRoot = $env:USERPROFILE
@@ -123,7 +125,7 @@ function Test-PythonDependencies {
     param([string]$Python)
 
     try {
-        $null = & $Python -c "import fastapi,uvicorn,httpx,pydantic,multipart,fitz,PIL" 2>$null
+        $null = & $Python -c "import fastapi,uvicorn,httpx,pydantic,multipart,fitz,PIL,mistune" 2>$null
         return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
@@ -134,19 +136,17 @@ function Install-BackendDependencies {
     param([string]$Python)
 
     $requirements = Join-Path $script:Root "backend\requirements.txt"
-    Write-Host "Installing missing backend dependencies into .venv..."
-    $null = & $Python -m pip --version 2>$null
+    Write-Host "Synchronizing backend dependencies in .venv from requirements.txt..."
+    & $Python -m pip --version | Out-Host
     if ($LASTEXITCODE -ne 0) {
-        $pipOutput = & $Python -m ensurepip --upgrade 2>&1
+        & $Python -m ensurepip --upgrade | Out-Host
         $pipCode = $LASTEXITCODE
-        $pipOutput | ForEach-Object { Write-Host $_ }
         if ($pipCode -ne 0) {
             throw "pip is unavailable in .venv. Install Python 3.11+ with ensurepip enabled."
         }
     }
-    $installOutput = & $Python -m pip install -r $requirements 2>&1
+    & $Python -m pip install -r $requirements | Out-Host
     $installCode = $LASTEXITCODE
-    $installOutput | ForEach-Object { Write-Host $_ }
     if ($installCode -ne 0) {
         throw "Backend dependency installation failed. Check network access and backend\requirements.txt."
     }
@@ -190,7 +190,7 @@ function Read-LauncherState {
         return $null
     }
     try {
-        return (Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json)
+        return (Get-Content -LiteralPath $script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json)
     } catch {
         return $null
     }
@@ -265,100 +265,11 @@ try {
         throw "frontend\package.json was not found. Run this script from the project checkout."
     }
 
-    $runtimeRoot = Get-RuntimeRoot
-    $fallbackPython = if ($runtimeRoot) { Join-Path $runtimeRoot "python\python.exe" } else { $null }
-    $fallbackNode = if ($runtimeRoot) { Join-Path $runtimeRoot "node\bin\node.exe" } else { $null }
-    $fallbackPnpm = if ($runtimeRoot) { Join-Path $runtimeRoot "bin\fallback\pnpm.cmd" } else { $null }
-
-    $venvDir = Join-Path $script:Root ".venv"
-    $venvPython = Join-Path $venvDir "Scripts\python.exe"
-    $runPython = $null
-    $usingVenv = $false
-    if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
-        $localPython = Get-ValidPython @($venvPython)
-        if ($null -eq $localPython) {
-            throw ".venv exists but its Python is not a working Python 3.11+ interpreter."
-        }
-        $runPython = $localPython.Path
-        $usingVenv = $true
-    } else {
-        $pythonCandidates = Get-ExecutableCandidates @("python.exe", "python3.exe") @($fallbackPython)
-        $basePython = Get-ValidPython $pythonCandidates
-        if ($null -eq $basePython) {
-            throw "No working Python 3.11+ interpreter was found. Install Python or repair PATH."
-        }
-        Write-Host ("Using Python {0} ({1})." -f $basePython.Version, $basePython.Path)
-        if (Test-Path -LiteralPath $venvDir) {
-            Write-Host "A partial .venv was found; using the verified interpreter while it remains usable."
-            if (Test-PythonDependencies $basePython.Path) {
-                $runPython = $basePython.Path
-            } else {
-                throw ".venv is incomplete and the fallback Python has no backend dependencies. Remove the partial .venv and rerun."
-            }
-        } else {
-            Write-Host "Creating the project-local .venv..."
-            $venvOutput = & $basePython.Path -m venv $venvDir 2>&1
-            $venvCode = $LASTEXITCODE
-            $venvOutput | ForEach-Object { Write-Host $_ }
-            if ($venvCode -eq 0 -and (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-                $createdPython = Get-ValidPython @($venvPython)
-                if ($null -ne $createdPython) {
-                    $runPython = $createdPython.Path
-                    $usingVenv = $true
-                }
-            }
-            if ($null -eq $runPython -and (Test-PythonDependencies $basePython.Path)) {
-                Write-Host "The bundled Python has the required packages; using it without modifying global Python."
-                $runPython = $basePython.Path
-            }
-            if ($null -eq $runPython) {
-                throw "Could not create a usable .venv. Install Python 3.11+ with venv/ensurepip enabled."
-            }
-        }
-    }
-
-    if (-not (Test-PythonDependencies $runPython)) {
-        if (-not $usingVenv) {
-            throw "Backend dependencies are missing from the available runtime. A local .venv is required; install Python 3.11+ with venv support."
-        }
-        Install-BackendDependencies $runPython
-    }
-    Write-Host ("Backend Python ready: {0}" -f $runPython)
-
-    $nodeCandidates = Get-ExecutableCandidates @("node.exe") @($fallbackNode)
-    $node = Get-ValidNode $nodeCandidates
-    if ($null -eq $node) {
-        throw "No supported Node.js was found. Vite requires Node 20.19+ or 22.12+."
-    }
-    Write-Host ("Using Node.js {0} ({1})." -f $node.Version, $node.Path)
-
-    $pnpmCandidates = Get-ExecutableCandidates @("pnpm.cmd", "pnpm.exe") @($fallbackPnpm)
-    $pnpm = Get-ValidPnpm $pnpmCandidates
-    if ($null -eq $pnpm) {
-        throw "pnpm was not found. Install pnpm or make the bundled runtime available."
-    }
-    Write-Host ("Using pnpm {0}." -f $pnpm.Version)
-
-    $viteCli = Join-Path $script:Frontend "node_modules\vite\bin\vite.js"
-    if (-not (Test-Path -LiteralPath $viteCli -PathType Leaf)) {
-        Write-Host "Frontend dependencies are missing; installing from pnpm-lock.yaml..."
-        Push-Location $script:Frontend
-        try {
-            $frontendOutput = & $pnpm.Path install --frozen-lockfile 2>&1
-            $frontendCode = $LASTEXITCODE
-        } finally {
-            Pop-Location
-        }
-        $frontendOutput | ForEach-Object { Write-Host $_ }
-        if ($frontendCode -ne 0) {
-            throw "Frontend dependency installation failed. Check network access and frontend\pnpm-lock.yaml."
-        }
-    }
-    if (-not (Test-Path -LiteralPath $viteCli -PathType Leaf)) {
-        throw "Vite is still missing after frontend dependency installation."
-    }
-
     $state = Read-LauncherState
+    if ($null -ne $state -and -not [string]::Equals([string]$state.root, $script:Root, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "Ignoring launcher state from a different project directory. Recorded PIDs will not be used; checking this project's listeners."
+        $state = $null
+    }
     $backendListener = Get-ProjectListenerEntry "backend" $script:Root
     $frontendListener = Get-ProjectListenerEntry "frontend" $script:Root
     if ($null -ne $backendListener -or $null -ne $frontendListener) {
@@ -398,6 +309,122 @@ try {
     if ($null -ne $state -and [string]::Equals([string]$state.root, $script:Root, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $script:StateFile)) {
         Remove-Item -LiteralPath $script:StateFile -Force
     }
+
+    $runtimeRoot = Get-RuntimeRoot
+    $fallbackPython = if ($runtimeRoot) { Join-Path $runtimeRoot "python\python.exe" } else { $null }
+    $fallbackNode = if ($runtimeRoot) { Join-Path $runtimeRoot "node\bin\node.exe" } else { $null }
+    $fallbackPnpm = if ($runtimeRoot) { Join-Path $runtimeRoot "bin\fallback\pnpm.cmd" } else { $null }
+
+    $venvDir = Join-Path $script:Root ".venv"
+    $venvPython = Join-Path $venvDir "Scripts\python.exe"
+    $runPython = $null
+    $usingVenv = $false
+    if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+        $localPython = Get-ValidPython @($venvPython)
+        if ($null -eq $localPython) {
+            throw ".venv exists but its Python is not a working Python 3.11+ interpreter."
+        }
+        $runPython = $localPython.Path
+        $usingVenv = $true
+    } else {
+        $pythonCandidates = Get-ExecutableCandidates @("python.exe", "python3.exe") @($fallbackPython)
+        $basePython = Get-ValidPython $pythonCandidates
+        if ($null -eq $basePython) {
+            throw "No working Python 3.11+ interpreter was found. Install Python or repair PATH."
+        }
+        Write-Host ("Using Python {0} ({1})." -f $basePython.Version, $basePython.Path)
+        if (Test-Path -LiteralPath $venvDir) {
+            Write-Host "A partial .venv was found; using the verified interpreter while it remains usable."
+            if (Test-PythonDependencies $basePython.Path) {
+                $runPython = $basePython.Path
+            } else {
+                throw ".venv is incomplete and the fallback Python has no backend dependencies. Remove the partial .venv and rerun."
+            }
+        } else {
+            Write-Host "Creating the project-local .venv..."
+            & $basePython.Path -m venv $venvDir | Out-Host
+            $venvCode = $LASTEXITCODE
+            if ($venvCode -eq 0 -and (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+                $createdPython = Get-ValidPython @($venvPython)
+                if ($null -ne $createdPython) {
+                    $runPython = $createdPython.Path
+                    $usingVenv = $true
+                }
+            }
+            if ($null -eq $runPython -and (Test-PythonDependencies $basePython.Path)) {
+                Write-Host "The bundled Python has the required packages; using it without modifying global Python."
+                $runPython = $basePython.Path
+            }
+            if ($null -eq $runPython) {
+                throw "Could not create a usable .venv. Install Python 3.11+ with venv/ensurepip enabled."
+            }
+        }
+    }
+
+    $requirements = Join-Path $script:Root "backend\requirements.txt"
+    $backendDependencyMarker = Join-Path $script:LauncherDir "backend-dependencies.sha256"
+    $requirementsHash = (Get-FileHash -LiteralPath $requirements -Algorithm SHA256).Hash
+    $installedRequirementsHash = if (Test-Path -LiteralPath $backendDependencyMarker -PathType Leaf) {
+        (Get-Content -LiteralPath $backendDependencyMarker -Raw).Trim()
+    } else { $null }
+    $backendDependenciesReady = Test-PythonDependencies $runPython
+    if ($usingVenv) {
+        if (-not $backendDependenciesReady -or $installedRequirementsHash -ne $requirementsHash) {
+            Install-BackendDependencies $runPython
+            Set-Content -LiteralPath $backendDependencyMarker -Value $requirementsHash -Encoding ASCII
+        }
+    } else {
+        if (-not $backendDependenciesReady) {
+            throw "Backend dependencies are missing from the available runtime. A local .venv is required; install Python 3.11+ with venv support."
+        }
+    }
+    Write-Host ("Backend Python ready: {0}" -f $runPython)
+
+    $nodeCandidates = Get-ExecutableCandidates @("node.exe") @($fallbackNode)
+    $node = Get-ValidNode $nodeCandidates
+    if ($null -eq $node) {
+        throw "No supported Node.js was found. Vite requires Node 20.19+ or 22.12+."
+    }
+    Write-Host ("Using Node.js {0} ({1})." -f $node.Version, $node.Path)
+
+    $pnpmCandidates = Get-ExecutableCandidates @("pnpm.cmd", "pnpm.exe") @($fallbackPnpm)
+    $pnpm = Get-ValidPnpm $pnpmCandidates
+    if ($null -eq $pnpm) {
+        throw "pnpm was not found. Install pnpm or make the bundled runtime available."
+    }
+    Write-Host ("Using pnpm {0}." -f $pnpm.Version)
+
+    $viteCli = Join-Path $script:Frontend "node_modules\vite\bin\vite.js"
+    $frontendDependencyMarker = Join-Path $script:LauncherDir "frontend-dependencies.sha256"
+    $packageHash = (Get-FileHash -LiteralPath (Join-Path $script:Frontend "package.json") -Algorithm SHA256).Hash
+    $lockHash = (Get-FileHash -LiteralPath (Join-Path $script:Frontend "pnpm-lock.yaml") -Algorithm SHA256).Hash
+    $frontendDependencyHash = $packageHash + $lockHash
+    $installedFrontendHash = if (Test-Path -LiteralPath $frontendDependencyMarker -PathType Leaf) {
+        (Get-Content -LiteralPath $frontendDependencyMarker -Raw).Trim()
+    } else { $null }
+    if ($installedFrontendHash -ne $frontendDependencyHash -or -not (Test-Path -LiteralPath $viteCli -PathType Leaf)) {
+        Write-Host "Synchronizing frontend dependencies from pnpm-lock.yaml..."
+        $previousCI = $env:CI
+        Push-Location $script:Frontend
+        try {
+            $env:CI = "true"
+            & $pnpm.Path install --frozen-lockfile | Out-Host
+            $frontendCode = $LASTEXITCODE
+        } finally {
+            $env:CI = $previousCI
+            Pop-Location
+        }
+        if ($frontendCode -ne 0) {
+            throw "Frontend dependency installation failed. Check network access and frontend\pnpm-lock.yaml."
+        }
+        if (-not (Test-Path -LiteralPath $viteCli -PathType Leaf)) {
+            throw "Vite is still missing after frontend dependency installation."
+        }
+        Set-Content -LiteralPath $frontendDependencyMarker -Value $frontendDependencyHash -Encoding ASCII
+    }
+
+    $xelatex = Initialize-LatexDependencies -DownloadDirectory (Join-Path $script:Root ".cache\dependency-downloads")
+    Write-Host ("LaTeX ready: {0}" -f $xelatex)
 
     $backendArgs = @(
         "-m", "uvicorn", "backend.main:app", "--app-dir", ('"' + $script:Root + '"'),
@@ -446,6 +473,8 @@ try {
     exit 0
 } catch {
     Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    Write-Host $_.InvocationInfo.PositionMessage
+    Write-Host $_.ScriptStackTrace
     if ($script:StartedEntries.Count -gt 0) {
         Stop-VerifiedEntries $script:StartedEntries
     }

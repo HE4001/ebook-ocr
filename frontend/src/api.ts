@@ -1,4 +1,4 @@
-import type { Arrangement, Book, BookDetail, Page, PageDraft, PaperSize, Settings } from './types'
+import type { Arrangement, Book, BookDetail, LayoutSettings, Page, PageDraft, PaperSize, Settings } from './types'
 
 const API_PREFIX = '/api'
 
@@ -10,7 +10,7 @@ function detailMessage(value: unknown, fallback: string): string {
   return fallback
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, responseFormat: 'json' | 'text' = 'json'): Promise<T> {
   const requestPath = `${API_PREFIX}${path}`
   let response: Response
   try {
@@ -31,6 +31,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(`本地接口 ${requestPath} 请求失败（HTTP ${response.status}）${suffix}`)
   }
   if (response.status === 204) return undefined as T
+  if (responseFormat === 'text') return await response.text() as T
   return response.json() as Promise<T>
 }
 
@@ -56,11 +57,18 @@ export const api = {
     }),
   pagePreviewUrl: (id: string, number: number) => `${API_PREFIX}/books/${encodeURIComponent(id)}/pages/${number}/preview`,
   getBook: (id: string) => request<BookDetail>(`/books/${encodeURIComponent(id)}`),
-  saveBookLayout: (id: string, paperSize: PaperSize) => request<Book>(`/books/${encodeURIComponent(id)}/layout`, {
+  saveBookLayout: (id: string, changes: { paper_size?: PaperSize; layout?: LayoutSettings }) => request<Book>(`/books/${encodeURIComponent(id)}/layout`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ paper_size: paperSize }),
+    body: JSON.stringify(changes),
   }),
+  compileBook: (id: string, printVersion: boolean) => request<{ pdf_url: string }>(`/books/${encodeURIComponent(id)}/compile?print_version=${printVersion}`, { method: 'POST' }),
+  compilePage: (id: string, number: number, draft: PageDraft, printVersion: boolean) => request<{ pdf_url: string }>(`/books/${encodeURIComponent(id)}/pages/${number}/compile?print_version=${printVersion}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(draft),
+  }),
+  exportLatex: (id: string, printVersion: boolean) => request<string>(`/books/${encodeURIComponent(id)}/export.tex?print_version=${printVersion}`, undefined, 'text'),
   deleteBook: (id: string) => request<void>(`/books/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   uploadBook: (file: File) => {
     const form = new FormData()

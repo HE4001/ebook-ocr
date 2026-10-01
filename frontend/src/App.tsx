@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
-import { BookContent, PageContent } from './Markdown'
-import { buildStandaloneHtml, downloadText, safeFilename } from './exportHtml'
+import { PdfPreview } from './PdfPreview'
+import { downloadText, downloadUrl, safeFilename } from './downloads'
 import ProjectOrganizer from './ProjectOrganizer'
 import { PageEditor } from './PageEditor'
+import { LayoutSettingsForm } from './LayoutSettingsForm'
 import { ReasoningControl } from './ReasoningControl'
 import { bindingPageSide, PAPER_SIZES } from './paper'
-import type { ApiProtocol, Book, BookDetail, Notice, Page, PageDraft, PaperSize, Settings, Usage } from './types'
+import type { ApiProtocol, Book, BookDetail, LayoutSettings, Notice, Page, PageDraft, PaperSize, Settings, Usage } from './types'
 
 const STATUS_LABEL: Record<string, string> = {
   uploaded: '待处理', processing: '处理中', pausing: '正在暂停', paused: '已暂停', ready: '已完成',
@@ -293,7 +294,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
           <label><span>服务器模型</span><select value={models?.includes(settings.extraction_model) ? settings.extraction_model : ''} onChange={(event) => update('extraction_model', event.target.value)} disabled={saving || modelsLoading || !models?.length}><option value="" disabled>{models?.length ? '选择模型，不会自动保存' : '获取模型后选择'}</option>{models?.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
           <small>{isGemini ? '仅列出服务声明支持 generateContent 的模型；不保证支持图片输入或结构化输出，请确认所选模型能力。' : '模型列表仅提供名称，不代表模型支持 Responses 或图片输入，请向供应商确认。'}</small>
         </div>
-        <label><span>页面代理模型 ID</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} placeholder="手动填写，或从上方列表选择" disabled={saving} /><small>{isGemini && '可填裸模型 ID 或 models/ 开头的完整资源名。'}保存后用于逐页识别，返回页眉、正文 Markdown 和页脚。</small></label>
+        <label><span>页面代理模型 ID</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} placeholder="手动填写，或从上方列表选择" disabled={saving} /><small>{isGemini && '可填裸模型 ID 或 models/ 开头的完整资源名。'}保存后用于逐页识别，返回页眉、LaTeX 正文和页脚。</small></label>
         <ReasoningControl protocol={settings.api_protocol} value={settings.reasoning_effort} onChange={(value) => update('reasoning_effort', value)} disabled={saving} />
         <div className="field-grid compact-grid">
           <label><span>超时秒数</span><input type="number" min={5} max={600} value={settings.timeout_seconds} onChange={(event) => update('timeout_seconds', Number(event.target.value))} disabled={saving} /></label>
@@ -325,6 +326,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
 }
 
 type WorkspaceView = 'upload' | 'organize' | 'workspace' | 'preview' | 'settings'
+type PdfResult = { key: string; url: string | null; error: string | null }
 
 function projectView(book: Book): WorkspaceView {
   if (!book.upload_confirmed) return 'upload'
@@ -344,6 +346,24 @@ function sourceLabel(page: Page): string {
 function draftFromPage(page: Page | null): PageDraft {
   return page ? { text: page.text, page_kind: page.page_kind, cover_fields: page.cover_fields }
     : { text: '', page_kind: 'content', cover_fields: [] }
+}
+
+function outputDraft(draft: PageDraft): PageDraft {
+  return {
+    text: draft.page_kind === 'content' ? draft.text : '',
+    page_kind: draft.page_kind,
+    cover_fields: draft.page_kind === 'content' ? [] : draft.cover_fields.filter((field) => field.text.trim()),
+  }
+}
+
+function pagePrintContent(page: Page) {
+  return {
+    number: page.number,
+    ...outputDraft(draftFromPage(page)),
+    page_side: page.page_side,
+    header_segments: page.header_segments,
+    footer_segments: page.footer_segments,
+  }
 }
 
 function PaperSizeControl({ value, saving, disabled, onChange }: {
@@ -380,7 +400,11 @@ export default function App() {
   const [uploading, setUploading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [layoutSaving, setLayoutSaving] = useState(false)
+  const [layoutDirty, setLayoutDirty] = useState(false)
   const [printVersion, setPrintVersion] = useState(false)
+  const [compiling, setCompiling] = useState<'book' | 'page' | null>(null)
+  const [bookPdf, setBookPdf] = useState<PdfResult | null>(null)
+  const [pagePdf, setPagePdf] = useState<PdfResult | null>(null)
   const [actionBusy, setActionBusy] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [newProject, setNewProject] = useState(false)
@@ -398,14 +422,14 @@ export default function App() {
   }, [notice])
 
   useEffect(() => {
-    if (!dirty && !organizerDirty) return
+    if (!dirty && !organizerDirty && !layoutDirty) return
     const protectDraft = (event: BeforeUnloadEvent) => {
       event.preventDefault()
       event.returnValue = ''
     }
     window.addEventListener('beforeunload', protectDraft)
     return () => window.removeEventListener('beforeunload', protectDraft)
-  }, [dirty, organizerDirty])
+  }, [dirty, organizerDirty, layoutDirty])
 
   const loadBooks = useCallback(async () => {
     try {
@@ -448,6 +472,7 @@ export default function App() {
   useEffect(() => {
     setDirty(false)
     setOrganizerDirty(false)
+    setLayoutDirty(false)
     setUploadError('')
     setDetail(null)
     setSelectedPageNumber(1)
@@ -455,10 +480,10 @@ export default function App() {
     if (selectedBookId) void loadDetail(selectedBookId, false, true)
   }, [selectedBookId, loadDetail])
   useEffect(() => {
-    if (!selectedBookId || actionBusy || layoutSaving || !['processing', 'pausing'].includes(detail?.book.status ?? '')) return
+    if (!selectedBookId || actionBusy || layoutSaving || compiling || !['processing', 'pausing'].includes(detail?.book.status ?? '')) return
     const timer = window.setInterval(() => void loadDetail(selectedBookId, true), 2000)
     return () => window.clearInterval(timer)
-  }, [selectedBookId, detail?.book.status, actionBusy, layoutSaving, loadDetail])
+  }, [selectedBookId, detail?.book.status, actionBusy, layoutSaving, compiling, loadDetail])
 
   const sourcePage = useMemo(() => detail?.pages.find((page) => page.number === selectedPageNumber) ?? null, [detail, selectedPageNumber])
   const sourcePageHasResult = sourcePage && (sourcePage.status === 'ready' || Boolean(sourcePage.text || sourcePage.cover_fields.length || sourcePage.header_segments.length || sourcePage.footer_segments.length))
@@ -467,20 +492,36 @@ export default function App() {
   const bindingPageCount = detail?.pages.filter((page) => bindingPageSide(page) !== 'unknown').length ?? 0
   const effectivePrintVersion = printVersion && bindingPageCount > 0
   const isRunning = detail?.book.status === 'processing' || detail?.book.status === 'pausing'
-  const busy = actionBusy || saving || layoutSaving || uploading || deleting || organizerBusy
+  const busy = actionBusy || saving || layoutSaving || uploading || deleting || organizerBusy || compiling !== null
   const processLocked = isRunning || busy
   const editLocked = busy || sourcePage?.status === 'processing'
   const progress = detail?.book.selected_page_count ? Math.round(detail.book.completed_pages / detail.book.selected_page_count * 100) : 0
-  const oldBackendContract = Boolean(detail && (!Array.isArray(detail.files) || !detail.book.usage
+  const oldBackendContract = Boolean(detail && (!Array.isArray(detail.files) || !detail.book.usage || detail.book.content_format !== 'latex' || !detail.book.layout
     || detail.pages.some((page) => typeof page.text !== 'string' || !page.page_kind || !Array.isArray(page.cover_fields) || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage)))
 
   useEffect(() => { if (!dirty) setPageDraft(draftFromPage(sourcePage)) }, [sourcePage, dirty])
 
+  const bookPdfKey = useMemo(() => JSON.stringify(detail && {
+    id: detail.book.id, title: detail.book.title, paper_size: detail.book.paper_size,
+    layout: detail.book.layout, print_version: effectivePrintVersion,
+    pages: detail.pages.map(pagePrintContent),
+  }), [detail, effectivePrintVersion])
+  const pagePdfKey = useMemo(() => JSON.stringify(detail && sourcePage && {
+    id: detail.book.id, paper_size: detail.book.paper_size, layout: detail.book.layout,
+    print_version: effectivePrintVersion, page: { ...pagePrintContent(sourcePage), ...outputDraft(pageDraft) },
+  }), [detail, sourcePage, pageDraft, effectivePrintVersion])
+  useEffect(() => { setBookPdf(null) }, [bookPdfKey])
+  useEffect(() => { setPagePdf(null) }, [pagePdfKey])
+  useEffect(() => { if (layoutDirty) setBookPdf(null) }, [layoutDirty])
+  const currentBookPdf = bookPdf?.key === bookPdfKey ? bookPdf : null
+  const currentPagePdf = pagePdf?.key === pagePdfKey ? pagePdf : null
+
   const leaveDrafts = () => {
-    const message = organizerDirty ? '页面编排尚未确认，确定离开并放弃这些调整吗？' : '当前页有未保存修改，确定离开并放弃吗？'
-    if ((dirty || organizerDirty) && !window.confirm(message)) return false
+    const message = organizerDirty ? '页面编排尚未确认，确定离开并放弃这些调整吗？' : layoutDirty ? '整书排版设置尚未保存，确定离开并放弃吗？' : '当前页有未保存修改，确定离开并放弃吗？'
+    if ((dirty || organizerDirty || layoutDirty) && !window.confirm(message)) return false
     setDirty(false)
     setOrganizerDirty(false)
+    setLayoutDirty(false)
     return true
   }
 
@@ -643,13 +684,13 @@ export default function App() {
   }
 
   const savePaperSize = async (paperSize: PaperSize) => {
-    if (!detail || layoutSaving || paperSize === (detail.book.paper_size ?? 'a4')) return
+    if (!detail || layoutSaving || paperSize === detail.book.paper_size) return
     setLayoutSaving(true)
     detailRequestRef.current += 1
     try {
-      const saved = await api.saveBookLayout(detail.book.id, paperSize)
-      setDetail((current) => current?.book.id === saved.id ? { ...current, book: { ...current.book, paper_size: saved.paper_size } } : current)
-      setBooks((current) => current.map((book) => book.id === saved.id ? { ...book, paper_size: saved.paper_size } : book))
+      const saved = await api.saveBookLayout(detail.book.id, { paper_size: paperSize })
+      setDetail((current) => current?.book.id === saved.id ? { ...current, book: saved } : current)
+      setBooks((current) => current.map((book) => book.id === saved.id ? saved : book))
       await loadDetail(saved.id, true)
       setNotice({ kind: 'success', text: `已将整本书纸张设为 ${PAPER_SIZES[saved.paper_size].label}。` })
     } catch (error) {
@@ -659,15 +700,28 @@ export default function App() {
     }
   }
 
+  const saveLayoutSettings = async (layout: LayoutSettings): Promise<boolean> => {
+    setLayoutSaving(true)
+    detailRequestRef.current += 1
+    try {
+      const saved = await api.saveBookLayout(detail!.book.id, { layout })
+      setDetail((current) => current ? { ...current, book: saved } : current)
+      setBooks((current) => current.map((book) => book.id === saved.id ? saved : book))
+      setNotice({ kind: 'success', text: '整书排版设置已保存，请更新 PDF。' })
+      return true
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorText(error) })
+      return false
+    } finally {
+      setLayoutSaving(false)
+    }
+  }
+
   const savePage = async () => {
     if (!detail || !sourcePage || editLocked) return
     setSaving(true)
     try {
-      const saved = await api.savePage(detail.book.id, sourcePage.number, {
-        ...pageDraft,
-        text: pageDraft.page_kind === 'content' ? pageDraft.text : '',
-        cover_fields: pageDraft.page_kind === 'content' ? [] : pageDraft.cover_fields.filter((field) => field.text.trim()),
-      })
+      const saved = await api.savePage(detail.book.id, sourcePage.number, outputDraft(pageDraft))
       setDetail((current) => current ? { ...current, pages: current.pages.map((page) => page.number === saved.number ? saved : page) } : current)
       setPageDraft(draftFromPage(saved))
       setDirty(false)
@@ -680,15 +734,55 @@ export default function App() {
     }
   }
 
-  const exportData = async (kind: 'json' | 'html') => {
+  const compileBook = async () => {
+    const key = bookPdfKey
+    setCompiling('book')
+    setBookPdf(null)
+    try {
+      const result = await api.compileBook(detail!.book.id, effectivePrintVersion)
+      setBookPdf({ key, url: result.pdf_url, error: null })
+    } catch (error) {
+      setBookPdf({ key, url: null, error: errorText(error) })
+    } finally {
+      setCompiling(null)
+    }
+  }
+
+  const compilePage = async () => {
+    const key = pagePdfKey
+    setCompiling('page')
+    setPagePdf(null)
+    try {
+      const result = await api.compilePage(detail!.book.id, sourcePage!.number, outputDraft(pageDraft), effectivePrintVersion)
+      setPagePdf({ key, url: result.pdf_url, error: null })
+    } catch (error) {
+      setPagePdf({ key, url: null, error: errorText(error) })
+    } finally {
+      setCompiling(null)
+    }
+  }
+
+  const exportJson = async () => {
     if (!detail) return
     setActionBusy(true)
     try {
       const data = await api.exportBook(detail.book.id)
       const name = safeFilename(data.book.title)
-      if (kind === 'json') downloadText(name + '.json', JSON.stringify(data, null, 2), 'application/json;charset=utf-8')
-      if (kind === 'html') downloadText(name + '.html', buildStandaloneHtml(data, effectivePrintVersion && data.pages.some((page) => bindingPageSide(page) !== 'unknown')), 'text/html;charset=utf-8')
-      setNotice({ kind: 'success', text: (kind === 'html' ? '独立 HTML' : 'JSON') + ' 已下载。' })
+      downloadText(name + '.json', JSON.stringify(data, null, 2), 'application/json;charset=utf-8')
+      setNotice({ kind: 'success', text: 'JSON 已下载。' })
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorText(error) })
+    } finally {
+      setActionBusy(false)
+    }
+  }
+
+  const exportLatex = async () => {
+    setActionBusy(true)
+    try {
+      const content = await api.exportLatex(detail!.book.id, effectivePrintVersion)
+      downloadText(safeFilename(detail!.book.title) + '.tex', content, 'application/x-tex;charset=utf-8')
+      setNotice({ kind: 'success', text: 'LaTeX 源文件已下载。' })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
     } finally {
@@ -733,7 +827,7 @@ export default function App() {
             ) : !selectedBookId ? (
               <div className="welcome-state"><span className="welcome-icon">页</span><h1>多份资料，一本书稿</h1><p>先建立项目，汇集 PDF 与图片；确认页序后，再识别和校对。</p><button className="primary" onClick={beginProject} disabled={busy}>新建第一个项目</button></div>
             ) : detailLoading || !detail || detail.book.id !== selectedBookId ? <div className="center-state">正在读取项目…</div>
-              : oldBackendContract ? <div className="center-state"><h2>后端仍在运行旧版本</h2><p>请使用 stop.bat 和 start.bat 重启后端，以加载多文件项目接口。</p></div>
+              : oldBackendContract ? <div className="center-state"><h2>后端仍在运行旧版本</h2><p>请运行 <code>ocr.bat Restart</code>，以加载当前 LaTeX 正文和排版接口。</p></div>
               : <>
                 <header className="book-header project-header no-print">
                   <div className="book-overview">
@@ -766,15 +860,16 @@ export default function App() {
                   : view === 'preview' ? <>
                     <section className="preview-toolbar no-print" aria-labelledby="preview-title">
                       <div className="preview-heading">
-                        <div><h2 id="preview-title">预览与导出</h2><p>{detail.pages.length} 页已编排 · 长正文按纸张自然分页</p></div>
+                        <div><h2 id="preview-title">预览与导出</h2><p>{detail.pages.length} 页已编排 · 根据已保存的 LaTeX 正文生成 PDF</p></div>
                         <div className="button-row export-buttons">
-                          <button onClick={() => void exportData('json')} disabled={busy}>下载 JSON</button>
-                          <button onClick={() => void exportData('html')} disabled={busy}>下载 HTML</button>
-                          <button className="primary" onClick={() => window.print()} disabled={busy}><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 8V3h10v5M7 17H4V9h16v8h-3M7 14h10v7H7zM17 11h.01" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>打印 / 存为 PDF</button>
+                          <button onClick={() => void exportJson()} disabled={busy}>下载 JSON</button>
+                          <button onClick={() => void exportLatex()} disabled={processLocked || layoutDirty}>下载 LaTeX</button>
+                          <button onClick={() => downloadUrl(safeFilename(detail.book.title) + '.pdf', currentBookPdf!.url!)} disabled={busy || !currentBookPdf?.url || layoutDirty}>下载 PDF</button>
+                          <button className="primary" onClick={() => void compileBook()} disabled={processLocked || layoutDirty}>{compiling === 'book' ? '正在生成 PDF…' : '生成/更新 PDF'}</button>
                         </div>
                       </div>
                       <div className="preview-options">
-                        <PaperSizeControl value={detail.book.paper_size ?? 'a4'} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
+                        <PaperSizeControl value={detail.book.paper_size} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
                         <div className="print-layout-option">
                           <span className={`binding-preview${effectivePrintVersion ? ' is-bound' : ''}`} aria-hidden="true"><i /><i /></span>
                           <label className="print-version-control">
@@ -786,11 +881,12 @@ export default function App() {
                         </div>
                       </div>
                       <div className="toolbar-footnotes">
-                        <details className="export-help"><summary>导出与打印说明</summary><p>HTML 可独立离线阅读，公式显示取决于浏览器数学字体。打印时请选择与成书一致的纸张，并关闭浏览器页眉和页脚。</p><p>装订版中，无页脚、未知页侧和封面封底仍居中。长正文续页沿用源页版式，实际分页以打印预览为准。</p></details>
+                        <details className="export-help"><summary>导出与打印说明</summary><p>PDF 与 LaTeX 源文件使用已保存的正文和排版设置。纸型、内容、页序或装订选项变化后，请重新生成 PDF。打印时使用 PDF 自身的纸张尺寸。</p><p>装订版中，无页脚、未知页侧和封面封底仍居中；长正文续页沿用源页侧别。PDF 生成需要本机可用的 XeLaTeX。</p></details>
                         <ToolbarUsage usage={detail.book.usage} />
                       </div>
+                      <LayoutSettingsForm key={detail.book.id} layout={detail.book.layout} paperSize={detail.book.paper_size} dirty={layoutDirty} saving={layoutSaving} disabled={busy} onDirtyChange={setLayoutDirty} onSave={saveLayoutSettings} />
                     </section>
-                    <BookContent detail={detail} printVersion={effectivePrintVersion} />
+                    <div className="book-pdf-preview"><PdfPreview url={currentBookPdf?.url ?? null} error={currentBookPdf?.error ?? null} loading={compiling === 'book'} title="整书 PDF 预览" emptyMessage={layoutDirty ? '先保存排版设置，再生成整书 PDF。' : '点击“生成/更新 PDF”查看当前书稿；内容或排版变化后需重新生成。'} /></div>
                   </> : <>
                     <section className="proofing-toolbar no-print" aria-label="逐页校对工具栏">
                       <div className="proofing-controls">
@@ -799,7 +895,7 @@ export default function App() {
                           <div className="progress-track" role="progressbar" aria-label="已编排页面识别进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><span style={{ width: progress + '%' }} /></div>
                           <p>{isRunning ? '已开始的页面会完成并保存结果' : pendingPages.length ? '识别完成后，可逐页检查并保存校对' : detail.pages.length ? '可继续校对，或进入整书预览' : '返回页面编排，加入需要识别的页面'}</p>
                         </div>
-                        <PaperSizeControl value={detail.book.paper_size ?? 'a4'} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
+                        <PaperSizeControl value={detail.book.paper_size} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
                         <div className="button-row proofing-actions">
                           <button onClick={() => changeView('organize')} disabled={processLocked}>修改编排</button>
                           {pagesToProcess.length > 0 && <button onClick={() => void processPages(pagesToProcess)} className="primary" disabled={processLocked}>{isRunning ? '处理中…' : '识别未完成页'}</button>}
@@ -822,13 +918,11 @@ export default function App() {
                             <PageEditor draft={pageDraft} onChange={(draft) => { setPageDraft(draft); setDirty(true) }} disabled={editLocked} />
                           </section>
                           <section className="render-panel">
-                            <div className="panel-title"><strong>排版预览</strong><a href={api.pagePreviewUrl(detail.book.id, sourcePage.number)} target="_blank" rel="noreferrer">查看原页</a></div>
+                            <div className="panel-title"><strong>本页 PDF 预览</strong><div className="button-row"><button onClick={() => void compilePage()} disabled={editLocked}>{compiling === 'page' ? '正在生成…' : '更新本页 PDF'}</button><a href={api.pagePreviewUrl(detail.book.id, sourcePage.number)} target="_blank" rel="noreferrer">查看原页</a></div></div>
                             <div className="page-render">
-                              <p className="page-layout-note">{pageDraft.page_kind === 'front_cover' ? '封面版式 · 自动应用' : pageDraft.page_kind === 'back_cover' ? '封底版式 · 自动应用' : '正文版式'}<span>{PAPER_SIZES[detail.book.paper_size ?? 'a4'].label}</span></p>
-                              <PageContent page={{ ...sourcePage, ...pageDraft }} paperSize={detail.book.paper_size} />
-                              {pageDraft.page_kind === 'content'
-                                ? !pageDraft.text && <p className="empty-page">本页暂无正文</p>
-                                : !pageDraft.cover_fields.some((field) => field.text.trim()) && <p className="empty-page">本页暂无书目信息</p>}
+                              <p className="page-layout-note">{pageDraft.page_kind === 'front_cover' ? '封面模板' : pageDraft.page_kind === 'back_cover' ? '封底模板' : '正文模板'}{effectivePrintVersion ? ' · 装订版' : ''}<span>{PAPER_SIZES[detail.book.paper_size].label}</span></p>
+                              <p className="page-preview-note">预览使用当前草稿和已保存的整书排版，更新 PDF 不会保存本页修改。</p>
+                              <PdfPreview url={currentPagePdf?.url ?? null} error={currentPagePdf?.error ?? null} loading={compiling === 'page'} title={`${sourceLabel(sourcePage)} PDF 预览`} emptyMessage="点击“更新本页 PDF”预览当前草稿；正文或版式变化后需重新更新。" />
                             </div>
                           </section>
                         </div>

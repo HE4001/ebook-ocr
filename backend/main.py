@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 from contextlib import asynccontextmanager
+from hashlib import sha256
 from pathlib import Path
 from typing import AsyncIterator
 from uuid import UUID, uuid4
@@ -15,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .importers import ImportFailure, import_document, prepare_source_preview
+from .latex_export import LatexCompileError, build_latex, compile_pdf
 from .models import (
     Arrangement,
     ArrangementUpdate,
@@ -43,23 +45,7 @@ from .storage import Storage
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 ASSET_NAME = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
-COVER_FIELD_LABELS = {
-    "title": "书名", "subtitle": "副标题", "author": "作者", "translator": "译者",
-    "editor": "编者", "publisher": "出版社", "series": "丛书", "edition": "版本",
-    "publication_year": "出版年份", "isbn": "ISBN",
-}
-
-
-def _page_markdown(page: Page) -> str:
-    if page.page_kind == "content":
-        return page.text
-    label = "封面" if page.page_kind == "front_cover" else "封底"
-    lines = []
-    for field in page.cover_fields:
-        text = re.sub(r"([\\`*{}\[\]()#+\-.!_<>|$~&])", r"\\\1", field.text)
-        lines.append(f"**{COVER_FIELD_LABELS[field.kind]}**：{text}")
-    fields = "\n\n".join(lines)
-    return f"### {label}\n\n{fields}".rstrip()
+COMPILED_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 class RuntimeSecrets:
@@ -88,6 +74,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     manually_saved_pages: dict[str, set[int]] = {}
     uploading: set[str] = set()
     preview_lock = asyncio.Lock()
+    compile_locks: dict[str, asyncio.Lock] = {}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -148,6 +135,24 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     def ensure_arranged(book: Book) -> None:
         if not book.upload_confirmed or not book.selection_confirmed:
             raise HTTPException(status_code=409, detail="请先确认上传并完成页面编排")
+
+    def latex_source(detail: BookDetail, print_version: bool) -> str:
+        try:
+            return build_latex(detail, print_version=print_version)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    async def compiled_pdf(detail: BookDetail, print_version: bool) -> dict[str, str]:
+        source = latex_source(detail, print_version)
+        digest = sha256(source.encode("utf-8")).hexdigest()
+        output_dir = storage.books_root / detail.book.id / "latex-cache" / digest
+        async with compile_locks.setdefault(detail.book.id, asyncio.Lock()):
+            if not (output_dir / "document.pdf").is_file():
+                try:
+                    await compile_pdf(source, output_dir)
+                except LatexCompileError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"pdf_url": f"/api/books/{detail.book.id}/compiled/{digest}.pdf"}
 
     async def read_upload(file: UploadFile) -> tuple[str, bytes]:
         filename = Path(file.filename or "").name
@@ -391,7 +396,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     @app.put("/api/books/{book_id}/layout", response_model=Book)
     async def put_layout(book_id: str, request: LayoutUpdate) -> Book:
         ensure_book(book_id)
-        storage.save_layout(book_id, request.paper_size)
+        storage.save_layout(book_id, request.paper_size, request.layout)
         return ensure_book(book_id)
 
     @app.delete("/api/books/{book_id}", status_code=204)
@@ -535,19 +540,57 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             },
         )
 
-    @app.get("/api/books/{book_id}/export.md")
-    async def export_markdown(book_id: str) -> Response:
+    @app.get("/api/books/{book_id}/export.tex")
+    async def export_latex(book_id: str, print_version: bool = False) -> Response:
         book = ensure_book(book_id)
         ensure_arranged(book)
-        pages = storage.get_pages(book_id)
-        body = "# " + book.title + "\n\n" + "\n\n---\n\n".join(
-            f"## 第 {index} 页 · {page.source_filename} / 源第 {page.source_page} 页\n\n{_page_markdown(page)}"
-            for index, page in enumerate(pages, 1)
-        ) + "\n"
         return Response(
-            content=body,
-            media_type="text/markdown; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="book-{book_id}.md"'},
+            content=latex_source(book_detail(book_id), print_version),
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="book-{book_id}.tex"'},
+        )
+
+    @app.post("/api/books/{book_id}/compile")
+    async def compile_book(book_id: str, print_version: bool = False) -> dict[str, str]:
+        ensure_arranged(ensure_book(book_id))
+        return await compiled_pdf(book_detail(book_id), print_version)
+
+    @app.post("/api/books/{book_id}/pages/{number}/compile")
+    async def compile_page(
+        book_id: str, number: int, update: PageUpdate, print_version: bool = False,
+    ) -> dict[str, str]:
+        detail = book_detail(book_id)
+        ensure_arranged(detail.book)
+        page = next((page for page in detail.pages if page.number == number), None)
+        if page is None:
+            raise HTTPException(status_code=404, detail="页面不存在")
+        kind = update.page_kind if update.page_kind is not None else page.page_kind
+        if kind == "content":
+            if update.cover_fields:
+                raise HTTPException(status_code=422, detail="正文页不能包含封面书目信息")
+            changes = {"text": update.text, "page_kind": kind, "cover_fields": []}
+        else:
+            if update.text:
+                raise HTTPException(status_code=422, detail="封面和封底不能包含正文")
+            changes = {
+                "text": "", "page_kind": kind, "page_side": "unknown",
+                "cover_fields": update.cover_fields if update.cover_fields is not None else page.cover_fields,
+                "header_segments": [], "footer_segments": [],
+            }
+        draft = detail.model_copy(update={"pages": [page.model_copy(update=changes)]})
+        return await compiled_pdf(draft, print_version)
+
+    @app.get("/api/books/{book_id}/compiled/{digest}.pdf")
+    async def get_compiled_pdf(book_id: str, digest: str) -> FileResponse:
+        ensure_book(book_id)
+        if not COMPILED_DIGEST.fullmatch(digest):
+            raise HTTPException(status_code=404, detail="PDF 不存在")
+        path = storage.books_root / book_id / "latex-cache" / digest / "document.pdf"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="PDF 不存在，请先生成")
+        return FileResponse(
+            path, media_type="application/pdf", filename=f"book-{book_id}.pdf",
+            content_disposition_type="inline",
         )
 
     @app.get("/api/books/{book_id}/assets/{name}")

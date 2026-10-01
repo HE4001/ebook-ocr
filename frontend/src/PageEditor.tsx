@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import type { CoverField, PageDraft, PageKind } from './types'
 
 const COVER_FIELD_LABELS: Record<CoverField['kind'], string> = {
@@ -18,8 +19,21 @@ export function PageEditor({ draft, onChange, disabled }: {
   onChange: (draft: PageDraft) => void
   disabled: boolean
 }) {
+  const bodyInput = useRef<HTMLTextAreaElement>(null)
   const updateField = (index: number, changes: Partial<CoverField>) => {
     onChange({ ...draft, cover_fields: draft.cover_fields.map((field, position) => position === index ? { ...field, ...changes } : field) })
+  }
+
+  const insert = (prefix: string, suffix = '') => {
+    const input = bodyInput.current!
+    const start = input.selectionStart
+    const end = input.selectionEnd
+    const selected = draft.text.slice(start, end)
+    onChange({ ...draft, text: draft.text.slice(0, start) + prefix + selected + suffix + draft.text.slice(end) })
+    requestAnimationFrame(() => {
+      input.focus()
+      input.setSelectionRange(start + prefix.length, start + prefix.length + selected.length)
+    })
   }
 
   return <fieldset className="page-editor" disabled={disabled}>
@@ -34,7 +48,19 @@ export function PageEditor({ draft, onChange, disabled }: {
       <p>识别为封面或封底时自动应用对应版式，也可在此修正类型。切换时保留未保存草稿；保存后仅保留所选类型的内容。</p>
     </div>
     {draft.page_kind === 'content'
-      ? <label className="body-editor"><span>正文 Markdown 源文本</span><textarea aria-label="本页正文 Markdown 源文本" value={draft.text} onChange={(event) => onChange({ ...draft, text: event.target.value })} spellCheck={false} placeholder="本页暂无正文" /></label>
+      ? <div className="body-editor">
+        <label htmlFor="page-latex-body">LaTeX 正文</label>
+        <div className="latex-tools" role="group" aria-label="插入 LaTeX 格式" onMouseDown={(event) => event.preventDefault()}>
+          <button type="button" onClick={() => insert('\\begin{center}\n', '\n\\end{center}')}>居中</button>
+          <button type="button" onClick={() => insert('\\begin{flushleft}\n', '\n\\end{flushleft}')}>左对齐</button>
+          <button type="button" onClick={() => insert('\\begin{flushright}\n', '\n\\end{flushright}')}>右对齐</button>
+          <button type="button" onClick={() => insert('\\noindent ')}>无缩进</button>
+          <button type="button" onClick={() => insert('\n\n')}>段落分隔</button>
+          <button type="button" onClick={() => insert('\\[\n', '\n\\]')}>公式</button>
+        </div>
+        <textarea ref={bodyInput} id="page-latex-body" aria-label="本页 LaTeX 正文" value={draft.text} onChange={(event) => onChange({ ...draft, text: event.target.value })} spellCheck={false} placeholder="本页暂无正文" />
+        <p className="latex-editor-hint">使用空行分段；选择文字后点击格式按钮。这里只编辑正文片段，页眉、页脚与封面由整书模板排版。</p>
+      </div>
       : <div className="cover-editor">
         <p className="cover-editor-hint">只保留原页可见的书名、署名和出版信息。没有可辨认的信息时可留空。</p>
         <div className="cover-field-list">

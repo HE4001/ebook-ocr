@@ -5,12 +5,6 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
-
-SectionType = Literal[
-    "heading", "paragraph", "quote", "example", "list", "code", "equation",
-    "table", "figure", "caption", "footnote", "header", "footer",
-    "page_number", "unknown",
-]
 PageStatus = Literal["uploaded", "processing", "ready", "failed", "interrupted"]
 BookStatus = PageStatus | Literal["pausing", "paused"]
 PageKind = Literal["content", "front_cover", "back_cover"]
@@ -29,11 +23,23 @@ class Usage(BaseModel):
     complete: bool
 
 
+class LayoutSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    font_family: Literal["songti", "heiti", "kaiti"] = "songti"
+    font_size_pt: float | None = Field(default=None, ge=6, le=48)
+    line_height: float = Field(default=1.6, ge=1, le=3)
+    paragraph_indent: float = Field(default=2, ge=0, le=8)
+    paragraph_spacing_pt: float = Field(default=0, ge=0, le=48)
+    margin_mm: float | None = Field(default=None, ge=2, le=50)
+
+
 class Book(BaseModel):
     id: str
     title: str
     filename: str
     paper_size: PaperSize = "a4"
+    layout: LayoutSettings = Field(default_factory=LayoutSettings)
+    content_format: Literal["latex"] = "latex"
     status: BookStatus
     page_count: int
     file_count: int = 1
@@ -120,7 +126,17 @@ class ArrangementUpdate(BaseModel):
 
 class LayoutUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    paper_size: PaperSize
+    paper_size: PaperSize | None = None
+    layout: LayoutSettings | None = None
+
+    @model_validator(mode="after")
+    def validate_layout(self) -> "LayoutUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少提供纸型或排版设置")
+        for name in self.model_fields_set:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} 不能为 null")
+        return self
 
 
 class PageUpdate(BaseModel):
@@ -272,23 +288,6 @@ class PauseResult(BaseModel):
     requested: bool
 
 
-class Section(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: SectionType
-    text: str = Field(max_length=50_000)
-
-
-class PageResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    sections: list[Section] = Field(max_length=500)
-
-    @model_validator(mode="after")
-    def validate_length(self) -> "PageResult":
-        if sum(len(section.text) for section in self.sections) > 1_000_000:
-            raise ValueError("页面文本过长")
-        return self
-
-
 class SpecialPageResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     page_kind: Literal["front_cover", "back_cover"]
@@ -307,12 +306,12 @@ class StructuredPageResult(BaseModel):
     page_side: PageSide = "unknown"
     cover_fields: list[CoverField] = Field(default_factory=list, max_length=100)
     header_segments: list[MarginSegment] = Field(max_length=100)
-    body_markdown: str = Field(max_length=1_000_000)
+    body_latex: str = Field(max_length=1_000_000)
     footer_segments: list[MarginSegment] = Field(max_length=100)
 
     @classmethod
     def from_model_response(cls, value: object) -> "StructuredPageResult":
-        """新模型响应必须显式提供字段；存量数据仍可使用兼容默认值。"""
+        """模型响应必须显式提供页面字段和完整的页眉页脚属性。"""
         required = cls.model_fields.keys() - {"cover_fields"}
         if not isinstance(value, dict) or not required.issubset(value):
             raise ValueError("模型页面结构缺少必填字段")
@@ -340,9 +339,9 @@ class StructuredPageResult(BaseModel):
         if self.page_kind == "content":
             if self.cover_fields:
                 raise ValueError("正文页不能包含封面书目信息")
-        elif self.body_markdown or self.header_segments or self.footer_segments:
+        elif self.body_latex or self.header_segments or self.footer_segments:
             raise ValueError("封面和封底只能包含书目信息")
-        total = len(self.body_markdown) + sum(
+        total = len(self.body_latex) + sum(
             len(segment.text) for segment in self.header_segments + self.footer_segments
         ) + sum(len(field.text) for field in self.cover_fields)
         if total > 1_000_000:

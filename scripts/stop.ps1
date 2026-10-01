@@ -36,10 +36,11 @@ function Test-TrackedProcess {
 try {
     $state = $null
     if (Test-Path -LiteralPath $script:StateFile -PathType Leaf) {
-        try { $state = Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json } catch { $state = $null }
+        try { $state = Get-Content -LiteralPath $script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $state = $null }
     }
     if ($null -ne $state -and -not [string]::Equals([string]$state.root, $script:Root, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "The launcher state belongs to a different project directory; no process was stopped."
+        Write-Host "Ignoring launcher state from a different project directory. Recorded PIDs will not be used; checking this project's listeners."
+        $state = $null
     }
 
     # Stop verified listeners before their recorded launcher parents.

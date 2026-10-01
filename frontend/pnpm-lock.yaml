@@ -11,34 +11,16 @@ importers:
       '@vitejs/plugin-react':
         specifier: latest
         version: 6.1.1(vite@8.3.0)
-      katex:
-        specifier: ^0.16.22
-        version: 0.16.47
       react:
         specifier: latest
         version: 19.3.0
       react-dom:
         specifier: latest
         version: 19.3.0(react@19.3.0)
-      react-markdown:
-        specifier: ^10.1.0
-        version: 10.1.0(@types/react@19.3.0)(react@19.3.0)
-      rehype-katex:
-        specifier: ^7.0.1
-        version: 7.0.1
-      remark-gfm:
-        specifier: ^4.0.1
-        version: 4.0.1
-      remark-math:
-        specifier: ^6.0.0
-        version: 6.0.0
       vite:
         specifier: latest
         version: 8.3.0
     devDependencies:
-      '@types/katex':
-        specifier: ^0.16.7
-        version: 0.16.8
       '@types/react':
         specifier: latest
         version: 19.3.0

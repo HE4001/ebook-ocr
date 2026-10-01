@@ -28,6 +28,15 @@ export type Status = 'uploaded' | 'processing' | 'pausing' | 'paused' | 'ready' 
 
 export type PaperSize = 'a4' | 'a5' | 'a6' | 'b5' | 'b6' | 'trade_6x9'
 
+export type LayoutSettings = {
+  font_family: 'songti' | 'heiti' | 'kaiti'
+  font_size_pt: number | null
+  line_height: number
+  paragraph_indent: number
+  paragraph_spacing_pt: number
+  margin_mm: number | null
+}
+
 export type Book = {
   id: string
   title: string
@@ -43,6 +52,8 @@ export type Book = {
   created_at: string
   usage: Usage
   paper_size: PaperSize
+  content_format: 'latex'
+  layout: LayoutSettings
 }
 
 export type Page = {

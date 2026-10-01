@@ -62,7 +62,7 @@ class SpecialPageAgent:
         )
         return StructuredPageResult(
             page_kind=result.page_kind, cover_fields=result.cover_fields,
-            header_segments=[], body_markdown="", footer_segments=[],
+            header_segments=[], body_latex="", footer_segments=[],
         )
 
 

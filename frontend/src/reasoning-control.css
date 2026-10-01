@@ -8,13 +8,7 @@
 
 .reasoning-legend { padding: 0; font-size: .87rem; font-weight: 650; }
 .reasoning-hint { margin: .35rem 0 .7rem; color: var(--muted); font-size: .76rem; line-height: 1.55; }
-.reasoning-fields { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem 1.15rem; }
-.reasoning-presets { display: flex; flex-wrap: wrap; gap: .35rem; }
-.reasoning-preset { min-height: 44px; padding: .5rem .8rem; border: 1px solid var(--line); border-radius: 6px; background: var(--paper); font-size: .8rem; }
-.reasoning-preset[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: #fff; font-weight: 650; }
-.reasoning-preset[aria-pressed="true"]:hover:not(:disabled) { border-color: #184635; background: #184635; }
-.reasoning-preset:hover:not(:disabled):not([aria-pressed="true"]) { border-color: #9bb5a6; background: #edf3ee; }
-.reasoning-control .reasoning-custom { display: flex; align-items: center; flex: 1 1 215px; gap: .6rem; min-width: 0; max-width: 310px; margin: 0; }
+.reasoning-control .reasoning-custom { display: flex; align-items: center; gap: .6rem; min-width: 0; max-width: 310px; margin: 0; }
 .reasoning-control .reasoning-custom > .reasoning-custom-label { flex: none; margin: 0; color: var(--muted); font-size: .76rem; font-weight: 500; }
 .reasoning-input { width: 100%; min-width: 0; min-height: 44px; padding: .55rem .65rem; font-family: ui-monospace, Consolas, "Microsoft YaHei", monospace; font-size: .8rem; }
 .reasoning-details { margin-top: .7rem; color: var(--muted); font-size: .75rem; line-height: 1.6; }
@@ -22,12 +16,9 @@
 .reasoning-detail-content { margin: .5rem 0 0; padding: .6rem .8rem; border-left: 2px solid #c5d6ca; background: #f2f5ef; }
 .reasoning-detail-line { margin: 0; overflow-wrap: anywhere; }
 .reasoning-detail-line + .reasoning-detail-line { margin-top: .4rem; }
-.reasoning-preset:focus-visible, .reasoning-input:focus-visible, .reasoning-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-.reasoning-preset:disabled, .reasoning-input:disabled { opacity: .55; cursor: not-allowed; }
+.reasoning-input:focus-visible, .reasoning-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.reasoning-input:disabled { opacity: .55; cursor: not-allowed; }
 
 @media (max-width: 520px) {
-  .reasoning-fields { align-items: stretch; }
-  .reasoning-presets { width: 100%; }
-  .reasoning-preset { flex: 1 1 auto; padding-inline: .55rem; }
-  .reasoning-control .reasoning-custom { flex-basis: 100%; max-width: none; }
+  .reasoning-control .reasoning-custom { max-width: none; }
 }

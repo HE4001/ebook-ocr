@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import Book, CoverField, MarginSegment, Page, PageKind, PaperSize, SourceFile, StructuredPageResult, Usage
-from .prompts import legacy_blocks_to_markdown
+from .latex_migration import legacy_blocks_to_markdown, markdown_to_latex
+from .models import Book, CoverField, LayoutSettings, MarginSegment, Page, PageKind, PaperSize, SourceFile, StructuredPageResult, Usage
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -36,6 +36,7 @@ class Storage:
 
     def initialize(self) -> None:
         self.books_root.mkdir(parents=True, exist_ok=True)
+        self._backup_before_latex_migration()
         with self._connect() as connection:
             connection.executescript(
                 """
@@ -50,7 +51,9 @@ class Storage:
                     status TEXT NOT NULL, page_count INTEGER NOT NULL,
                     completed_pages INTEGER NOT NULL DEFAULT 0, error TEXT,
                     created_at TEXT NOT NULL, selection_confirmed INTEGER NOT NULL DEFAULT 0,
-                    paper_size TEXT NOT NULL DEFAULT 'a4'
+                    paper_size TEXT NOT NULL DEFAULT 'a4',
+                    layout_json TEXT NOT NULL DEFAULT '{}',
+                    content_format TEXT NOT NULL DEFAULT 'latex'
                 );
                 CREATE TABLE IF NOT EXISTS pages (
                     book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
@@ -58,6 +61,7 @@ class Storage:
                     image_name TEXT NOT NULL, status TEXT NOT NULL, error TEXT,
                     extraction_text TEXT NOT NULL DEFAULT '', extraction_json TEXT,
                     blocks_json TEXT NOT NULL DEFAULT '[]', text TEXT NOT NULL DEFAULT '',
+                    legacy_markdown TEXT,
                     page_kind TEXT NOT NULL DEFAULT 'content',
                     page_side TEXT NOT NULL DEFAULT 'unknown',
                     cover_fields_json TEXT NOT NULL DEFAULT '[]',
@@ -84,6 +88,7 @@ class Storage:
                 );
                 """
             )
+            connection.execute("BEGIN")
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(pages)")}
             if "usage_unknown" not in columns:
                 connection.execute(
@@ -98,11 +103,8 @@ class Storage:
                     "SELECT book_id, number, blocks_json, extraction_text FROM pages"
                 ).fetchall()
                 for row in rows:
-                    try:
-                        blocks = json.loads(row["blocks_json"] or "[]")
-                        text = legacy_blocks_to_markdown(blocks) if isinstance(blocks, list) else ""
-                    except (ValueError, TypeError, KeyError):
-                        text = ""
+                    blocks = json.loads(row["blocks_json"])
+                    text = legacy_blocks_to_markdown(blocks)
                     if not text:
                         text = row["extraction_text"] or ""
                     connection.execute(
@@ -123,6 +125,8 @@ class Storage:
                 connection.execute("ALTER TABLE pages ADD COLUMN page_side TEXT NOT NULL DEFAULT 'unknown'")
             if "cover_fields_json" not in columns:
                 connection.execute("ALTER TABLE pages ADD COLUMN cover_fields_json TEXT NOT NULL DEFAULT '[]'")
+            if "legacy_markdown" not in columns:
+                connection.execute("ALTER TABLE pages ADD COLUMN legacy_markdown TEXT")
             if "selected" not in columns:
                 connection.execute("ALTER TABLE pages ADD COLUMN selected INTEGER NOT NULL DEFAULT 1")
             if "source_id" not in columns:
@@ -135,6 +139,10 @@ class Storage:
             book_columns = {row["name"] for row in connection.execute("PRAGMA table_info(books)")}
             if "paper_size" not in book_columns:
                 connection.execute("ALTER TABLE books ADD COLUMN paper_size TEXT NOT NULL DEFAULT 'a4'")
+            if "layout_json" not in book_columns:
+                connection.execute("ALTER TABLE books ADD COLUMN layout_json TEXT NOT NULL DEFAULT '{}'")
+            if "content_format" not in book_columns:
+                connection.execute("ALTER TABLE books ADD COLUMN content_format TEXT NOT NULL DEFAULT 'markdown'")
             if "selection_confirmed" not in book_columns:
                 connection.execute(
                     "ALTER TABLE books ADD COLUMN selection_confirmed INTEGER NOT NULL DEFAULT 0"
@@ -178,6 +186,38 @@ class Storage:
                     "INSERT INTO settings(id, value) VALUES (1, ?)",
                     (json.dumps(DEFAULT_SETTINGS, ensure_ascii=False),),
                 )
+            self._migrate_latex_content(connection)
+
+    def _backup_before_latex_migration(self) -> None:
+        backup_path = self.data_root / "app-before-latex.db"
+        if not self.db_path.is_file() or backup_path.exists():
+            return
+        with sqlite3.connect(self.db_path) as source:
+            if not source.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'books'").fetchone():
+                return
+            columns = {row[1] for row in source.execute("PRAGMA table_info(books)")}
+            if "content_format" in columns and not source.execute(
+                "SELECT 1 FROM books WHERE content_format != 'latex' LIMIT 1"
+            ).fetchone():
+                return
+            with sqlite3.connect(backup_path) as destination:
+                source.backup(destination)
+
+    @staticmethod
+    def _migrate_latex_content(connection: sqlite3.Connection) -> None:
+        books = connection.execute("SELECT id FROM books WHERE content_format != 'latex'").fetchall()
+        for book in books:
+            pages = connection.execute(
+                "SELECT number, text, page_kind FROM pages WHERE book_id = ?", (book["id"],)
+            ).fetchall()
+            for page in pages:
+                latex = markdown_to_latex(page["text"]) if page["page_kind"] == "content" else ""
+                connection.execute(
+                    "UPDATE pages SET legacy_markdown = text, text = ?, extraction_json = NULL "
+                    "WHERE book_id = ? AND number = ?",
+                    (latex, book["id"], page["number"]),
+                )
+            connection.execute("UPDATE books SET content_format = 'latex' WHERE id = ?", (book["id"],))
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -263,8 +303,8 @@ class Storage:
         created_at = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO books(id,title,filename,status,page_count,completed_pages,error,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO books(id,title,filename,status,page_count,completed_pages,error,created_at,content_format) "
+                "VALUES (?,?,?,?,?,?,?,?,'latex')",
                 (book_id, title, filename, "uploaded", len(pages), 0, None, created_at),
             )
             connection.executemany(
@@ -285,8 +325,8 @@ class Storage:
     def create_project(self, book_id: str, title: str) -> Book:
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO books(id,title,filename,status,page_count,created_at,upload_confirmed) "
-                "VALUES (?,?,'','uploaded',0,?,0)",
+                "INSERT INTO books(id,title,filename,status,page_count,created_at,upload_confirmed,content_format) "
+                "VALUES (?,?,'','uploaded',0,?,0,'latex')",
                 (book_id, title, datetime.now(timezone.utc).isoformat()),
             )
         book = self.get_book(book_id)
@@ -369,11 +409,16 @@ class Storage:
             row = connection.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
             return self._book(connection, row) if row else None
 
-    def save_layout(self, book_id: str, paper_size: PaperSize) -> None:
+    def save_layout(
+        self, book_id: str, paper_size: PaperSize | None = None, layout: LayoutSettings | None = None,
+    ) -> None:
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE books SET paper_size = ? WHERE id = ?", (paper_size, book_id),
-            )
+            if paper_size is not None:
+                connection.execute("UPDATE books SET paper_size = ? WHERE id = ?", (paper_size, book_id))
+            if layout is not None:
+                connection.execute(
+                    "UPDATE books SET layout_json = ? WHERE id = ?", (layout.model_dump_json(), book_id),
+                )
 
     def delete_book(self, book_id: str) -> bool:
         book_dir = self.books_root / book_id
@@ -513,12 +558,8 @@ class Storage:
             )
 
     def save_page_result(
-        self, book_id: str, number: int, result: StructuredPageResult | str,
+        self, book_id: str, number: int, result: StructuredPageResult,
     ) -> None:
-        if isinstance(result, str):
-            result = StructuredPageResult(
-                header_segments=[], body_markdown=result, footer_segments=[]
-            )
         with self._connect() as connection:
             connection.execute(
                 "UPDATE pages SET status = 'ready', error = NULL, text = ?, "
@@ -526,7 +567,7 @@ class Storage:
                 "header_segments_json = ?, footer_segments_json = ?, extraction_json = NULL "
                 "WHERE book_id = ? AND number = ?",
                 (
-                    result.body_markdown,
+                    result.body_latex,
                     result.page_kind,
                     result.page_side,
                     json.dumps([field.model_dump() for field in result.cover_fields], ensure_ascii=False),
@@ -656,6 +697,7 @@ class Storage:
             (row["id"],),
         ).fetchone())
         data = dict(row)
+        data["layout"] = LayoutSettings.model_validate_json(data.pop("layout_json"))
         data["file_count"] = connection.execute(
             "SELECT COUNT(*) FROM source_files WHERE book_id = ?", (row["id"],),
         ).fetchone()[0]
