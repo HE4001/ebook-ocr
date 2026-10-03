@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .latex_content import is_latex_document
 from .latex_migration import legacy_blocks_to_markdown, markdown_to_latex
+from .layout_contract import LayoutObservation, PageSourceMetadata, RenderStrategy, SourceFidelityLayout
 from .models import Book, CoverField, LayoutSettings, MarginSegment, Page, PageKind, PaperSize, SourceFile, StructuredPageResult, Usage
 
 
@@ -28,6 +30,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
+class RevisionConflict(ValueError):
+    """The caller edited an older content or layout revision."""
+
+
 class Storage:
     def __init__(self, data_root: Path):
         self.data_root = data_root.resolve()
@@ -37,6 +43,7 @@ class Storage:
     def initialize(self) -> None:
         self.books_root.mkdir(parents=True, exist_ok=True)
         self._backup_before_latex_migration()
+        self._backup_before_layout_migration()
         with self._connect() as connection:
             connection.executescript(
                 """
@@ -53,7 +60,8 @@ class Storage:
                     created_at TEXT NOT NULL, selection_confirmed INTEGER NOT NULL DEFAULT 0,
                     paper_size TEXT NOT NULL DEFAULT 'a4',
                     layout_json TEXT NOT NULL DEFAULT '{}',
-                    content_format TEXT NOT NULL DEFAULT 'latex'
+                    content_format TEXT NOT NULL DEFAULT 'latex',
+                    render_strategy TEXT NOT NULL DEFAULT 'source_fidelity'
                 );
                 CREATE TABLE IF NOT EXISTS pages (
                     book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
@@ -67,6 +75,13 @@ class Storage:
                     cover_fields_json TEXT NOT NULL DEFAULT '[]',
                     header_segments_json TEXT NOT NULL DEFAULT '[]',
                     footer_segments_json TEXT NOT NULL DEFAULT '[]',
+                    render_strategy TEXT NOT NULL DEFAULT 'legacy_template',
+                    content_revision INTEGER NOT NULL DEFAULT 0,
+                    layout_revision INTEGER NOT NULL DEFAULT 0,
+                    generated_content_revision INTEGER,
+                    layout_schema_version INTEGER,
+                    layout_source_json TEXT,
+                    source_metadata_json TEXT,
                     usage_unknown INTEGER NOT NULL DEFAULT 0,
                     selected INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (book_id, number)
@@ -85,6 +100,13 @@ class Storage:
                     page_count INTEGER NOT NULL, position INTEGER NOT NULL,
                     directory TEXT NOT NULL, parent_id TEXT,
                     PRIMARY KEY (book_id, id)
+                );
+                CREATE TABLE IF NOT EXISTS page_versions (
+                    book_id TEXT NOT NULL, page_number INTEGER NOT NULL,
+                    content_revision INTEGER NOT NULL, snapshot_json TEXT NOT NULL,
+                    PRIMARY KEY (book_id, page_number, content_revision),
+                    FOREIGN KEY (book_id, page_number) REFERENCES pages(book_id, number)
+                        ON DELETE CASCADE
                 );
                 """
             )
@@ -136,6 +158,18 @@ class Storage:
             if "position" not in columns:
                 connection.execute("ALTER TABLE pages ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
                 connection.execute("UPDATE pages SET position = number")
+            layout_columns = {
+                "render_strategy": "TEXT NOT NULL DEFAULT 'legacy_template'",
+                "content_revision": "INTEGER NOT NULL DEFAULT 0",
+                "layout_revision": "INTEGER NOT NULL DEFAULT 0",
+                "generated_content_revision": "INTEGER",
+                "layout_schema_version": "INTEGER",
+                "layout_source_json": "TEXT",
+                "source_metadata_json": "TEXT",
+            }
+            for name, definition in layout_columns.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE pages ADD COLUMN {name} {definition}")
             book_columns = {row["name"] for row in connection.execute("PRAGMA table_info(books)")}
             if "paper_size" not in book_columns:
                 connection.execute("ALTER TABLE books ADD COLUMN paper_size TEXT NOT NULL DEFAULT 'a4'")
@@ -143,6 +177,8 @@ class Storage:
                 connection.execute("ALTER TABLE books ADD COLUMN layout_json TEXT NOT NULL DEFAULT '{}'")
             if "content_format" not in book_columns:
                 connection.execute("ALTER TABLE books ADD COLUMN content_format TEXT NOT NULL DEFAULT 'markdown'")
+            if "render_strategy" not in book_columns:
+                connection.execute("ALTER TABLE books ADD COLUMN render_strategy TEXT NOT NULL DEFAULT 'legacy_template'")
             if "selection_confirmed" not in book_columns:
                 connection.execute(
                     "ALTER TABLE books ADD COLUMN selection_confirmed INTEGER NOT NULL DEFAULT 0"
@@ -188,11 +224,24 @@ class Storage:
                 )
             self._migrate_latex_content(connection)
 
+    def _backup_before_layout_migration(self) -> None:
+        backup_path = self.data_root / "app-before-layout.db"
+        if not self.db_path.is_file() or backup_path.exists():
+            return
+        with closing(sqlite3.connect(self.db_path)) as source:
+            if not source.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pages'").fetchone():
+                return
+            columns = {row[1] for row in source.execute("PRAGMA table_info(pages)")}
+            if "layout_source_json" in columns:
+                return
+            with closing(sqlite3.connect(backup_path)) as destination:
+                source.backup(destination)
+
     def _backup_before_latex_migration(self) -> None:
         backup_path = self.data_root / "app-before-latex.db"
         if not self.db_path.is_file() or backup_path.exists():
             return
-        with sqlite3.connect(self.db_path) as source:
+        with closing(sqlite3.connect(self.db_path)) as source:
             if not source.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'books'").fetchone():
                 return
             columns = {row[1] for row in source.execute("PRAGMA table_info(books)")}
@@ -200,7 +249,7 @@ class Storage:
                 "SELECT 1 FROM books WHERE content_format != 'latex' LIMIT 1"
             ).fetchone():
                 return
-            with sqlite3.connect(backup_path) as destination:
+            with closing(sqlite3.connect(backup_path)) as destination:
                 source.backup(destination)
 
     @staticmethod
@@ -303,13 +352,13 @@ class Storage:
         created_at = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO books(id,title,filename,status,page_count,completed_pages,error,created_at,content_format) "
-                "VALUES (?,?,?,?,?,?,?,?,'latex')",
+                "INSERT INTO books(id,title,filename,status,page_count,completed_pages,error,created_at,content_format,render_strategy) "
+                "VALUES (?,?,?,?,?,?,?,?,'latex','source_fidelity')",
                 (book_id, title, filename, "uploaded", len(pages), 0, None, created_at),
             )
             connection.executemany(
-                "INSERT INTO pages(book_id,number,width,height,image_name,status,source_page,position) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO pages(book_id,number,width,height,image_name,status,source_page,position,render_strategy) "
+                "VALUES (?,?,?,?,?,?,?,?,'source_fidelity')",
                 [(book_id, number, width, height, name, "uploaded", number, number)
                  for number, width, height, name in pages],
             )
@@ -325,8 +374,8 @@ class Storage:
     def create_project(self, book_id: str, title: str) -> Book:
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO books(id,title,filename,status,page_count,created_at,upload_confirmed,content_format) "
-                "VALUES (?,?,'','uploaded',0,?,0,'latex')",
+                "INSERT INTO books(id,title,filename,status,page_count,created_at,upload_confirmed,content_format,render_strategy) "
+                "VALUES (?,?,'','uploaded',0,?,0,'latex','source_fidelity')",
                 (book_id, title, datetime.now(timezone.utc).isoformat()),
             )
         book = self.get_book(book_id)
@@ -342,6 +391,9 @@ class Storage:
 
     def append_files(self, book_id: str, files: list[dict[str, Any]]) -> None:
         with self._connect() as connection:
+            strategy = connection.execute(
+                "SELECT render_strategy FROM books WHERE id = ?", (book_id,),
+            ).fetchone()["render_strategy"]
             number = connection.execute(
                 "SELECT COALESCE(MAX(number), 0) FROM pages WHERE book_id = ?", (book_id,),
             ).fetchone()[0]
@@ -364,9 +416,9 @@ class Storage:
                     position += 1
                     connection.execute(
                         "INSERT INTO pages(book_id,number,width,height,image_name,status,source_id,"
-                        "source_page,position) VALUES (?,?,?,?,?,'uploaded',?,?,?)",
+                        "source_page,position,render_strategy) VALUES (?,?,?,?,?,'uploaded',?,?,?,?)",
                         (book_id, number, width, height,
-                         f'{source["directory"]}/{image_name}', source["id"], source_page, position),
+                         f'{source["directory"]}/{image_name}', source["id"], source_page, position, strategy),
                     )
             connection.execute(
                 "UPDATE books SET page_count = ?, upload_confirmed = 0, selection_confirmed = 0, "
@@ -411,6 +463,7 @@ class Storage:
 
     def save_layout(
         self, book_id: str, paper_size: PaperSize | None = None, layout: LayoutSettings | None = None,
+        render_strategy: RenderStrategy | None = None,
     ) -> None:
         with self._connect() as connection:
             if paper_size is not None:
@@ -418,6 +471,19 @@ class Storage:
             if layout is not None:
                 connection.execute(
                     "UPDATE books SET layout_json = ? WHERE id = ?", (layout.model_dump_json(), book_id),
+                )
+            if render_strategy is not None:
+                previous = connection.execute(
+                    "SELECT render_strategy FROM books WHERE id = ?", (book_id,),
+                ).fetchone()
+                if previous is None:
+                    raise KeyError("book")
+                connection.execute(
+                    "UPDATE pages SET render_strategy = ? WHERE book_id = ? AND render_strategy = ?",
+                    (render_strategy, book_id, previous["render_strategy"]),
+                )
+                connection.execute(
+                    "UPDATE books SET render_strategy = ? WHERE id = ?", (render_strategy, book_id),
                 )
 
     def delete_book(self, book_id: str) -> bool:
@@ -524,13 +590,19 @@ class Storage:
                 (width, height, image_name, book_id, number),
             )
 
-    def set_page_status(self, book_id: str, number: int, status: str) -> None:
+    def set_page_status(
+        self, book_id: str, number: int, status: str, *,
+        expected_content_revision: int | None = None,
+    ) -> bool:
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE pages SET status = ?, error = NULL WHERE book_id = ? AND number = ?",
-                (status, book_id, number),
+            result = connection.execute(
+                "UPDATE pages SET status = ?, error = NULL WHERE book_id = ? AND number = ? "
+                "AND (? IS NULL OR content_revision = ?)",
+                (status, book_id, number, expected_content_revision, expected_content_revision),
             )
-        self.refresh_book(book_id, processing=True)
+        if result.rowcount:
+            self.refresh_book(book_id, processing=True)
+        return bool(result.rowcount)
 
     def begin_attempt(self, book_id: str, number: int) -> int:
         with self._connect() as connection:
@@ -559,54 +631,133 @@ class Storage:
 
     def save_page_result(
         self, book_id: str, number: int, result: StructuredPageResult,
-    ) -> None:
+        *, expected_content_revision: int | None = None,
+        source_metadata: PageSourceMetadata | None = None,
+        generated_text: str | None = None,
+        generator_version: str | None = None,
+        render_strategy: RenderStrategy | None = None,
+        layout_source: SourceFidelityLayout | None = None,
+    ) -> bool:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            page = connection.execute(
+                "SELECT * FROM pages WHERE book_id = ? AND number = ?", (book_id, number),
+            ).fetchone()
+            if page is None or (
+                expected_content_revision is not None
+                and expected_content_revision != page["content_revision"]
+            ):
+                return False
+            content_revision = page["content_revision"] + 1
+            layout_revision = page["layout_revision"]
+            text = result.body_latex
+            strategy = render_strategy or page["render_strategy"]
+            generated_revision = None
+            layout_json = page["layout_source_json"]
+            schema_version = page["layout_schema_version"]
+            metadata_json = page["source_metadata_json"]
+            if source_metadata is not None:
+                self._check_source_identity(source_metadata, page)
+                metadata_json = source_metadata.model_dump_json()
+            if is_latex_document(text):
+                strategy = "custom_latex"
+            if result.layout is not None:
+                if source_metadata is None:
+                    raise ValueError("保存布局必须提供程序来源元数据")
+                if layout_source is not None and layout_source.model_dump(
+                    include=set(LayoutObservation.model_fields),
+                ) != result.layout.model_dump():
+                    raise ValueError("生成布局与识别原行内容不一致")
+                layout_revision += 1
+                if strategy == "source_fidelity" and generated_text is not None:
+                    text = generated_text
+                    generated_revision = content_revision
+                layout = layout_source or SourceFidelityLayout(
+                    **result.layout.model_dump(), source=source_metadata,
+                    content_revision=content_revision, layout_revision=layout_revision,
+                )
+                layout = layout.model_copy(update={
+                    "source": source_metadata,
+                    "content_revision": content_revision,
+                    "layout_revision": layout_revision,
+                    "generated_content_revision": generated_revision,
+                    "generator_version": generator_version,
+                })
+                layout_json = layout.model_dump_json()
+                schema_version = layout.schema_version
+            elif layout_source is not None:
+                raise ValueError("没有观察布局时不能保存布局来源")
+            self._archive_page(connection, page)
             connection.execute(
                 "UPDATE pages SET status = 'ready', error = NULL, text = ?, "
                 "page_kind = ?, page_side = ?, cover_fields_json = ?, "
-                "header_segments_json = ?, footer_segments_json = ?, extraction_json = NULL "
+                "header_segments_json = ?, footer_segments_json = ?, extraction_json = ?, "
+                "render_strategy = ?, content_revision = ?, layout_revision = ?, "
+                "generated_content_revision = ?, layout_schema_version = ?, "
+                "layout_source_json = ?, source_metadata_json = ? "
                 "WHERE book_id = ? AND number = ?",
                 (
-                    result.body_latex,
+                    text,
                     result.page_kind,
                     result.page_side,
                     json.dumps([field.model_dump() for field in result.cover_fields], ensure_ascii=False),
                     json.dumps([segment.model_dump() for segment in result.header_segments], ensure_ascii=False),
                     json.dumps([segment.model_dump() for segment in result.footer_segments], ensure_ascii=False),
+                    result.model_dump_json(), strategy, content_revision, layout_revision,
+                    generated_revision, schema_version, layout_json, metadata_json,
                     book_id, number,
                 ),
             )
         self.refresh_book(book_id, processing=True)
+        return True
 
-    def fail_page(self, book_id: str, number: int, message: str) -> None:
+    def fail_page(
+        self, book_id: str, number: int, message: str, *,
+        expected_content_revision: int | None = None,
+    ) -> bool:
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE pages SET status = 'failed', error = ? WHERE book_id = ? AND number = ?",
-                (message[:1000], book_id, number),
+            result = connection.execute(
+                "UPDATE pages SET status = 'failed', error = ? WHERE book_id = ? AND number = ? "
+                "AND (? IS NULL OR content_revision = ?)",
+                (message[:1000], book_id, number, expected_content_revision, expected_content_revision),
             )
-        self.refresh_book(book_id, processing=True)
+        if result.rowcount:
+            self.refresh_book(book_id, processing=True)
+        return bool(result.rowcount)
 
-    def interrupt_page(self, book_id: str, number: int) -> None:
+    def interrupt_page(
+        self, book_id: str, number: int, *, expected_content_revision: int | None = None,
+    ) -> bool:
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE pages SET status = 'interrupted', error = ? WHERE book_id = ? AND number = ?",
-                ("处理被中断，可重新处理", book_id, number),
+            result = connection.execute(
+                "UPDATE pages SET status = 'interrupted', error = ? WHERE book_id = ? AND number = ? "
+                "AND (? IS NULL OR content_revision = ?)",
+                ("处理被中断，可重新处理", book_id, number,
+                 expected_content_revision, expected_content_revision),
             )
+        return bool(result.rowcount)
 
     def save_manual_text(
         self, book_id: str, number: int, text: str, *,
         page_kind: PageKind | None = None, cover_fields: list[CoverField] | None = None,
         processing: bool = False,
-    ) -> None:
+        expected_content_revision: int | None = None,
+        expected_layout_revision: int | None = None,
+        render_strategy: RenderStrategy | None = None,
+    ) -> Page:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             page = connection.execute(
-                "SELECT page_kind, page_side, cover_fields_json, header_segments_json, footer_segments_json FROM pages "
+                "SELECT * FROM pages "
                 "WHERE book_id = ? AND number = ? AND selected = 1",
                 (book_id, number),
             ).fetchone()
             if page is None:
                 raise KeyError("page")
+            self._check_revisions(page, expected_content_revision, expected_layout_revision)
             kind = page_kind if page_kind is not None else page["page_kind"]
+            strategy = render_strategy or page["render_strategy"]
+            detached = text != page["text"] or kind != page["page_kind"]
             if kind == "content":
                 if cover_fields:
                     raise ValueError("正文页不能包含封面书目信息")
@@ -623,13 +774,118 @@ class Storage:
                 )
                 header_json = footer_json = "[]"
                 page_side = "unknown"
+            if kind == "content" and detached:
+                if render_strategy == "source_fidelity":
+                    raise ValueError("自由源码已修改，请通过布局校准重新生成原书还原源码")
+                strategy = "custom_latex"
+            content_revision = page["content_revision"] + 1
+            generated_revision = None if detached else page["generated_content_revision"]
+            layout_json = page["layout_source_json"]
+            layout = (SourceFidelityLayout.model_validate_json(layout_json)
+                      if not detached and layout_json is not None else None)
+            if strategy == "source_fidelity" and layout is not None:
+                if layout.content_revision != page["content_revision"]:
+                    raise ValueError("布局与当前源码已脱离，请先保存布局校准")
+            if generated_revision is not None:
+                generated_revision = content_revision
+            if layout is not None and layout.content_revision == page["content_revision"]:
+                layout = layout.model_copy(update={
+                    "content_revision": content_revision,
+                    "generated_content_revision": generated_revision,
+                })
+                layout_json = layout.model_dump_json()
+            self._archive_page(connection, page)
             connection.execute(
                 "UPDATE pages SET status = 'ready', error = NULL, text = ?, page_kind = ?, page_side = ?, "
-                "cover_fields_json = ?, header_segments_json = ?, footer_segments_json = ? "
+                "cover_fields_json = ?, header_segments_json = ?, footer_segments_json = ?, "
+                "render_strategy = ?, content_revision = ?, generated_content_revision = ?, layout_source_json = ? "
                 "WHERE book_id = ? AND number = ?",
-                (text, kind, page_side, fields_json, header_json, footer_json, book_id, number),
+                (text, kind, page_side, fields_json, header_json, footer_json, strategy,
+                 content_revision, generated_revision, layout_json, book_id, number),
             )
+            saved = self._saved_page(connection, book_id, number)
         self.refresh_book(book_id, processing=processing)
+        return saved
+
+    def save_page_layout(
+        self, book_id: str, number: int, layout: SourceFidelityLayout, generated_text: str,
+        expected_content_revision: int, expected_layout_revision: int,
+    ) -> Page:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            page = connection.execute(
+                "SELECT * FROM pages WHERE book_id = ? AND number = ? AND selected = 1",
+                (book_id, number),
+            ).fetchone()
+            if page is None:
+                raise KeyError("page")
+            self._check_revisions(page, expected_content_revision, expected_layout_revision)
+            self._check_source_identity(layout.source, page)
+            if page["page_kind"] != "content":
+                raise ValueError("封面和封底不能保存正文布局")
+            content_revision = page["content_revision"] + 1
+            layout_revision = page["layout_revision"] + 1
+            layout = layout.model_copy(update={
+                "content_revision": content_revision,
+                "layout_revision": layout_revision,
+                "generated_content_revision": content_revision,
+            })
+            self._archive_page(connection, page)
+            connection.execute(
+                "UPDATE pages SET status = 'ready', error = NULL, text = ?, render_strategy = 'source_fidelity', "
+                "content_revision = ?, layout_revision = ?, generated_content_revision = ?, "
+                "layout_schema_version = ?, layout_source_json = ?, source_metadata_json = ? "
+                "WHERE book_id = ? AND number = ?",
+                (generated_text, content_revision, layout_revision, content_revision,
+                 layout.schema_version, layout.model_dump_json(), layout.source.model_dump_json(), book_id, number),
+            )
+            saved = self._saved_page(connection, book_id, number)
+            processing = connection.execute(
+                "SELECT status FROM books WHERE id = ?", (book_id,),
+            ).fetchone()["status"] in {"processing", "pausing"}
+        self.refresh_book(book_id, processing=processing)
+        return saved
+
+    @staticmethod
+    def _check_revisions(
+        page: sqlite3.Row, content_revision: int | None, layout_revision: int | None,
+    ) -> None:
+        if (content_revision is not None and content_revision != page["content_revision"]) or (
+            layout_revision is not None and layout_revision != page["layout_revision"]
+        ):
+            raise RevisionConflict("页面已更新，请加载最新版本后再保存")
+
+    @staticmethod
+    def _check_source_identity(source: PageSourceMetadata, page: sqlite3.Row) -> None:
+        if (source.book_id, source.page_number, source.source_id, source.source_page) != (
+            page["book_id"], page["number"], page["source_id"], page["source_page"],
+        ):
+            raise ValueError("布局来源与项目页面不一致")
+
+    @staticmethod
+    def _archive_page(connection: sqlite3.Connection, page: sqlite3.Row) -> None:
+        connection.execute(
+            "INSERT INTO page_versions(book_id,page_number,content_revision,snapshot_json) VALUES (?,?,?,?)",
+            (page["book_id"], page["number"], page["content_revision"],
+             json.dumps(dict(page), ensure_ascii=False)),
+        )
+
+    @classmethod
+    def _saved_page(cls, connection: sqlite3.Connection, book_id: str, number: int) -> Page:
+        row = connection.execute(
+            "SELECT pages.*, source_files.filename AS source_filename FROM pages JOIN source_files "
+            "ON pages.book_id = source_files.book_id AND pages.source_id = source_files.id "
+            "WHERE pages.book_id = ? AND number = ?", (book_id, number),
+        ).fetchone()
+        return cls._page(connection, row)
+
+    def get_page_versions(self, book_id: str, number: int) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT snapshot_json FROM page_versions WHERE book_id = ? AND page_number = ? "
+                "ORDER BY content_revision", (book_id, number),
+            ).fetchall()
+        return [json.loads(row["snapshot_json"]) for row in rows]
 
     def refresh_book(self, book_id: str, processing: bool) -> None:
         with self._connect() as connection:
@@ -721,6 +977,14 @@ class Storage:
             number=row["number"], status=status, error=row["error"],
             source_id=row["source_id"], source_filename=row["source_filename"], source_page=row["source_page"],
             text=row["text"],
+            render_strategy=row["render_strategy"],
+            content_revision=row["content_revision"],
+            layout_revision=row["layout_revision"],
+            generated_content_revision=row["generated_content_revision"],
+            layout_source=(SourceFidelityLayout.model_validate_json(row["layout_source_json"])
+                           if row["layout_source_json"] is not None else None),
+            source_metadata=(PageSourceMetadata.model_validate_json(row["source_metadata_json"])
+                             if row["source_metadata_json"] is not None else None),
             page_kind=row["page_kind"],
             page_side=row["page_side"],
             cover_fields=[CoverField.model_validate(value) for value in json.loads(row["cover_fields_json"])],

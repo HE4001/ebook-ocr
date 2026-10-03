@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import { PdfPreview } from './PdfPreview'
-import { downloadText, downloadUrl, safeFilename } from './downloads'
+import { downloadBlob, downloadText, downloadUrl, safeFilename } from './downloads'
 import ProjectOrganizer from './ProjectOrganizer'
 import { PageEditor } from './PageEditor'
+import { LayoutCalibration } from './LayoutCalibration'
+import { SourceComparison } from './SourceComparison'
+import type { ProofingFocus } from './SourceComparison'
+import { calibrationFromPage } from './layoutDraft'
 import { LayoutSettingsForm } from './LayoutSettingsForm'
 import { ReasoningControl } from './ReasoningControl'
 import { bindingPageSide, PAPER_SIZES } from './paper'
-import type { ApiProtocol, Book, BookDetail, LayoutSettings, Notice, Page, PageDraft, PaperSize, Settings, Usage } from './types'
+import type { ApiProtocol, BBox, Book, BookDetail, LayoutCalibrationUpdate, LayoutSettings, Notice, Page, PageDraft, PaperSize, PdfCompileResult, RenderDiagnostic, RenderStrategy, Settings, Usage } from './types'
 
 const STATUS_LABEL: Record<string, string> = {
   uploaded: '待处理', processing: '处理中', pausing: '正在暂停', paused: '已暂停', ready: '已完成',
@@ -326,7 +330,9 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
 }
 
 type WorkspaceView = 'upload' | 'organize' | 'workspace' | 'preview' | 'settings'
-type PdfResult = { key: string; url: string | null; error: string | null; warnings: string[] }
+type PdfResult = { key: string; result: PdfCompileResult | null; error: string | null; origin: 'saved' | 'source_draft' | 'layout_draft' }
+
+const STRATEGY_LABEL: Record<RenderStrategy, string> = { source_fidelity: '原书还原', legacy_template: '现有模板', custom_latex: '自定义源码' }
 
 function projectView(book: Book): WorkspaceView {
   if (!book.upload_confirmed) return 'upload'
@@ -344,12 +350,16 @@ function sourceLabel(page: Page): string {
 }
 
 function draftFromPage(page: Page | null): PageDraft {
-  return page ? { text: page.text, page_kind: page.page_kind, cover_fields: page.cover_fields }
+  return page ? { text: page.text, page_kind: page.page_kind, cover_fields: page.cover_fields,
+    render_strategy: page.render_strategy, expected_content_revision: page.content_revision, expected_layout_revision: page.layout_revision }
     : { text: '', page_kind: 'content', cover_fields: [] }
 }
 
 function outputDraft(draft: PageDraft): PageDraft {
   return {
+    render_strategy: draft.render_strategy,
+    expected_content_revision: draft.expected_content_revision,
+    expected_layout_revision: draft.expected_layout_revision,
     text: draft.page_kind === 'content' ? draft.text : '',
     page_kind: draft.page_kind,
     cover_fields: draft.page_kind === 'content' ? [] : draft.cover_fields.filter((field) => field.text.trim()),
@@ -359,6 +369,12 @@ function outputDraft(draft: PageDraft): PageDraft {
 function pagePrintContent(page: Page) {
   return {
     number: page.number,
+    source_id: page.source_id,
+    source_page: page.source_page,
+    source_filename: page.source_filename,
+    layout_source: page.layout_source,
+    source_metadata: page.source_metadata,
+    generated_content_revision: page.generated_content_revision,
     ...outputDraft(draftFromPage(page)),
     page_side: page.page_side,
     header_segments: page.header_segments,
@@ -392,6 +408,11 @@ export default function App() {
   const [selectedPageNumber, setSelectedPageNumber] = useState(1)
   const [pageDraft, setPageDraft] = useState<PageDraft>(() => draftFromPage(null))
   const [dirty, setDirty] = useState(false)
+  const [calibrationDraft, setCalibrationDraft] = useState<LayoutCalibrationUpdate | null>(null)
+  const [calibrationDirty, setCalibrationDirty] = useState(false)
+  const [calibrationEditorRevision, setCalibrationEditorRevision] = useState(0)
+  const [pageEditMode, setPageEditMode] = useState<'layout' | 'source'>('layout')
+  const [proofingFocus, setProofingFocus] = useState<ProofingFocus | null>(null)
   const [organizerDirty, setOrganizerDirty] = useState(false)
   const [organizerBusy, setOrganizerBusy] = useState(false)
   const [notice, setNotice] = useState<Notice>(null)
@@ -413,6 +434,9 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null)
   const selectedBookIdRef = useRef<string | null>(null)
   const detailRequestRef = useRef(0)
+  const previewRequestRef = useRef(0)
+  const selectedPageRef = useRef(selectedPageNumber)
+  selectedPageRef.current = selectedPageNumber
   const showNotice = useCallback((value: Notice) => setNotice(value), [])
 
   useEffect(() => {
@@ -422,14 +446,22 @@ export default function App() {
   }, [notice])
 
   useEffect(() => {
-    if (!dirty && !organizerDirty && !layoutDirty) return
+    if (!dirty && !calibrationDirty && !organizerDirty && !layoutDirty) return
     const protectDraft = (event: BeforeUnloadEvent) => {
       event.preventDefault()
       event.returnValue = ''
     }
     window.addEventListener('beforeunload', protectDraft)
     return () => window.removeEventListener('beforeunload', protectDraft)
-  }, [dirty, organizerDirty, layoutDirty])
+  }, [dirty, calibrationDirty, organizerDirty, layoutDirty])
+
+  const invalidatePdfs = useCallback((scope: 'all' | 'page' = 'all', clearFocus = true) => {
+    previewRequestRef.current += 1
+    if (scope === 'all') setBookPdf(null)
+    setPagePdf(null)
+    setCompiling(null)
+    if (clearFocus) setProofingFocus(null)
+  }, [])
 
   const loadBooks = useCallback(async () => {
     try {
@@ -471,6 +503,8 @@ export default function App() {
   useEffect(() => { void loadBooks() }, [loadBooks])
   useEffect(() => {
     setDirty(false)
+    setCalibrationDirty(false)
+    setCalibrationDraft(null)
     setOrganizerDirty(false)
     setLayoutDirty(false)
     setUploadError('')
@@ -489,7 +523,7 @@ export default function App() {
   const sourcePageHasResult = sourcePage && (sourcePage.status === 'ready' || Boolean(sourcePage.text || sourcePage.cover_fields.length || sourcePage.header_segments.length || sourcePage.footer_segments.length))
   const pendingPages = detail?.pages.filter((page) => page.status !== 'ready') ?? []
   const pagesToProcess = pendingPages.map((page) => page.number)
-  const bindingPageCount = detail?.pages.filter((page) => bindingPageSide(page) !== 'unknown').length ?? 0
+  const bindingPageCount = detail?.pages.filter((page) => bindingPageSide(page, detail?.book.layout.source_fidelity_paper) !== 'unknown').length ?? 0
   const effectivePrintVersion = printVersion && bindingPageCount > 0
   const isRunning = detail?.book.status === 'processing' || detail?.book.status === 'pausing'
   const busy = actionBusy || saving || layoutSaving || uploading || deleting || organizerBusy || compiling !== null
@@ -500,27 +534,38 @@ export default function App() {
     || detail.pages.some((page) => typeof page.text !== 'string' || !page.page_kind || !Array.isArray(page.cover_fields) || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage)))
 
   useEffect(() => { if (!dirty) setPageDraft(draftFromPage(sourcePage)) }, [sourcePage, dirty])
+  useEffect(() => { if (!calibrationDirty) setCalibrationDraft(sourcePage ? calibrationFromPage(sourcePage) : null) }, [sourcePage, calibrationDirty])
+  useEffect(() => {
+    setPageEditMode(sourcePage?.render_strategy === 'source_fidelity' ? 'layout' : 'source')
+  }, [selectedBookId, sourcePage?.number, sourcePage?.render_strategy])
 
   const bookPdfKey = useMemo(() => JSON.stringify(detail && {
     id: detail.book.id, title: detail.book.title, paper_size: detail.book.paper_size,
-    layout: detail.book.layout, print_version: effectivePrintVersion,
+    layout: detail.book.layout, render_strategy: detail.book.render_strategy, print_version: effectivePrintVersion,
     pages: detail.pages.map(pagePrintContent),
   }), [detail, effectivePrintVersion])
   const pagePdfKey = useMemo(() => JSON.stringify(detail && sourcePage && {
     id: detail.book.id, paper_size: detail.book.paper_size, layout: detail.book.layout,
     page_order: detail.pages.findIndex((page) => page.number === sourcePage.number) + 1,
-    print_version: effectivePrintVersion, page: { ...pagePrintContent(sourcePage), ...outputDraft(pageDraft) },
-  }), [detail, sourcePage, pageDraft, effectivePrintVersion])
-  useEffect(() => { setBookPdf(null) }, [bookPdfKey])
-  useEffect(() => { setPagePdf(null) }, [pagePdfKey])
-  useEffect(() => { if (layoutDirty) setBookPdf(null) }, [layoutDirty])
+    print_version: effectivePrintVersion, mode: pageEditMode, calibration: calibrationDraft,
+    page: { ...pagePrintContent(sourcePage), ...outputDraft(pageDraft) },
+  }), [detail, sourcePage, pageDraft, calibrationDraft, pageEditMode, effectivePrintVersion])
+  const previewKeysRef = useRef({ book: bookPdfKey, page: pagePdfKey })
+  previewKeysRef.current = { book: bookPdfKey, page: pagePdfKey }
+  useEffect(() => { invalidatePdfs('all', false) }, [bookPdfKey, layoutDirty, invalidatePdfs])
+  useEffect(() => { invalidatePdfs('page', false) }, [pagePdfKey, invalidatePdfs])
   const currentBookPdf = bookPdf?.key === bookPdfKey ? bookPdf : null
   const currentPagePdf = pagePdf?.key === pagePdfKey ? pagePdf : null
+  const comparisonResult = currentPagePdf?.result ?? currentBookPdf?.result ?? null
+  const currentProofingFocus = sourcePage && proofingFocus && proofingFocus.book_id === detail?.book.id
+    && proofingFocus.page_number === sourcePage.number && proofingFocus.content_revision === sourcePage.content_revision
+    && proofingFocus.layout_revision === sourcePage.layout_revision ? proofingFocus : null
 
   const leaveDrafts = () => {
     const message = organizerDirty ? '页面编排尚未确认，确定离开并放弃这些调整吗？' : layoutDirty ? '整书排版设置尚未保存，确定离开并放弃吗？' : '当前页有未保存修改，确定离开并放弃吗？'
-    if ((dirty || organizerDirty || layoutDirty) && !window.confirm(message)) return false
+    if ((dirty || calibrationDirty || organizerDirty || layoutDirty) && !window.confirm(message)) return false
     setDirty(false)
+    setCalibrationDirty(false)
     setOrganizerDirty(false)
     setLayoutDirty(false)
     return true
@@ -536,8 +581,12 @@ export default function App() {
   const choosePage = (page: Page) => {
     if (busy || page.number === selectedPageNumber) return
     if (!leaveDrafts()) return
+    invalidatePdfs('page')
+    selectedPageRef.current = page.number
     setSelectedPageNumber(page.number)
     setPageDraft(draftFromPage(page))
+    setCalibrationDraft(calibrationFromPage(page))
+    setPageEditMode(page.render_strategy === 'source_fidelity' ? 'layout' : 'source')
   }
 
   const chooseBook = (id: string) => {
@@ -547,6 +596,7 @@ export default function App() {
       return
     }
     if (!leaveDrafts()) return
+    invalidatePdfs()
     setNewProject(false)
     selectedBookIdRef.current = id
     setSelectedBookId(id)
@@ -616,6 +666,7 @@ export default function App() {
   }
 
   const confirmArrangement = (value: BookDetail) => {
+    invalidatePdfs()
     applyDetail(value)
     setOrganizerDirty(false)
     setView('workspace')
@@ -626,7 +677,7 @@ export default function App() {
     if (!detail?.book.selection_confirmed || processLocked || pages.length === 0) return
     const bookId = detail.book.id
     const targets = detail.pages.filter((page) => pages.includes(page.number))
-    const discardDraft = dirty && pages.includes(selectedPageNumber)
+    const discardDraft = (dirty || calibrationDirty) && pages.includes(selectedPageNumber)
     if ((targets.some((page) => page.status === 'ready' || Boolean(page.text || page.cover_fields.length || page.header_segments.length || page.footer_segments.length)) || discardDraft)
       && !window.confirm(`这次处理会产生新的模型用量，成功后会覆盖本次处理页面已有的识别或校对文本。${discardDraft ? '当前未保存修改也会被放弃。' : ''}确定继续吗？`)) return
     setActionBusy(true)
@@ -634,8 +685,11 @@ export default function App() {
       const result = await api.processBook(bookId, pages)
       if (result.started && discardDraft) {
         setDirty(false)
+        setCalibrationDirty(false)
         setPageDraft(draftFromPage(sourcePage))
+        setCalibrationDraft(sourcePage ? calibrationFromPage(sourcePage) : null)
       }
+      if (result.started) invalidatePdfs()
       setNotice({ kind: 'success', text: result.started ? '处理已开始，页面完成后自动更新，最终顺序保持不变。' : '当前没有需要处理的页面。' })
       await loadDetail(bookId, true)
     } catch (error) {
@@ -686,12 +740,12 @@ export default function App() {
 
   const savePaperSize = async (paperSize: PaperSize) => {
     if (!detail || layoutSaving || paperSize === detail.book.paper_size) return
+    invalidatePdfs()
     setLayoutSaving(true)
     detailRequestRef.current += 1
     try {
       const saved = await api.saveBookLayout(detail.book.id, { paper_size: paperSize })
-      setDetail((current) => current?.book.id === saved.id ? { ...current, book: saved } : current)
-      setBooks((current) => current.map((book) => book.id === saved.id ? saved : book))
+      applySavedLayout(saved)
       await loadDetail(saved.id, true)
       setNotice({ kind: 'success', text: `已将整本书纸张设为 ${PAPER_SIZES[saved.paper_size].label}。` })
     } catch (error) {
@@ -701,13 +755,21 @@ export default function App() {
     }
   }
 
-  const saveLayoutSettings = async (layout: LayoutSettings): Promise<boolean> => {
+  const applySavedLayout = (saved: Book) => {
+    // Page statuses and the book summary advance together after getBook succeeds.
+    const settings = { paper_size: saved.paper_size, layout: saved.layout, render_strategy: saved.render_strategy }
+    setDetail((current) => current?.book.id === saved.id ? { ...current, book: { ...current.book, ...settings } } : current)
+    setBooks((current) => current.map((book) => book.id === saved.id ? { ...book, ...settings } : book))
+  }
+
+  const saveLayoutSettings = async (layout: LayoutSettings, renderStrategy: RenderStrategy): Promise<boolean> => {
+    invalidatePdfs()
     setLayoutSaving(true)
     detailRequestRef.current += 1
     try {
-      const saved = await api.saveBookLayout(detail!.book.id, { layout })
-      setDetail((current) => current ? { ...current, book: saved } : current)
-      setBooks((current) => current.map((book) => book.id === saved.id ? saved : book))
+      const saved = await api.saveBookLayout(detail!.book.id, { layout, render_strategy: renderStrategy })
+      applySavedLayout(saved)
+      await loadDetail(saved.id, true)
       setNotice({ kind: 'success', text: '整书排版设置已保存，请更新 PDF。' })
       return true
     } catch (error) {
@@ -720,13 +782,20 @@ export default function App() {
 
   const savePage = async () => {
     if (!detail || !sourcePage || editLocked) return
+    const bookId = detail.book.id
+    const pageNumber = sourcePage.number
+    invalidatePdfs()
+    detailRequestRef.current += 1
     setSaving(true)
     try {
-      const saved = await api.savePage(detail.book.id, sourcePage.number, outputDraft(pageDraft))
-      setDetail((current) => current ? { ...current, pages: current.pages.map((page) => page.number === saved.number ? saved : page) } : current)
+      const saved = await api.savePage(bookId, pageNumber, outputDraft(pageDraft))
+      if (selectedBookIdRef.current !== bookId || selectedPageRef.current !== pageNumber) return
+      setDetail((current) => current?.book.id === bookId ? { ...current, pages: current.pages.map((page) => page.number === saved.number ? saved : page) } : current)
       setPageDraft(draftFromPage(saved))
+      setCalibrationDraft(calibrationFromPage(saved))
       setDirty(false)
-      await loadDetail(detail.book.id, true)
+      setCalibrationDirty(false)
+      await loadDetail(bookId, true)
       setNotice({ kind: 'success', text: `${sourceLabel(saved)} 已保存。` })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
@@ -735,31 +804,120 @@ export default function App() {
     }
   }
 
+  const saveCalibration = async () => {
+    if (!detail || !sourcePage || !calibrationDraft || editLocked) return
+    const bookId = detail.book.id
+    const pageNumber = sourcePage.number
+    invalidatePdfs()
+    detailRequestRef.current += 1
+    setSaving(true)
+    try {
+      const saved = await api.savePageLayout(bookId, pageNumber, calibrationDraft)
+      if (selectedBookIdRef.current !== bookId || selectedPageRef.current !== pageNumber) return
+      setDetail((current) => current?.book.id === bookId ? { ...current, pages: current.pages.map((page) => page.number === saved.number ? saved : page) } : current)
+      setPageDraft(draftFromPage(saved))
+      setCalibrationDraft(calibrationFromPage(saved))
+      setCalibrationDirty(false)
+      setDirty(false)
+      await loadDetail(bookId, true)
+      setNotice({ kind: 'success', text: `${sourceLabel(saved)} 校准已保存，源码已重新生成。` })
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorText(error) })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const changePageDraft = (draft: PageDraft) => {
+    invalidatePdfs()
+    setPageDraft({ ...draft, render_strategy: draft.text !== sourcePage!.text ? 'custom_latex' : draft.render_strategy })
+    setDirty(true)
+  }
+
+  const changeCalibrationDraft = (draft: LayoutCalibrationUpdate) => {
+    invalidatePdfs()
+    setCalibrationDraft(draft)
+    setCalibrationDirty(true)
+  }
+
+  const switchPageEditor = (next: 'layout' | 'source') => {
+    if (next === pageEditMode || editLocked) return
+    if ((dirty || calibrationDirty) && !window.confirm('切换编辑方式会放弃当前未保存草稿，确定继续吗？')) return
+    invalidatePdfs()
+    setDirty(false)
+    setCalibrationDirty(false)
+    setPageDraft(draftFromPage(sourcePage))
+    setCalibrationDraft(sourcePage ? calibrationFromPage(sourcePage) : null)
+    setPageEditMode(next)
+  }
+
+  const locateRegion = (bbox: BBox | null, lineId?: string) => {
+    if (!detail || !sourcePage) return
+    setProofingFocus({ token: Date.now(), book_id: detail.book.id, page_number: sourcePage.number,
+      content_revision: sourcePage.content_revision, layout_revision: sourcePage.layout_revision,
+      source_bbox: bbox, output_bbox_bp: null, output_page: null, line_id: lineId ?? null })
+  }
+
+  const locateDiagnostic = (diagnostic: RenderDiagnostic) => {
+    if (!detail || (diagnostic.book_id != null && diagnostic.book_id !== detail.book.id)) return
+    const target = detail.pages.find((page) => page.number === diagnostic.page_number)
+    const currentDraftDiagnostic = currentPagePdf?.result?.diagnostics.includes(diagnostic) && target?.number === selectedPageNumber
+    if (!target || (!currentDraftDiagnostic && (target.content_revision !== diagnostic.content_revision || target.layout_revision !== diagnostic.layout_revision))) return
+    if (target.number !== selectedPageNumber) {
+      if (!leaveDrafts()) return
+      invalidatePdfs('page')
+      selectedPageRef.current = target.number
+      setSelectedPageNumber(target.number)
+      setPageDraft(draftFromPage(target))
+      setCalibrationDraft(calibrationFromPage(target))
+      setPageEditMode(target.render_strategy === 'source_fidelity' ? 'layout' : 'source')
+    }
+    setView('workspace')
+    setProofingFocus({ token: Date.now(), book_id: detail.book.id, page_number: target.number,
+      content_revision: target.content_revision, layout_revision: target.layout_revision,
+      source_bbox: diagnostic.source_bbox, output_bbox_bp: diagnostic.output_bbox_bp,
+      output_page: diagnostic.output_page_start, line_id: diagnostic.line_id })
+  }
+
   const compileBook = async () => {
+    if (!detail || processLocked || layoutDirty) return
     const key = bookPdfKey
+    const bookId = detail.book.id
+    const requestId = ++previewRequestRef.current
     setCompiling('book')
     setBookPdf(null)
     try {
-      const result = await api.compileBook(detail!.book.id, effectivePrintVersion)
-      setBookPdf({ key, url: result.pdf_url, error: null, warnings: result.warnings })
+      const result = await api.compileBook(bookId, effectivePrintVersion)
+      if (requestId === previewRequestRef.current && bookId === selectedBookIdRef.current && key === previewKeysRef.current.book)
+        setBookPdf({ key, result, error: null, origin: 'saved' })
     } catch (error) {
-      setBookPdf({ key, url: null, error: errorText(error), warnings: [] })
+      if (requestId === previewRequestRef.current && bookId === selectedBookIdRef.current && key === previewKeysRef.current.book)
+        setBookPdf({ key, result: null, error: errorText(error), origin: 'saved' })
     } finally {
-      setCompiling(null)
+      if (requestId === previewRequestRef.current) setCompiling(null)
     }
   }
 
   const compilePage = async () => {
+    if (!detail || !sourcePage || editLocked || layoutDirty || (pageEditMode === 'layout' && !calibrationDraft)) return
     const key = pagePdfKey
+    const bookId = detail.book.id
+    const pageNumber = sourcePage.number
+    const requestId = ++previewRequestRef.current
+    const origin = pageEditMode === 'layout' ? 'layout_draft' : 'source_draft'
     setCompiling('page')
     setPagePdf(null)
     try {
-      const result = await api.compilePage(detail!.book.id, sourcePage!.number, outputDraft(pageDraft), effectivePrintVersion)
-      setPagePdf({ key, url: result.pdf_url, error: null, warnings: result.warnings })
+      const result = pageEditMode === 'layout'
+        ? await api.compilePageLayout(bookId, pageNumber, calibrationDraft!, effectivePrintVersion)
+        : await api.compilePage(bookId, pageNumber, outputDraft(pageDraft), effectivePrintVersion)
+      if (requestId === previewRequestRef.current && bookId === selectedBookIdRef.current && pageNumber === selectedPageRef.current && key === previewKeysRef.current.page)
+        setPagePdf({ key, result, error: null, origin })
     } catch (error) {
-      setPagePdf({ key, url: null, error: errorText(error), warnings: [] })
+      if (requestId === previewRequestRef.current && bookId === selectedBookIdRef.current && pageNumber === selectedPageRef.current && key === previewKeysRef.current.page)
+        setPagePdf({ key, result: null, error: errorText(error), origin })
     } finally {
-      setCompiling(null)
+      if (requestId === previewRequestRef.current) setCompiling(null)
     }
   }
 
@@ -781,9 +939,9 @@ export default function App() {
   const exportLatex = async () => {
     setActionBusy(true)
     try {
-      const content = await api.exportLatex(detail!.book.id, effectivePrintVersion)
-      downloadText(safeFilename(detail!.book.title) + '.tex', content, 'application/x-tex;charset=utf-8')
-      setNotice({ kind: 'success', text: 'LaTeX 源文件已下载。' })
+      const source = await api.exportLatex(detail!.book.id, effectivePrintVersion)
+      downloadBlob(safeFilename(detail!.book.title) + source.extension, source.blob)
+      setNotice({ kind: 'success', text: source.extension === '.zip' ? 'LaTeX 源码包已下载。' : 'LaTeX 源码已下载。' })
     } catch (error) {
       setNotice({ kind: 'error', text: errorText(error) })
     } finally {
@@ -861,11 +1019,11 @@ export default function App() {
                   : view === 'preview' ? <>
                     <section className="preview-toolbar no-print" aria-labelledby="preview-title">
                       <div className="preview-heading">
-                        <div><h2 id="preview-title">预览与导出</h2><p>{detail.pages.length} 页已编排 · 根据已保存的 LaTeX 正文生成 PDF</p></div>
+                        <div><h2 id="preview-title">预览与导出</h2><p>{detail.pages.length} 个源页已编排 · 整书只使用已保存内容和布局，实际输出范围见页映射</p></div>
                         <div className="button-row export-buttons">
                           <button onClick={() => void exportJson()} disabled={busy}>下载 JSON</button>
                           <button onClick={() => void exportLatex()} disabled={processLocked || layoutDirty}>下载 LaTeX</button>
-                          <button onClick={() => downloadUrl(safeFilename(detail.book.title) + '.pdf', currentBookPdf!.url!)} disabled={busy || !currentBookPdf?.url || layoutDirty}>下载 PDF</button>
+                          <button onClick={() => downloadUrl(safeFilename(detail.book.title) + '.pdf', currentBookPdf!.result!.pdf_url!)} disabled={busy || !currentBookPdf?.result?.pdf_url || layoutDirty}>下载 PDF</button>
                           <button className="primary" onClick={() => void compileBook()} disabled={processLocked || layoutDirty}>{compiling === 'book' ? '正在生成 PDF…' : '生成/更新 PDF'}</button>
                         </div>
                       </div>
@@ -875,19 +1033,19 @@ export default function App() {
                           <span className={`binding-preview${effectivePrintVersion ? ' is-bound' : ''}`} aria-hidden="true"><i /><i /></span>
                           <label className="print-version-control">
                             <span><strong>打印装订版</strong><small id="print-version-note">{bindingPageCount === 0
-                              ? '没有可用左右页信息，所有页面保持居中'
+                              ? '当前策略或纸张模式下没有可用装订页；源页尺寸和完整自定义文档由自身排版控制'
                               : `${bindingPageCount}/${detail.pages.length} 页可用；${effectivePrintVersion ? '已按左右页预留装订边距' : '开启后按左右页预留装订边距'}，其他页仍居中`}</small></span>
-                            <input type="checkbox" role="switch" checked={effectivePrintVersion} disabled={busy || bindingPageCount === 0} onChange={(event) => setPrintVersion(event.target.checked)} aria-describedby="print-version-note" />
+                            <input type="checkbox" role="switch" checked={effectivePrintVersion} disabled={busy || bindingPageCount === 0} onChange={(event) => { invalidatePdfs(); setPrintVersion(event.target.checked) }} aria-describedby="print-version-note" />
                           </label>
                         </div>
                       </div>
                       <div className="toolbar-footnotes">
-                        <details className="export-help"><summary>导出与打印说明</summary><p>PDF 与 LaTeX 源文件使用已保存的正文和排版设置。纸型、内容、页序或装订选项变化后，请重新生成 PDF。打印时使用 PDF 自身的纸张尺寸。</p><p>装订版中，无页脚、未知页侧和封面封底仍居中；长正文续页沿用源页侧别。PDF 生成需要本机可用的 XeLaTeX。</p></details>
+                        <details className="export-help"><summary>导出与打印说明</summary><p>PDF 与 LaTeX 使用已保存内容和布局。原书还原页按原页画布整体映射；现有模板页使用项目排版；完整自定义文档保留自身文档类、宏包、纸张和排版。单份源码下载为 .tex，混合内容或多份独立文档下载为 ZIP 源码包。</p><p>装订选项按已知原页侧别应用；未知页侧保持居中。实际输出纸张、页数和比例以页映射为准。内容、布局、页序或项目排版变化后请更新 PDF；PDF 生成需要本机 XeLaTeX 及源码所需宏包和字体。</p></details>
                         <ToolbarUsage usage={detail.book.usage} />
                       </div>
-                      <LayoutSettingsForm key={detail.book.id} layout={detail.book.layout} paperSize={detail.book.paper_size} dirty={layoutDirty} saving={layoutSaving} disabled={busy} onDirtyChange={setLayoutDirty} onSave={saveLayoutSettings} />
+                      <LayoutSettingsForm key={detail.book.id} layout={detail.book.layout} paperSize={detail.book.paper_size} renderStrategy={detail.book.render_strategy} dirty={layoutDirty} saving={layoutSaving} disabled={busy} onDirtyChange={(changed) => { invalidatePdfs(); setLayoutDirty(changed) }} onSave={saveLayoutSettings} />
                     </section>
-                    <div className="book-pdf-preview"><PdfPreview url={currentBookPdf?.url ?? null} error={currentBookPdf?.error ?? null} warnings={currentBookPdf?.warnings ?? []} loading={compiling === 'book'} title="整书 PDF 预览" emptyMessage={layoutDirty ? '先保存排版设置，再生成整书 PDF。' : '点击“生成/更新 PDF”查看当前书稿；内容或排版变化后需重新生成。'} /></div>
+                    <div className="book-pdf-preview"><PdfPreview result={currentBookPdf?.result ?? null} error={currentBookPdf?.error ?? null} loading={compiling === 'book'} title="整书 PDF 预览" onDiagnostic={locateDiagnostic} emptyMessage={layoutDirty ? '先保存排版设置，再生成整书 PDF。' : '点击“生成/更新 PDF”查看已保存书稿；内容或布局变化后需重新生成。'} /></div>
                   </> : <>
                     <section className="proofing-toolbar no-print" aria-label="逐页校对工具栏">
                       <div className="proofing-controls">
@@ -912,21 +1070,21 @@ export default function App() {
                       {sourcePage ? <div className="proofing-area">
                         <div className="page-heading"><div><p className="eyebrow">编排第 {detail.pages.findIndex((page) => page.number === sourcePage.number) + 1} 页</p><div className="button-row"><h2 className="proofing-source-title">{sourceLabel(sourcePage)}</h2><span className={statusClass(sourcePage.status)}>{STATUS_LABEL[sourcePage.status] ?? sourcePage.status}</span><button onClick={() => void processPages([sourcePage.number])} disabled={processLocked} title="仅识别当前页面">{sourcePageHasResult ? '重新识别本页' : '识别本页'}</button></div></div><UsageView usage={sourcePage.usage} attempts={sourcePage.attempts} /></div>
                         {sourcePage.error && <div className="page-error">{sourcePage.error}</div>}
-                        <div className="proofing-grid">
-                          <section className="text-panel">
-                            <div className="panel-title"><strong>本页校对</strong><button className="primary" onClick={savePage} disabled={!dirty || editLocked}>{saving ? '保存中…' : '保存本页'}</button></div>
-                            {editLocked && <div className="lock-note">{sourcePage.status === 'processing' ? '本页正在识别，暂不可编辑；可切换到其他页面校对。' : '正在更新，本页暂不可编辑。'}</div>}
-                            <PageEditor draft={pageDraft} onChange={(draft) => { setPageDraft(draft); setDirty(true) }} disabled={editLocked} />
-                          </section>
-                          <section className="render-panel">
-                            <div className="panel-title"><strong>本页 PDF 预览</strong><div className="button-row"><button onClick={() => void compilePage()} disabled={editLocked}>{compiling === 'page' ? '正在生成…' : '更新本页 PDF'}</button><a href={api.pagePreviewUrl(detail.book.id, sourcePage.number)} target="_blank" rel="noreferrer">查看原页</a></div></div>
-                            <div className="page-render">
-                              <p className="page-layout-note">{pageDraft.page_kind === 'front_cover' ? '封面模板' : pageDraft.page_kind === 'back_cover' ? '封底模板' : '正文模板'}{effectivePrintVersion ? ' · 装订版' : ''}<span>{PAPER_SIZES[detail.book.paper_size].label}</span></p>
-                              <p className="page-preview-note">预览使用当前草稿和已保存的整书排版，更新 PDF 不会保存本页修改。</p>
-                              <PdfPreview url={currentPagePdf?.url ?? null} error={currentPagePdf?.error ?? null} warnings={currentPagePdf?.warnings ?? []} loading={compiling === 'page'} title={`${sourceLabel(sourcePage)} PDF 预览`} emptyMessage="点击“更新本页 PDF”预览当前草稿；正文或版式变化后需重新更新。" />
-                            </div>
-                          </section>
+                        <p className="page-layout-note">已保存策略：{STRATEGY_LABEL[sourcePage.render_strategy]} · 内容 r{sourcePage.content_revision} / 布局 r{sourcePage.layout_revision}<span>项目纸型：{PAPER_SIZES[detail.book.paper_size].label} · {detail.book.layout.source_fidelity_paper === 'source' ? '还原页采用源页尺寸' : '还原页整体映射到项目纸型'}</span></p>
+                        {sourcePage.render_strategy === 'source_fidelity' && !sourcePage.layout_source && <p className="missing-layout-note">本页缺少原书布局，需校准；目前没有原书还原通过结论。</p>}
+                        {sourcePage.render_strategy === 'custom_latex' && <p className="source-authority-summary">版式由源码控制。保留的原书布局不会覆盖当前源码。</p>}
+                        <SourceComparison key={`${detail.book.id}-${sourcePage.number}`} bookId={detail.book.id} page={sourcePage} result={comparisonResult} loading={compiling === 'page'} focus={currentProofingFocus} />
+                        <div className="page-preview-result">
+                          <p className="page-preview-note">当前结果：{currentPagePdf ? currentPagePdf.origin === 'layout_draft' ? '本页校准草稿' : '本页源码草稿' : currentBookPdf ? '已保存整书输出 · 按当前源页定位' : '尚未生成'} · 单页预览不会保存修改；整书只使用已保存版本。</p>
+                          <PdfPreview result={comparisonResult} error={currentPagePdf?.error ?? null} loading={compiling === 'page'} title={`${sourceLabel(sourcePage)} PDF 预览`} onDiagnostic={locateDiagnostic} emptyMessage="选择下方编辑方式，预览本页草稿后查看质量诊断和完整 PDF。" />
                         </div>
+                        <details className="page-editing" open>
+                          <summary>本页校对与校准{dirty || calibrationDirty ? ' · 未保存草稿' : ''}</summary>
+                          <div className="page-editor-tabs" role="group" aria-label="编辑方式"><button aria-pressed={pageEditMode === 'layout'} onClick={() => switchPageEditor('layout')} disabled={editLocked || sourcePage.page_kind !== 'content'}>原书布局校准</button><button aria-pressed={pageEditMode === 'source'} onClick={() => switchPageEditor('source')} disabled={editLocked}>自由源码 / 书目信息</button></div>
+                          {editLocked && <div className="lock-note">{sourcePage.status === 'processing' ? '本页正在识别，暂不可编辑；可切换到其他页面校对。' : '正在更新，本页暂不可编辑。'}</div>}
+                          {pageEditMode === 'layout' ? <LayoutCalibration key={`${detail.book.id}-${sourcePage.number}-${sourcePage.content_revision}-${sourcePage.layout_revision}-${calibrationEditorRevision}`} page={sourcePage} draft={calibrationDraft} dirty={calibrationDirty} disabled={editLocked} saving={saving} onChange={changeCalibrationDraft} onEditing={() => { invalidatePdfs(); setCalibrationDirty(true) }} onSave={() => void saveCalibration()} onPreview={() => void compilePage()} onLocate={locateRegion} onRestore={() => { invalidatePdfs(); setCalibrationDraft(calibrationFromPage(sourcePage)); setCalibrationDirty(false); setCalibrationEditorRevision((value) => value + 1) }} />
+                            : <section className="text-panel"><div className="panel-title"><strong>自由源码编辑</strong><div className="button-row"><button onClick={() => void compilePage()} disabled={editLocked || layoutDirty}>{compiling === 'page' ? '正在生成…' : '预览本页源码草稿'}</button><button className="primary" onClick={savePage} disabled={!dirty || editLocked}>{saving ? '保存中…' : '保存本页源码'}</button></div></div><PageEditor draft={pageDraft} onChange={changePageDraft} disabled={editLocked} /></section>}
+                        </details>
                       </div> : <div className="page-list-empty"><h2>编排暂无页面</h2><p>返回页面编排，选择需要识别和校对的页面。</p><button onClick={() => changeView('organize')} disabled={processLocked}>进入页面编排</button></div>}
                     </div>
                   </>}

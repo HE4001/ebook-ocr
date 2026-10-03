@@ -159,8 +159,11 @@ def legacy_blocks_to_markdown(blocks: list[dict[str, Any]]) -> str:
             value = (value + "\n\n" if value else "") + f"$$\n{latex}\n$$"
         rows = block.get("rows")
         if kind == "table" and isinstance(rows, list) and rows:
-            table_text = "\n".join(" | ".join(str(cell) for cell in row) for row in rows)
-            if not all(str(cell) in value for row in rows for cell in row):
+            table_rows = ["| " + " | ".join(str(cell).replace("|", r"\|") for cell in row) + " |"
+                          for row in rows]
+            separator = "| " + " | ".join("---" for _ in rows[0]) + " |"
+            table_text = "\n".join([table_rows[0], separator, *table_rows[1:]])
+            if table_text not in value:
                 value = (value + "\n\n" if value else "") + table_text
         if value:
             sections.append({"type": kind, "text": value})

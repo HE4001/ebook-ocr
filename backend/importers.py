@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import pymupdf as fitz
 from PIL import Image, ImageOps
+
+from .layout_contract import PageSourceMetadata, PdfSourceGeometry
 
 
 MAX_IMAGE_PIXELS = 40_000_000
@@ -169,6 +173,93 @@ def prepare_source_page(book_dir: Path, record: dict[str, Any]) -> tuple[int, in
         image_name = str(Path(record["source_directory"]) / name).replace("\\", "/")
         return width, height, image_name
     return record["width"], record["height"], record["image_name"]
+
+
+def _file_fingerprint(path: Path) -> str:
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+@lru_cache(maxsize=128)
+def _cached_source_fingerprint(path: Path, mtime_ns: int, size: int) -> str:
+    return _file_fingerprint(path)
+
+
+def _source_file_fingerprint(path: Path) -> str:
+    resolved = path.resolve()
+    stat = resolved.stat()
+    return _cached_source_fingerprint(resolved, stat.st_mtime_ns, stat.st_size)
+
+
+def read_page_source_metadata(book_dir: Path, record: dict[str, Any]) -> PageSourceMetadata:
+    """Read provenance for an already prepared canonical image, without rendering.
+
+    Pixel transforms map continuous image edges, so a flipped x=0 maps to
+    source_width_px rather than to the last pixel center. PDF widths and heights
+    are the unrotated crop dimensions; crop/media boxes retain their offsets.
+    """
+    directory = book_dir / record["source_directory"]
+    image_path = book_dir / record["image_name"]
+    with Image.open(image_path) as image:
+        width, height = image.size
+    common = {
+        "book_id": record["book_id"],
+        "page_number": record["number"],
+        "source_id": record["source_id"],
+        "source_page": record["source_page"],
+        "source_kind": record["source_kind"],
+        "image_fingerprint": _file_fingerprint(image_path),
+        "canonical_width_px": width,
+        "canonical_height_px": height,
+    }
+    if record["source_kind"] == "pdf":
+        source_path = directory / "source.pdf"
+        with fitz.open(source_path) as document:
+            page = document[record["source_page"] - 1]
+            crop_width, crop_height = page.cropbox.width, page.cropbox.height
+            rotation = page.rotation
+            # Inverse clockwise rotation after scaling canonical pixels to bp.
+            transforms = {
+                0: (crop_width / width, 0, 0, crop_height / height, 0, 0),
+                90: (0, -crop_height / width, crop_width / height, 0, 0, crop_height),
+                180: (-crop_width / width, 0, 0, -crop_height / height, crop_width, crop_height),
+                270: (0, crop_height / width, -crop_width / height, 0, crop_width, 0),
+            }
+            geometry = PdfSourceGeometry(
+                media_box_bp=tuple(page.mediabox), crop_box_bp=tuple(page.cropbox),
+                rotation=rotation, width_bp=crop_width, height_bp=crop_height,
+            )
+        return PageSourceMetadata(
+            **common, source_file_fingerprint=_source_file_fingerprint(source_path),
+            source_coordinate_space="unrotated_crop_bp",
+            canonical_to_source_affine=transforms[rotation], pdf_geometry=geometry,
+        )
+    source_path = directory / f'source{Path(record["source_filename"]).suffix.lower()}'
+    with Image.open(source_path) as original:
+        source_width, source_height = original.size
+        orientation = original.getexif().get(274, 1)
+    oriented_width, oriented_height = (
+        (source_height, source_width) if orientation in {5, 6, 7, 8}
+        else (source_width, source_height)
+    )
+    sx, sy = oriented_width / width, oriented_height / height
+    transforms = {
+        1: (sx, 0, 0, sy, 0, 0),
+        2: (-sx, 0, 0, sy, source_width, 0),
+        3: (-sx, 0, 0, -sy, source_width, source_height),
+        4: (sx, 0, 0, -sy, 0, source_height),
+        5: (0, sx, sy, 0, 0, 0),
+        6: (0, -sx, sy, 0, 0, source_height),
+        7: (0, -sx, -sy, 0, source_width, source_height),
+        8: (0, sx, -sy, 0, source_width, 0),
+    }
+    # Pillow treats unsupported EXIF orientations as the unchanged image.
+    transform = transforms[orientation] if orientation in transforms else transforms[1]
+    return PageSourceMetadata(
+        **common, source_file_fingerprint=_source_file_fingerprint(source_path),
+        source_width_px=source_width, source_height_px=source_height,
+        source_coordinate_space="original_image_px", canonical_to_source_affine=transform,
+    )
 
 
 def prepare_source_preview(book_dir: Path, record: dict[str, Any]) -> Path:

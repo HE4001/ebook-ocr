@@ -10,16 +10,24 @@ from fastapi.testclient import TestClient
 
 from backend.main import create_app
 from backend.models import MarginSegment, StructuredPageResult
-from backend.prompts import PAGE_RESPONSE_SCHEMA, SPECIAL_PAGE_RESPONSE_SCHEMA
+from backend.prompts import PAGE_RESPONSE_SCHEMA
 from backend.storage import Storage
+from backend.tests.layout_response_fixtures import page_response
 
 
 def content(side="unknown", footer=None):
     return StructuredPageResult(
-        page_side=side, header_segments=[], body_markdown="正文",
+        page_side=side, header_segments=[], body_latex="正文",
         footer_segments=footer if footer is not None else [
             MarginSegment(kind="page_number", text="2", alignment="left")],
     )
+
+
+def parse_response(payload):
+    value = page_response(payload["body_latex"], kind=payload["page_kind"],
+                          header_segments=payload["header_segments"], footer_segments=payload["footer_segments"])
+    value["page_side"] = payload["page_side"]
+    return StructuredPageResult.from_model_response(value, response_version=2)
 
 
 class PageSideTests(unittest.TestCase):
@@ -57,9 +65,9 @@ class PageSideTests(unittest.TestCase):
         for name, reported, footer, expected in cases:
             with self.subTest(name=name):
                 payload = {"page_kind": "content", "page_side": reported,
-                           "header_segments": [segment("right")], "body_markdown": "正文",
+                           "header_segments": [segment("right")], "body_latex": "正文",
                            "footer_segments": footer}
-                result = StructuredPageResult.from_model_response(payload)
+                result = parse_response(payload)
                 self.assertEqual(result.page_side, expected)
                 self.assertEqual([item.model_dump() for item in result.footer_segments], footer)
                 self.assertEqual(payload["page_side"], reported)
@@ -69,23 +77,23 @@ class PageSideTests(unittest.TestCase):
             for position in ("left", "right", "center"):
                 with self.subTest(text=text, position=position):
                     footer = MarginSegment(kind="page_number", text=text, alignment=position)
-                    result = StructuredPageResult.from_model_response({
+                    result = parse_response({
                         "page_kind": "content", "page_side": "unknown", "header_segments": [],
-                        "body_markdown": "正文", "footer_segments": [footer.model_dump()],
+                        "body_latex": "正文", "footer_segments": [footer.model_dump()],
                     })
                     self.assertEqual(result.page_side, position if position != "center" else "unknown")
 
     def test_new_response_normalization_does_not_reinterpret_legacy_results(self):
         payload = {"page_kind": "content", "page_side": "unknown", "header_segments": [],
-                   "body_markdown": "正文", "footer_segments": [
+                   "body_latex": "正文", "footer_segments": [
                        MarginSegment(kind="page_number", text="12", alignment="left").model_dump()]}
         self.assertEqual(StructuredPageResult.model_validate(payload).page_side, "unknown")
-        self.assertEqual(StructuredPageResult.from_model_response(payload).page_side, "left")
+        self.assertEqual(parse_response(payload).page_side, "left")
         for kind in ("front_cover", "back_cover"):
             with self.subTest(kind=kind):
-                result = StructuredPageResult.from_model_response({
+                result = parse_response({
                     "page_kind": kind, "page_side": "right", "header_segments": [],
-                    "body_markdown": "", "footer_segments": [],
+                    "body_latex": "", "footer_segments": [],
                 })
                 self.assertEqual(result.page_side, "unknown")
 
@@ -93,8 +101,9 @@ class PageSideTests(unittest.TestCase):
         self.assertIn("page_side", PAGE_RESPONSE_SCHEMA["required"])
         self.assertEqual(PAGE_RESPONSE_SCHEMA["properties"]["page_side"]["enum"],
                          ["left", "right", "unknown"])
-        self.assertEqual(set(SPECIAL_PAGE_RESPONSE_SCHEMA["properties"]),
-                         {"page_kind", "cover_fields"})
+        self.assertEqual(PAGE_RESPONSE_SCHEMA["properties"]["page_kind"]["enum"],
+                         ["content", "front_cover", "back_cover"])
+        self.assertIn("cover_fields", PAGE_RESPONSE_SCHEMA["required"])
         self.assertEqual(content().page_side, "unknown")
         for footer in ([], [MarginSegment(kind="text", text="  ", alignment="left")]):
             with self.subTest(footer=footer):
@@ -102,7 +111,7 @@ class PageSideTests(unittest.TestCase):
         for kind in ("front_cover", "back_cover"):
             with self.subTest(kind=kind):
                 result = StructuredPageResult(page_kind=kind, page_side="right",
-                                              header_segments=[], body_markdown="", footer_segments=[])
+                                              header_segments=[], body_latex="", footer_segments=[])
                 self.assertEqual(result.page_side, "unknown")
 
     def test_old_database_migrates_unknown_without_inference(self):

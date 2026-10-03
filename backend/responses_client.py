@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import httpx
 from pydantic import ValidationError
 
-from .models import EmphasisResult, PageKind, SpecialPageResult, StructuredPageResult
-from .prompts import EMPHASIS_RESPONSE_SCHEMA, PAGE_RESPONSE_SCHEMA, SPECIAL_PAGE_RESPONSE_SCHEMA
+from .models import StructuredPageResult
+from .prompts import PAGE_RESPONSE_VERSION, page_response_schema
 
 
 MAX_RESPONSE_BYTES = 2_000_000
@@ -114,60 +114,24 @@ class ResponsesClient:
         input_value: list[dict[str, Any]],
         on_attempt_start: Callable[[], int] | None = None,
         on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
+        *, response_version: Literal[1, 2] = PAGE_RESPONSE_VERSION,
     ) -> StructuredPageResult:
-        payload = self._page_payload(model, input_value, "page_transcription", PAGE_RESPONSE_SCHEMA)
+        payload = self._page_payload(
+            model, input_value, f"page_transcription_v{response_version}",
+            page_response_schema(response_version),
+        )
         data = await self._post(payload, on_attempt_start, on_attempt_end)
         response_text = self.extract_output_text(data)
         try:
-            result = StructuredPageResult.from_model_response(json.loads(response_text))
+            result = StructuredPageResult.from_model_response(json.loads(response_text), response_version)
         except (ValueError, ValidationError) as exc:
             raise ModelServiceError("模型返回的页面结构无效") from exc
-        if result.cover_fields:
-            raise ModelServiceError("普通页面代理识别到特殊页后应立即停止读取，不能返回书目信息")
         if self.config.context_reuse_enabled:
             response_id = data.get("id")
             if not isinstance(response_id, str) or not response_id.strip():
                 raise ModelServiceError("模型接口未返回有效 response id，不支持实验性上下文续接")
             self.previous_response_id = response_id
         return result
-
-    async def request_special_page(
-        self,
-        model: str,
-        input_value: list[dict[str, Any]],
-        page_kind: PageKind,
-        on_attempt_start: Callable[[], int] | None = None,
-        on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
-    ) -> SpecialPageResult:
-        payload = self._page_payload(
-            model, input_value, "special_page_transcription", SPECIAL_PAGE_RESPONSE_SCHEMA,
-        )
-        data = await self._post(payload, on_attempt_start, on_attempt_end)
-        response_text = self.extract_output_text(data)
-        try:
-            result = SpecialPageResult.model_validate(json.loads(response_text))
-        except (ValueError, ValidationError) as exc:
-            raise ModelServiceError("特殊页面代理返回的书目结构无效") from exc
-        if result.page_kind != page_kind:
-            raise ModelServiceError("特殊页面代理返回的页面类型与分流类型不一致")
-        return result
-
-    async def request_emphasis(
-        self,
-        model: str,
-        input_value: list[dict[str, Any]],
-        on_attempt_start: Callable[[], int] | None = None,
-        on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
-    ) -> EmphasisResult:
-        payload = self._page_payload(
-            model, input_value, "page_emphasis", EMPHASIS_RESPONSE_SCHEMA,
-        )
-        data = await self._post(payload, on_attempt_start, on_attempt_end)
-        response_text = self.extract_output_text(data)
-        try:
-            return EmphasisResult.model_validate(json.loads(response_text))
-        except (ValueError, ValidationError) as exc:
-            raise ModelServiceError("字重复核返回的范围结构无效") from exc
 
     async def test_connection(self, model: str) -> None:
         payload = {

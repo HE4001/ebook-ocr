@@ -1,5 +1,8 @@
 export function downloadText(filename: string, content: string, type: string): void {
-  const blob = new Blob([content], { type })
+  downloadBlob(filename, new Blob([content], { type }))
+}
+
+export function downloadBlob(filename: string, blob: Blob): void {
   const url = URL.createObjectURL(blob)
   downloadUrl(filename, url)
   setTimeout(() => URL.revokeObjectURL(url), 1000)

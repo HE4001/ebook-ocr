@@ -4,14 +4,14 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
 
-from .models import EmphasisResult, PageKind, SpecialPageResult, StructuredPageResult
-from .prompts import EMPHASIS_RESPONSE_SCHEMA, PAGE_RESPONSE_SCHEMA, SPECIAL_PAGE_RESPONSE_SCHEMA
+from .models import StructuredPageResult
+from .prompts import PAGE_RESPONSE_VERSION, page_response_schema
 from .responses_client import (
     MAX_OUTPUT_CHARS,
     MAX_RESPONSE_BYTES,
@@ -141,57 +141,22 @@ class GeminiClient:
         input_value: list[dict[str, Any]],
         on_attempt_start: Callable[[], int] | None = None,
         on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
+        *, response_version: Literal[1, 2] = PAGE_RESPONSE_VERSION,
     ) -> StructuredPageResult:
-        payload = self._page_payload(input_value, PAGE_RESPONSE_SCHEMA)
+        payload = self._page_payload(input_value, page_response_schema(response_version))
         user_content = payload["contents"][0]
         if self.config.context_reuse_enabled:
             payload["contents"] = [*self.contents, user_content]
         data = await self._post(model, payload, on_attempt_start, on_attempt_end)
         response_text = self.extract_output_text(data)
         try:
-            result = StructuredPageResult.from_model_response(json.loads(response_text))
+            result = StructuredPageResult.from_model_response(json.loads(response_text), response_version)
         except (ValueError, ValidationError) as exc:
             raise ModelServiceError("模型返回的页面结构无效") from exc
-        if result.cover_fields:
-            raise ModelServiceError("普通页面代理识别到特殊页后应立即停止读取，不能返回书目信息")
         if self.config.context_reuse_enabled:
             # 保留完整模型内容，包括 thoughtSignature，供后续轮次原样回传。
             self.contents.extend([user_content, data["candidates"][0]["content"]])
         return result
-
-    async def request_special_page(
-        self,
-        model: str,
-        input_value: list[dict[str, Any]],
-        page_kind: PageKind,
-        on_attempt_start: Callable[[], int] | None = None,
-        on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
-    ) -> SpecialPageResult:
-        payload = self._page_payload(input_value, SPECIAL_PAGE_RESPONSE_SCHEMA)
-        data = await self._post(model, payload, on_attempt_start, on_attempt_end)
-        response_text = self.extract_output_text(data)
-        try:
-            result = SpecialPageResult.model_validate(json.loads(response_text))
-        except (ValueError, ValidationError) as exc:
-            raise ModelServiceError("特殊页面代理返回的书目结构无效") from exc
-        if result.page_kind != page_kind:
-            raise ModelServiceError("特殊页面代理返回的页面类型与分流类型不一致")
-        return result
-
-    async def request_emphasis(
-        self,
-        model: str,
-        input_value: list[dict[str, Any]],
-        on_attempt_start: Callable[[], int] | None = None,
-        on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
-    ) -> EmphasisResult:
-        payload = self._page_payload(input_value, EMPHASIS_RESPONSE_SCHEMA)
-        data = await self._post(model, payload, on_attempt_start, on_attempt_end)
-        response_text = self.extract_output_text(data)
-        try:
-            return EmphasisResult.model_validate(json.loads(response_text))
-        except (ValueError, ValidationError) as exc:
-            raise ModelServiceError("字重复核返回的范围结构无效") from exc
 
     async def test_connection(self, model: str) -> None:
         payload: dict[str, Any] = {

@@ -5,31 +5,37 @@ import os
 import re
 import shutil
 from contextlib import asynccontextmanager
-from hashlib import sha256
+from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from typing import AsyncIterator
 from uuid import UUID, uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel
-
+from .compile_service import compile_documents, failed_result, render_output_page
 from .importers import ImportFailure, import_document, prepare_source_preview
-from .latex_diagnostics import layout_warnings
-from .latex_export import LatexCompileError, build_latex, compile_pdf
+from .latex_export import (
+    GENERATOR_VERSION, FidelityLayoutError, LatexCompileError,
+    build_latex_documents, generate_source_fidelity_latex,
+)
+from .layout_contract import SourceFidelityLayout
 from .models import (
     Arrangement,
     ArrangementUpdate,
     Book,
     BookDetail,
     ConnectionTestResult,
+    LayoutCalibrationUpdate,
     LayoutUpdate,
     ModelsRequest,
     ModelsResult,
     Page,
     PageUpdate,
+    PdfCompileResult,
     PagesRequest,
     PauseResult,
     ProcessRequest,
@@ -38,11 +44,11 @@ from .models import (
     SettingsOut,
     SettingsUpdate,
 )
-from .pipeline import BookProcessor
+from .pipeline import BookProcessor, _prepare_page
 from .gemini_client import fetch_gemini_models
 from .model_client import create_model_client
 from .responses_client import ModelServiceError, fetch_models
-from .storage import Storage
+from .storage import RevisionConflict, Storage
 
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -52,11 +58,6 @@ COMPILED_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 class RuntimeSecrets:
     api_key: str = ""
-
-
-class PdfCompileResult(BaseModel):
-    pdf_url: str
-    warnings: list[str]
 
 
 def _valid_book_id(value: str) -> str:
@@ -143,31 +144,99 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         if not book.upload_confirmed or not book.selection_confirmed:
             raise HTTPException(status_code=409, detail="请先确认上传并完成页面编排")
 
-    def latex_source(detail: BookDetail, print_version: bool) -> str:
-        try:
-            return build_latex(detail, print_version=print_version)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
     async def compiled_pdf(
         detail: BookDetail, print_version: bool, page_order: list[int] | None = None,
     ) -> PdfCompileResult:
-        source = latex_source(detail, print_version)
-        digest = sha256(source.encode("utf-8")).hexdigest()
-        output_dir = storage.books_root / detail.book.id / "latex-cache" / digest
+        if not detail.pages:
+            raise HTTPException(status_code=422, detail="当前清单没有可编译页面")
+        positions = page_order if page_order is not None else list(range(1, len(detail.pages) + 1))
+        try:
+            documents = build_latex_documents(detail, print_version)
+        except LatexCompileError as error:
+            return failed_result(detail, error, positions)
+        documents = [replace(document, page_order=[positions[position - 1] for position in document.page_order])
+                     for document in documents]
         async with compile_locks.setdefault(detail.book.id, asyncio.Lock()):
-            if not (output_dir / "document.pdf").is_file():
+            current_sources = []
+            for page in detail.pages:
+                record = storage.get_page_record(detail.book.id, page.number)
                 try:
-                    await compile_pdf(source, output_dir)
-                except LatexCompileError as exc:
-                    raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return PdfCompileResult(
-            pdf_url=f"/api/books/{detail.book.id}/compiled/{digest}.pdf",
-            warnings=layout_warnings(
-                output_dir / "compiled.log", source,
-                page_order if page_order is not None else list(range(1, len(detail.pages) + 1)),
-            ),
+                    _, _, _, metadata = await asyncio.to_thread(
+                        _prepare_page, storage.books_root / detail.book.id, record,
+                    )
+                except (ImportFailure, OSError, ValueError) as error:
+                    return failed_result(detail, LatexCompileError(
+                        f"无法读取源页 {page.number} 的当前来源：{error}",
+                        code="LAYOUT_SOURCE_MISMATCH", page_number=page.number,
+                    ), positions)
+                current_sources.append(metadata)
+            return await compile_documents(detail, documents, storage.books_root / detail.book.id,
+                                           current_sources, print_version, positions)
+
+    def editable_page(book_id: str, number: int) -> Page:
+        ensure_arranged(ensure_book(book_id))
+        if book_id in uploading:
+            raise HTTPException(status_code=409, detail="项目正在上传，请稍后保存")
+        record = storage.get_page_record(book_id, number)
+        if record is None or not record["selected"]:
+            raise HTTPException(status_code=404, detail="页面不存在")
+        if record["status"] == "processing":
+            raise HTTPException(status_code=409, detail="本页正在识别，暂不能保存；可校对其他页面")
+        return next(page for page in storage.get_pages(book_id) if page.number == number)
+
+    async def calibrated_page(book_id: str, number: int, update: LayoutCalibrationUpdate) -> Page:
+        page = editable_page(book_id, number)
+        if update.render_strategy != "source_fidelity":
+            raise HTTPException(status_code=422, detail="布局校准使用原书还原策略；其他策略请通过页面或项目设置选择")
+        if page.page_kind != "content":
+            raise HTTPException(status_code=422, detail="封面和封底不能校准正文布局")
+        if (page.content_revision != update.expected_content_revision
+                or page.layout_revision != update.expected_layout_revision):
+            raise HTTPException(status_code=409, detail="页面已更新，请加载最新版本后再校准")
+        record = storage.get_page_record(book_id, number)
+        try:
+            _, _, _, metadata = await asyncio.to_thread(_prepare_page, storage.books_root / book_id, record)
+        except (ImportFailure, OSError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=f"无法读取当前来源：{error}") from error
+        previous = page.layout_source
+        parameters = {name: getattr(previous, name) if previous is not None else None for name in (
+            "canvas_width_bp", "canvas_height_bp", "canvas_basis",
+            "body_font_size_bp", "body_font_family", "body_font_basis",
+        )}
+        provided = update.model_fields_set
+        canvas_fields = {"canvas_width_bp", "canvas_height_bp"}
+        if provided & canvas_fields and not canvas_fields <= provided:
+            raise HTTPException(status_code=422, detail="规范画布宽高必须同时提供或同时设为 null")
+        if canvas_fields <= provided:
+            parameters.update(canvas_width_bp=update.canvas_width_bp, canvas_height_bp=update.canvas_height_bp,
+                              canvas_basis="manual" if update.canvas_width_bp is not None else None)
+        font_fields = {"body_font_size_bp", "body_font_family"}
+        for name in provided & font_fields:
+            parameters[name] = getattr(update, name)
+        reasons = list(update.observation.review_reasons)
+        if provided & font_fields:
+            cleared = any(getattr(update, name) is None for name in provided & font_fields)
+            jointly_confirmed = font_fields <= provided and not cleared
+            if all(parameters[name] is None for name in font_fields):
+                parameters["body_font_basis"] = None
+            elif jointly_confirmed or (parameters["body_font_basis"] == "manual" and not cleared):
+                parameters["body_font_basis"] = "manual"
+            elif parameters["body_font_basis"] in {None, "manual"}:
+                parameters["body_font_basis"] = "project"
+                reason = "基准字族与字号尚未共同确认；未知项保持未知，预览采用临时项目配置。"
+                if reason not in reasons:
+                    reasons.append(reason)
+        layout = SourceFidelityLayout(
+            **update.observation.model_dump(exclude={"review_reasons"}), review_reasons=reasons,
+            **parameters, source=metadata,
+            content_revision=page.content_revision + 1, layout_revision=page.layout_revision + 1,
+            generated_content_revision=page.content_revision + 1, generator_version=GENERATOR_VERSION,
         )
+        return page.model_copy(update={
+            "layout_source": layout, "source_metadata": metadata, "render_strategy": "source_fidelity",
+            "content_revision": layout.content_revision, "layout_revision": layout.layout_revision,
+            "generated_content_revision": layout.generated_content_revision,
+        })
 
     async def read_upload(file: UploadFile) -> tuple[str, bytes]:
         filename = Path(file.filename or "").name
@@ -411,7 +480,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     @app.put("/api/books/{book_id}/layout", response_model=Book)
     async def put_layout(book_id: str, request: LayoutUpdate) -> Book:
         ensure_book(book_id)
-        storage.save_layout(book_id, request.paper_size, request.layout)
+        storage.save_layout(book_id, request.paper_size, request.layout, request.render_strategy)
         return ensure_book(book_id)
 
     @app.delete("/api/books/{book_id}", status_code=204)
@@ -533,15 +602,47 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                 book_id, number, update.text,
                 page_kind=update.page_kind, cover_fields=update.cover_fields,
                 processing=active,
+                expected_content_revision=update.expected_content_revision,
+                expected_layout_revision=update.expected_layout_revision,
+                render_strategy=update.render_strategy,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="页面不存在") from exc
+        except RevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if active:
             manually_saved_pages[book_id].add(number)
         pages = storage.get_pages(book_id)
         return next(page for page in pages if page.number == number)
+
+    @app.put("/api/books/{book_id}/pages/{number}/layout", response_model=Page)
+    async def save_page_layout(book_id: str, number: int, update: LayoutCalibrationUpdate) -> Page:
+        draft = await calibrated_page(book_id, number, update)
+        try:
+            source = generate_source_fidelity_latex(draft.layout_source)
+            saved = storage.save_page_layout(
+                book_id, number, draft.layout_source, source,
+                update.expected_content_revision, update.expected_layout_revision,
+            )
+        except RevisionConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (FidelityLayoutError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if is_running(book_id):
+            manually_saved_pages[book_id].add(number)
+        return saved
+
+    @app.post("/api/books/{book_id}/pages/{number}/compile-layout-pdf", response_model=PdfCompileResult)
+    async def compile_page_layout(
+        book_id: str, number: int, update: LayoutCalibrationUpdate, print_version: bool = False,
+    ) -> PdfCompileResult:
+        page = await calibrated_page(book_id, number, update)
+        detail = book_detail(book_id)
+        position = next(index + 1 for index, item in enumerate(detail.pages) if item.number == number)
+        draft = detail.model_copy(update={"pages": [page]})
+        return await compiled_pdf(draft, print_version, page_order=[position])
 
     @app.get("/api/books/{book_id}/export")
     async def export_book(book_id: str) -> JSONResponse:
@@ -559,18 +660,42 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     async def export_latex(book_id: str, print_version: bool = False) -> Response:
         book = ensure_book(book_id)
         ensure_arranged(book)
+        try:
+            documents = build_latex_documents(book_detail(book_id), print_version)
+        except LatexCompileError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if len(documents) == 1:
+            return Response(
+                content=documents[0].source,
+                media_type="text/plain; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="book-{book_id}.tex"'},
+            )
+        archive = BytesIO()
+        instructions = [
+            "请按以下顺序分别用 XeLaTeX 编译每份 .tex，再按相同顺序合并 PDF。",
+            "独立文档保留原源码，连续片段页使用应用模板；外部资源需自行准备。",
+            "",
+            "文件\t对应原页面编排位置",
+        ]
+        with ZipFile(archive, "w", compression=ZIP_DEFLATED) as package:
+            for index, document in enumerate(documents, 1):
+                filename = f"{index:04d}.tex"
+                package.writestr(filename, document.source)
+                positions = ", ".join(str(position) for position in document.page_order)
+                instructions.append(f"{filename}\t{positions}")
+            package.writestr("README.txt", "\n".join(instructions) + "\n")
         return Response(
-            content=latex_source(book_detail(book_id), print_version),
-            media_type="text/plain; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="book-{book_id}.tex"'},
+            content=archive.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="book-{book_id}.zip"'},
         )
 
-    @app.post("/api/books/{book_id}/compile")
+    @app.post("/api/books/{book_id}/compile", response_model=PdfCompileResult)
     async def compile_book(book_id: str, print_version: bool = False) -> PdfCompileResult:
         ensure_arranged(ensure_book(book_id))
         return await compiled_pdf(book_detail(book_id), print_version)
 
-    @app.post("/api/books/{book_id}/pages/{number}/compile")
+    @app.post("/api/books/{book_id}/pages/{number}/compile", response_model=PdfCompileResult)
     async def compile_page(
         book_id: str, number: int, update: PageUpdate, print_version: bool = False,
     ) -> PdfCompileResult:
@@ -579,6 +704,9 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         page = next((page for page in detail.pages if page.number == number), None)
         if page is None:
             raise HTTPException(status_code=404, detail="页面不存在")
+        if ((update.expected_content_revision is not None and update.expected_content_revision != page.content_revision)
+                or (update.expected_layout_revision is not None and update.expected_layout_revision != page.layout_revision)):
+            raise HTTPException(status_code=409, detail="页面已更新，请加载最新版本后再编译草稿")
         kind = update.page_kind if update.page_kind is not None else page.page_kind
         if kind == "content":
             if update.cover_fields:
@@ -592,6 +720,13 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                 "cover_fields": update.cover_fields if update.cover_fields is not None else page.cover_fields,
                 "header_segments": [], "footer_segments": [],
             }
+        detached = update.text != page.text or kind != page.page_kind
+        if kind == "content" and detached:
+            if update.render_strategy == "source_fidelity":
+                raise HTTPException(status_code=422, detail="自由源码已修改，请通过布局校准重新生成原书还原源码")
+            changes.update(render_strategy="custom_latex", generated_content_revision=None)
+        elif update.render_strategy is not None:
+            changes["render_strategy"] = update.render_strategy
         draft = detail.model_copy(update={"pages": [page.model_copy(update=changes)]})
         page_order = next(index + 1 for index, item in enumerate(detail.pages) if item.number == number)
         return await compiled_pdf(draft, print_version, page_order=[page_order])
@@ -608,6 +743,21 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             path, media_type="application/pdf", filename=f"book-{book_id}.pdf",
             content_disposition_type="inline",
         )
+
+    @app.get("/api/books/{book_id}/compiled/{digest}/pages/{output_page}.png")
+    async def get_compiled_page(book_id: str, digest: str, output_page: int) -> FileResponse:
+        ensure_book(book_id)
+        if not COMPILED_DIGEST.fullmatch(digest):
+            raise HTTPException(status_code=404, detail="PDF 不存在")
+        path = storage.books_root / book_id / "latex-cache" / digest / "document.pdf"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="PDF 不存在，请先生成")
+        try:
+            async with preview_lock:
+                image_path = await asyncio.to_thread(render_output_page, path, output_page)
+        except IndexError as error:
+            raise HTTPException(status_code=404, detail="输出页面不存在") from error
+        return FileResponse(image_path, media_type="image/png")
 
     @app.get("/api/books/{book_id}/assets/{name}")
     async def get_asset(book_id: str, name: str) -> FileResponse:

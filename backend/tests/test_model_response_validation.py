@@ -11,16 +11,19 @@ from PIL import Image
 from backend.gemini_client import GeminiClient, GeminiConfig
 from backend.models import StructuredPageResult
 from backend.pipeline import BookProcessor
-from backend.prompts import MARGIN_SEGMENT_SCHEMA, PAGE_RESPONSE_SCHEMA
+from backend.prompts import MARGIN_SEGMENT_SCHEMA, PAGE_RESPONSE_SCHEMA, PAGE_RESPONSE_SCHEMA_V1
 from backend.responses_client import ModelServiceError, ResponsesClient, ResponsesConfig
 from backend.storage import Storage
+from backend.tests.layout_response_fixtures import original_printed_page, page_response
 
 
-def page_result():
+def page_result(version=2):
     segment = {"kind": "page_number", "text": "2", "alignment": "left", "row": 2,
                "font_size": "normal", "bold": True, "italic": True}
-    return {"page_kind": "content", "page_side": "left", "header_segments": [segment],
-            "body_markdown": "原文", "footer_segments": [dict(segment)]}
+    result = page_response("原文", version=version,
+                           header_segments=[segment], footer_segments=[segment])
+    result["page_side"] = "left"
+    return result
 
 
 def response(protocol, value):
@@ -67,6 +70,22 @@ class ModelResponseValidationTests(unittest.IsolatedAsyncioTestCase):
                     value = page_result()
                     del value[area][0][field]
                     cases.append((f"{area}.{field}", value))
+            for field in page_result()["layout"]:
+                value = page_result()
+                del value["layout"][field]
+                cases.append((f"layout.{field}", value))
+            for field in page_result()["layout"]["lines"][0]:
+                value = page_result()
+                del value["layout"]["lines"][0][field]
+                cases.append((f"line.{field}", value))
+            for field in page_result()["layout"]["lines"][0]["style"]:
+                value = page_result()
+                del value["layout"]["lines"][0]["style"][field]
+                cases.append((f"line.style.{field}", value))
+            for field in original_printed_page()["layout"]["equation_groups"][0]["number"]:
+                value = original_printed_page()
+                del value["layout"]["equation_groups"][0]["number"][field]
+                cases.append((f"equation.number.{field}", value))
             for field, value in cases:
                 with self.subTest(protocol=protocol, missing=field):
                     client._post.return_value = response(protocol, value)
@@ -84,8 +103,9 @@ class ModelResponseValidationTests(unittest.IsolatedAsyncioTestCase):
                 book_dir = storage.books_root / "test"
                 book_dir.mkdir()
                 Image.new("RGB", (16, 16), "white").save(book_dir / "page.png")
+                (book_dir / "source.png").write_bytes((book_dir / "page.png").read_bytes())
                 storage.create_book("test", "测试", "page.png", [(1, 16, 16, "page.png")])
-                storage.save_page_result("test", 1, StructuredPageResult.model_validate(page_result()))
+                storage.save_page_result("test", 1, StructuredPageResult.model_validate(page_result(version=1)))
                 invalid = page_result()
                 del invalid["footer_segments"][0]["alignment"]
                 transport = httpx.MockTransport(lambda request: httpx.Response(200, json=response(protocol, invalid)))
@@ -102,12 +122,70 @@ class ModelResponseValidationTests(unittest.IsolatedAsyncioTestCase):
     def test_legacy_results_keep_compatibility_defaults(self):
         result = StructuredPageResult.model_validate({
             "header_segments": [{"kind": "text", "text": "旧页眉"}],
-            "body_markdown": "旧正文", "footer_segments": [{"kind": "page_number", "text": "2"}],
+            "body_latex": "旧正文", "footer_segments": [{"kind": "page_number", "text": "2"}],
         })
         self.assertEqual((result.page_kind, result.page_side), ("content", "unknown"))
         for segment in result.header_segments + result.footer_segments:
             self.assertEqual((segment.alignment, segment.row, segment.font_size, segment.bold, segment.italic),
                              ("center", 1, "small", False, False))
+
+    async def test_requested_version_selects_schema_and_rejects_other_versions(self):
+        for protocol in ("openai_responses", "gemini"):
+            for version, schema in ((1, PAGE_RESPONSE_SCHEMA_V1), (2, PAGE_RESPONSE_SCHEMA)):
+                with self.subTest(protocol=protocol, version=version):
+                    client = model_client(protocol)
+                    client._post = AsyncMock(return_value=response(protocol, page_result(version)))
+                    result = await client.request_page("test-model", PAGE_INPUT, response_version=version)
+                    self.assertEqual(result.response_version, version)
+                    payload = client._post.call_args.args[1 if protocol == "gemini" else 0]
+                    actual_schema = (payload["generationConfig"]["responseJsonSchema"] if protocol == "gemini"
+                                     else payload["text"]["format"]["schema"])
+                    self.assertEqual(actual_schema, schema)
+                    client._post.return_value = response(protocol, page_result(3 - version))
+                    with self.assertRaisesRegex(ModelServiceError, "页面结构无效"):
+                        await client.request_page("test-model", PAGE_INPUT, response_version=version)
+                    if version == 1:
+                        for extra in ({"response_version": 1}, {"layout": None}):
+                            client._post.return_value = response(protocol, {**page_result(1), **extra})
+                            with self.assertRaisesRegex(ModelServiceError, "页面结构无效"):
+                                await client.request_page("test-model", PAGE_INPUT, response_version=1)
+
+    async def test_invalid_layout_is_rejected_without_advancing_context(self):
+        for protocol in ("openai_responses", "gemini"):
+            client = model_client(protocol)
+            client._post = AsyncMock(return_value=response(protocol, page_result()))
+            await client.request_page("test-model", PAGE_INPUT)
+            context = copy.deepcopy(client.contents) if protocol == "gemini" else client.previous_response_id
+            invalid_values = []
+            for bbox in ([.9, .1, .1, .2], [-.1, .1, .9, .2], [.1, .1, 1.1, .2]):
+                value = page_result()
+                value["layout"]["lines"][0]["bbox"] = bbox
+                invalid_values.append(value)
+            value = page_result()
+            value["layout"]["lines"].append(copy.deepcopy(value["layout"]["lines"][0]))
+            invalid_values.append(value)
+            value = page_result()
+            value["layout"]["regions"][0]["parent_id"] = "paragraph"
+            invalid_values.append(value)
+            value = page_result()
+            value["layout"]["source_id"] = "model-forged-source"
+            invalid_values.append(value)
+            value = page_result()
+            value["layout"]["lines"][0]["basis"] = "file_metadata"
+            invalid_values.append(value)
+            value = page_result()
+            value["layout"]["review_reasons"] = [f"模型复核项 {index}" for index in range(101)]
+            invalid_values.append(value)
+            for index, value in enumerate(invalid_values):
+                with self.subTest(protocol=protocol, case=index):
+                    client._post.return_value = response(protocol, value)
+                    with self.assertRaisesRegex(ModelServiceError, "页面结构无效"):
+                        await client.request_page("test-model", PAGE_INPUT)
+                    self.assertEqual(client.contents if protocol == "gemini" else client.previous_response_id, context)
+
+    def test_wire_schema_reserves_program_review_slots(self):
+        self.assertEqual(PAGE_RESPONSE_SCHEMA["$defs"]["LayoutObservation"]["properties"]
+                         ["review_reasons"]["maxItems"], 100)
 
 
 if __name__ == "__main__":

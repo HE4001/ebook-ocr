@@ -15,17 +15,37 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from backend.main import create_app
-from backend.models import PageResult
+from backend.models import StructuredPageResult
 from backend.pipeline import BookProcessor
-from backend.prompts import sections_to_markdown
 from backend.responses_client import ModelServiceError, ResponsesClient
 from backend.storage import Storage
+from backend.latex_migration import legacy_blocks_to_markdown, markdown_to_latex
 
 
 def png_bytes() -> bytes:
     output = BytesIO()
     Image.new("RGB", (32, 24), "white").save(output, format="PNG")
     return output.getvalue()
+
+
+def transcription(text):
+    return StructuredPageResult(header_segments=[], body_latex=text, footer_segments=[])
+
+
+def response_payload(value):
+    value = {**value, "cover_fields": [], "response_version": 2}
+    lines = []
+    regions = []
+    if value["body_latex"]:
+        regions = [{"region_id": "body", "kind": "body", "order": 0,
+                    "bbox": None, "parent_id": None, "basis": None}]
+        lines = [{"line_id": "body-1", "block_id": "body", "order": 0, "kind": "text",
+                  "latex": value["body_latex"], "bbox": None, "baseline": None, "basis": None,
+                  "style": {"font_family": None, "font_size_bp": None, "font_size_ratio": None,
+                            "bold": None, "italic": None, "basis": None}}]
+    value["layout"] = {"schema_version": 1, "body_frame": None, "regions": regions,
+                       "lines": lines, "equation_groups": [], "review_reasons": []}
+    return value
 
 
 class BackendTests(unittest.TestCase):
@@ -35,6 +55,7 @@ class BackendTests(unittest.TestCase):
             book_id = str(uuid4())
             book_dir = storage.books_root / book_id
             book_dir.mkdir()
+            (book_dir / "source.png").write_bytes(png_bytes())
             for number in (1, 2, 3):
                 (book_dir / f"page-{number:04d}.png").write_bytes(png_bytes())
             storage.create_book(book_id, "三页", "three.png", [
@@ -75,7 +96,7 @@ class BackendTests(unittest.TestCase):
                 if block_second and number == 2:
                     second_started.set()
                     self.assertTrue(await asyncio.to_thread(release_second.wait, 5))
-                return f"新{number}"
+                return transcription(f"新{number}")
 
             with patch("backend.pipeline.PageAgent.run", fake_run):
                 self.assertEqual(client.post(f"/api/books/{book_id}/process", json={
@@ -133,6 +154,7 @@ class BackendTests(unittest.TestCase):
             book_id = str(uuid4())
             book_dir = storage.books_root / book_id
             book_dir.mkdir()
+            (book_dir / "source.png").write_bytes(png_bytes())
             for number in (1, 2):
                 (book_dir / f"page-{number:04d}.png").write_bytes(png_bytes())
             storage.create_book(book_id, "两页", "two.png", [
@@ -151,7 +173,7 @@ class BackendTests(unittest.TestCase):
                 if number == 1:
                     first_started.set()
                     self.assertTrue(await asyncio.to_thread(release_first.wait, 5))
-                return f"第 {number} 页"
+                return transcription(f"第 {number} 页")
 
             def wait_for_status(expected: str) -> None:
                 deadline = time.monotonic() + 5
@@ -197,15 +219,12 @@ class BackendTests(unittest.TestCase):
 
     def test_display_equation_delimiters_and_inline_math(self) -> None:
         formula = r"E=mc^2\tag{1}"
-        multiline = "$$\n" + "\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}" + "\n$$"
-        result = PageResult.model_validate({"sections": [
-            {"type": "equation", "text": f"$${formula}$$"},
-            {"type": "equation", "text": multiline},
-            {"type": "paragraph", "text": r"正文 $x^2$ 继续"},
-            {"type": "equation", "text": "旧公式说明"},
-        ]})
-        self.assertEqual(sections_to_markdown(result),
-                         f"$$\n{formula}\n$$\n\n{multiline}\n\n正文 $x^2$ 继续\n\n旧公式说明")
+        multiline = "\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}"
+        body = f"\\[{formula}\\]\n\n{multiline}\n\n正文 $x^2$ 继续\n\n旧公式说明"
+        result = transcription(body)
+        self.assertEqual(result.body_latex, body)
+        self.assertIn(r"\begin{align}", result.body_latex)
+        self.assertIn(r"正文 $x^2$ 继续", result.body_latex)
 
     def test_structured_page_response_and_usage_across_retries(self) -> None:
         async def run() -> None:
@@ -215,6 +234,7 @@ class BackendTests(unittest.TestCase):
                 book_id = str(uuid4())
                 book_dir = storage.books_root / book_id
                 book_dir.mkdir()
+                (book_dir / "source.png").write_bytes(png_bytes())
                 (book_dir / "page-0001.png").write_bytes(png_bytes())
                 storage.create_book(book_id, "测试", "page.png", [(1, 32, 24, "page-0001.png")])
                 response_values = [
@@ -229,18 +249,18 @@ class BackendTests(unittest.TestCase):
                                 "type": "reasoning_text", "text": "不应出现在OCR正文中的推理"
                             }]},
                             {"type": "message", "content": [{
-                                "type": "output_text", "text": json.dumps({
+                                "type": "output_text", "text": json.dumps(response_payload({
                                     "page_kind": "content", "page_side": "unknown",
                                     "header_segments": [{
                                         "kind": "text", "text": "原书页眉", "alignment": "center",
                                         "row": 1, "font_size": "small", "bold": False, "italic": False,
                                     }],
-                                    "body_markdown": "# 标题\n\n正文 **原文**",
+                                    "body_latex": r"\section*{标题}" + "\n\n" + r"正文 \textbf{原文}",
                                     "footer_segments": [{
                                         "kind": "page_number", "text": "12", "alignment": "right",
                                         "row": 1, "font_size": "small", "bold": False, "italic": False,
                                     }],
-                                }, ensure_ascii=False),
+                                }), ensure_ascii=False),
                             }]},
                         ],
                     }),
@@ -273,7 +293,7 @@ class BackendTests(unittest.TestCase):
                 ):
                     await BookProcessor(storage).process(book_id, settings, "secret")
                 page = storage.get_pages(book_id)[0]
-                self.assertEqual(page.text, "# 标题\n\n正文 **原文**")
+                self.assertEqual(page.text, r"\section*{标题}" + "\n\n" + r"正文 \textbf{原文}")
                 self.assertEqual(page.header_segments[0].text, "原书页眉")
                 self.assertEqual(page.footer_segments[0].kind, "page_number")
                 self.assertEqual(page.footer_segments[0].text, "12")
@@ -330,16 +350,17 @@ class BackendTests(unittest.TestCase):
                     "status": "completed", "usage": {
                         "input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
                     "output": [{"type": "message", "content": [{
-                        "type": "output_text", "text": json.dumps({
+                        "type": "output_text", "text": json.dumps(response_payload({
                             "page_kind": "content", "page_side": "unknown",
-                            "header_segments": [], "body_markdown": "", "footer_segments": [],
-                        })}]}],
+                            "header_segments": [], "body_latex": "", "footer_segments": [],
+                        }))}]}],
                 }))
                 with patch("backend.responses_client.httpx.AsyncClient", FakeClient):
                     await BookProcessor(storage).process(book_id, settings, "secret")
                 page = storage.get_pages(book_id)[0]
                 self.assertEqual(page.status, "ready")
-                self.assertEqual(page.text, "")
+                self.assertIn(r"\documentclass", page.text)
+                self.assertEqual(page.layout_source.lines, [])
                 self.assertEqual(page.header_segments, [])
                 self.assertEqual(page.footer_segments, [])
 
@@ -386,9 +407,11 @@ class BackendTests(unittest.TestCase):
             storage = Storage(path)
             storage.initialize()
             page = storage.get_pages(book_id)[0]
-            self.assertIn("## 标题", page.text)
+            self.assertIn(r"\subsection*{标题}", page.text)
             self.assertIn("销售表", page.text)
-            self.assertIn("一 | 二", page.text)
+            self.assertIn(r"\begin{longtable}", page.text)
+            self.assertIn("年 & 值", page.text)
+            self.assertIn("一 & 二", page.text)
             self.assertIn("x^2", page.text)
             self.assertEqual(page.attempts, 0)
             self.assertIsNone(page.usage.total_tokens)
@@ -408,6 +431,16 @@ class BackendTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM page_attempts").fetchone()[0], 0)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM pages").fetchone()[0], 0)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM books").fetchone()[0], 0)
+
+    def test_legacy_table_rows_preserve_caption_and_literal_pipe_cells(self) -> None:
+        markdown = legacy_blocks_to_markdown([{
+            "type": "table", "text": "Original caption", "rows": [["Label", "Value"], ["A | B", "2"]],
+        }])
+        latex = markdown_to_latex(markdown)
+        self.assertIn("Original caption", latex)
+        self.assertIn(r"\begin{longtable}", latex)
+        self.assertIn("Label & Value", latex)
+        self.assertIn("A | B & 2", latex)
 
     def test_reasoning_setting_and_connection_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory, TestClient(create_app(Path(directory))) as client:
@@ -488,7 +521,9 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(set(detail["pages"][0]), {
                 "number", "status", "error", "text", "header_segments",
                 "footer_segments", "usage", "attempts", "source_id",
-                "source_filename", "source_page", "page_kind", "page_side", "cover_fields"})
+                "source_filename", "source_page", "page_kind", "page_side", "cover_fields",
+                "render_strategy", "content_revision", "layout_revision", "generated_content_revision",
+                "layout_source", "source_metadata"})
             self.assertEqual(client.put(f"/api/books/{book_id}/arrangement", json={
                 "file_order": ["legacy"], "page_order": [1],
             }).status_code, 200)
@@ -498,7 +533,7 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(saved.json()["text"], "**人工校对**")
             self.assertEqual(saved.json()["attempts"], 0)
             async def fake_run(_self, *_args):
-                return "**重新识别**"
+                return transcription(r"\textbf{重新识别}")
 
             with patch("backend.pipeline.PageAgent.run", fake_run):
                 self.assertEqual(client.post(f"/api/books/{book_id}/process").json(), {
@@ -507,15 +542,15 @@ class BackendTests(unittest.TestCase):
                 while book_id in client.app.state.running and time.monotonic() < deadline:
                     time.sleep(0.02)
             self.assertEqual(client.get(f"/api/books/{book_id}").json()["pages"][0]["text"],
-                             "**重新识别**")
+                             r"\textbf{重新识别}")
             export = client.get(f"/api/books/{book_id}/export").json()
-            self.assertEqual(export["pages"][0]["text"], "**重新识别**")
-            markdown = client.get(f"/api/books/{book_id}/export.md")
-            self.assertEqual(markdown.status_code, 200)
-            self.assertIn("text/markdown", markdown.headers["content-type"])
-            self.assertIn('.md"', markdown.headers["content-disposition"])
-            self.assertEqual(markdown.text,
-                             "# page\n\n## 第 1 页 · page.png / 源第 1 页\n\n**重新识别**\n")
+            self.assertEqual(export["pages"][0]["text"], r"\textbf{重新识别}")
+            latex = client.get(f"/api/books/{book_id}/export.tex")
+            self.assertEqual(latex.status_code, 200)
+            self.assertIn("text/plain", latex.headers["content-type"])
+            self.assertIn('.tex"', latex.headers["content-disposition"])
+            self.assertIn(r"\textbf{重新识别}", latex.text)
+            self.assertIn(r"\documentclass", latex.text)
 
             fields = [
                 {"kind": "title", "text": "*书名* $x$"},
@@ -540,11 +575,11 @@ class BackendTests(unittest.TestCase):
                                  ("", [], []))
                 self.assertEqual(client.get(f"/api/books/{book_id}").json()["pages"][0], page)
                 self.assertEqual(client.get(f"/api/books/{book_id}/export").json()["pages"][0], page)
-                exported_cover = client.get(f"/api/books/{book_id}/export.md").text
-                self.assertIn(f"### {label}", exported_cover)
-                self.assertIn(r"**书名**：\*书名\* \$x\$", exported_cover)
-                self.assertIn("**作者**：作者甲", exported_cover)
-                self.assertIn("**出版社**：出版社乙", exported_cover)
+                exported_cover = client.get(f"/api/books/{book_id}/export.tex").text
+                self.assertIn(r"\begin{center}", exported_cover)
+                self.assertIn(r"*书名* \$x\$", exported_cover)
+                self.assertIn("作者甲", exported_cover)
+                self.assertIn("出版社乙", exported_cover)
 
             client.app.state.storage.fail_page(book_id, 1, "识别失败")
             failed = client.get(f"/api/books/{book_id}").json()["pages"][0]

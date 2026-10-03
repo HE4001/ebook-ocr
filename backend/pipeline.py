@@ -3,71 +3,65 @@ from __future__ import annotations
 import asyncio
 import base64
 import threading
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .emphasis import apply_emphasis
-from .importers import prepare_source_page
-from .gemini_client import GeminiClient, GeminiConfig
-from .latex_content import validate_latex_fragment
+from .importers import prepare_source_page, read_page_source_metadata
+from .gemini_client import GeminiClient
+from .latex_content import is_latex_document
+from .latex_export import GENERATOR_VERSION, PAPER_SIZES, FidelityLayoutError, generate_source_fidelity_latex
+from .layout_contract import PageSourceMetadata, SourceFidelityLayout
 from .model_client import create_model_client
-from .models import PageKind, StructuredPageResult
-from .prompts import (
-    EMPHASIS_AGENT_PROMPT, PAGE_AGENT_PROMPT, PAGE_CONTEXT_AGENT_PROMPT,
-    SPECIAL_PAGE_AGENT_PROMPT, page_context,
-)
-from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig
+from .models import Book, StructuredPageResult
+from .prompts import PAGE_AGENT_PROMPT, PAGE_CONTEXT_AGENT_PROMPT, PAGE_RESPONSE_VERSION, page_context
+from .responses_client import ModelServiceError, ResponsesClient
 from .storage import Storage
 
 
 _render_lock = threading.Lock()
 
 
-def _prepare_page(book_dir: Path, record: dict[str, Any]) -> tuple[int, int, str]:
+def _prepare_page(book_dir: Path, record: dict[str, Any]) -> tuple[int, int, str, PageSourceMetadata]:
     # PyMuPDF cannot render concurrently, including across different projects.
     with _render_lock:
-        return prepare_source_page(book_dir, record)
-
-
-def _independent_client(config: ResponsesConfig | GeminiConfig) -> ResponsesClient | GeminiClient:
-    config = replace(config, context_reuse_enabled=False)
-    return GeminiClient(config) if isinstance(config, GeminiConfig) else ResponsesClient(config)
-
-
-class SpecialPageAgent:
-    """使用独立上下文读取当前特殊页的书目信息。"""
-
-    def __init__(self, config: ResponsesConfig | GeminiConfig, storage: Storage):
-        self.client = _independent_client(config)
-        self.storage = storage
-
-    async def run(
-        self, book_id: str, number: int, model: str,
-        image_data: str, source_context: str, page_kind: PageKind,
-    ) -> StructuredPageResult:
-        input_value = [
-            {"role": "system", "content": [{"type": "input_text", "text": SPECIAL_PAGE_AGENT_PROMPT}]},
-            {"role": "user", "content": [
-                {"type": "input_text", "text": (
-                    f"{source_context}\n当前页已判定为 {page_kind}，"
-                    "请只读取这张图像的书目信息，保持 page_kind 不变。"
-                )},
-                {"type": "input_image", "image_url": f"data:image/png;base64,{image_data}",
-                 "detail": "high"},
-            ]},
-        ]
-        result = await self.client.request_special_page(
-            model, input_value, page_kind,
-            on_attempt_start=lambda: self.storage.begin_attempt(book_id, number),
-            on_attempt_end=lambda attempt, usage, returned: self.storage.finish_attempt(
-                book_id, number, attempt, usage, returned
-            ),
+        width, height, image_name = prepare_source_page(book_dir, record)
+        metadata = read_page_source_metadata(
+            book_dir, {**record, "width": width, "height": height, "image_name": image_name},
         )
-        return StructuredPageResult(
-            page_kind=result.page_kind, cover_fields=result.cover_fields,
-            header_segments=[], body_latex="", footer_segments=[],
-        )
+        return width, height, image_name, metadata
+
+
+def _source_layout(
+    result: StructuredPageResult, metadata: PageSourceMetadata, book: Book,
+    content_revision: int, layout_revision: int,
+) -> SourceFidelityLayout:
+    observation = result.layout
+    assert observation is not None
+    paper_width_mm, _, _, default_font_size = PAPER_SIZES[book.paper_size]
+    # At most two program reasons here, plus one missing-geometry reason below.
+    reasons = list(observation.review_reasons)
+    if metadata.pdf_geometry is not None:
+        geometry = metadata.pdf_geometry
+        width, height = geometry.width_bp, geometry.height_bp
+        if geometry.rotation in (90, 270):
+            width, height = height, width
+        canvas_basis = "file_metadata"
+    else:
+        width = paper_width_mm * 72 / 25.4
+        height = width * metadata.canonical_height_px / metadata.canonical_width_px
+        canvas_basis = "project"
+        reasons.append("原图没有可信物理尺寸：画布采用项目纸宽并保持原图长宽比，待人工校准。")
+    reasons.append("正文基准字体及字号采用项目设置，原书字体与字号待人工校准。")
+    observation.review_reasons = reasons
+    return SourceFidelityLayout(
+        **observation.model_dump(),
+        source=metadata, content_revision=content_revision, layout_revision=layout_revision,
+        generated_content_revision=None if is_latex_document(result.body_latex) else content_revision,
+        generator_version=GENERATOR_VERSION,
+        canvas_width_bp=width, canvas_height_bp=height, canvas_basis=canvas_basis,
+        body_font_size_bp=book.layout.font_size_pt or default_font_size,
+        body_font_family=book.layout.font_family, body_font_basis="project",
+    )
 
 
 class PageAgent:
@@ -102,38 +96,9 @@ class PageAgent:
             on_attempt_end=lambda attempt, usage, returned: self.storage.finish_attempt(
                 book_id, number, attempt, usage, returned
             ),
+            response_version=PAGE_RESPONSE_VERSION,
         )
-        if result.page_kind == "content":
-            if result.body_latex.strip():
-                review_client = _independent_client(self.client.config)
-                review_input = [
-                    {"role": "system", "content": [
-                        {"type": "input_text", "text": EMPHASIS_AGENT_PROMPT},
-                    ]},
-                    {"role": "user", "content": [
-                        {"type": "input_text", "text": source_context},
-                        {"type": "input_text", "text": result.body_latex},
-                        {"type": "input_image", "image_url": f"data:image/png;base64,{image_data}",
-                         "detail": "high"},
-                    ]},
-                ]
-                emphasis = await review_client.request_emphasis(
-                    model, review_input,
-                    on_attempt_start=lambda: self.storage.begin_attempt(book_id, number),
-                    on_attempt_end=lambda attempt, usage, returned: self.storage.finish_attempt(
-                        book_id, number, attempt, usage, returned
-                    ),
-                )
-                result = StructuredPageResult.model_validate({
-                    **result.model_dump(),
-                    "body_latex": apply_emphasis(result.body_latex, emphasis),
-                })
-                validate_latex_fragment(result.body_latex)
-            return result
-        special_agent = SpecialPageAgent(self.client.config, self.storage)
-        return await special_agent.run(
-            book_id, number, model, image_data, source_context, result.page_kind,
-        )
+        return result
 
 
 class BookProcessor:
@@ -188,9 +153,13 @@ class BookProcessor:
                     if (number in pending_pages or number in manually_saved_pages
                             or record is None or not record["selected"]):
                         continue
+                    revision = record["content_revision"]
                     try:
-                        self.storage.set_page_status(book_id, number, "processing")
-                        width, height, image_name = await asyncio.to_thread(
+                        if not self.storage.set_page_status(
+                            book_id, number, "processing", expected_content_revision=revision,
+                        ):
+                            continue
+                        width, height, image_name, metadata = await asyncio.to_thread(
                             _prepare_page, book_dir, record
                         )
                         self.storage.update_page_image(book_id, number, width, height, image_name)
@@ -198,13 +167,44 @@ class BookProcessor:
                             book_id, number, record["source_page_count"], record["source_filename"],
                             settings["extraction_model"], book_dir / image_name, record["source_page"],
                         )
-                        self.storage.save_page_result(book_id, number, result)
+                        layout_source = None
+                        generated_text = None
+                        strategy = record["render_strategy"] if result.page_kind == "content" else "legacy_template"
+                        if result.page_kind == "content" and result.layout is not None:
+                            book = self.storage.get_book(book_id)
+                            assert book is not None
+                            layout_source = _source_layout(
+                                result, metadata, book, revision + 1, record["layout_revision"] + 1,
+                            )
+                            if is_latex_document(result.body_latex):
+                                strategy = "custom_latex"
+                            else:
+                                strategy = "source_fidelity"
+                                try:
+                                    generated_text = generate_source_fidelity_latex(layout_source)
+                                except FidelityLayoutError as exc:
+                                    # Valid observations with unknown positions remain editable for calibration.
+                                    result.layout.review_reasons.append(str(exc))
+                                    layout_source.review_reasons = list(result.layout.review_reasons)
+                                    layout_source.generated_content_revision = None
+                        elif is_latex_document(result.body_latex):
+                            strategy = "custom_latex"
+                        saved = self.storage.save_page_result(
+                            book_id, number, result, expected_content_revision=revision,
+                            source_metadata=metadata, generated_text=generated_text,
+                            generator_version=GENERATOR_VERSION if layout_source is not None else None,
+                            render_strategy=strategy, layout_source=layout_source,
+                        )
+                        if not saved and context_reuse_enabled:
+                            client.reset_context()
                     except (ModelServiceError, ValueError, OSError) as exc:
-                        self.storage.fail_page(book_id, number, _safe_error(exc))
+                        self.storage.fail_page(
+                            book_id, number, _safe_error(exc), expected_content_revision=revision,
+                        )
                         if context_reuse_enabled:
                             client.reset_context()
                     except asyncio.CancelledError:
-                        self.storage.interrupt_page(book_id, number)
+                        self.storage.interrupt_page(book_id, number, expected_content_revision=revision)
                         raise
 
         try:

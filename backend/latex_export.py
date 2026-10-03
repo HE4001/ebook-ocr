@@ -1,4 +1,4 @@
-"""Build the application's Chinese LaTeX document and compile it with XeLaTeX."""
+"""Build template or standalone LaTeX documents and compile them with XeLaTeX."""
 
 from __future__ import annotations
 
@@ -7,11 +7,15 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from .latex_content import escape_latex, validate_latex_fragment
-from .latex_layout import normalize_latex_layout
+from .fidelity_rendering import (
+    GENERATOR_VERSION, MATHRSFS_FONT_SHAPES, FidelityLayoutError, canvas_dimensions, render_fidelity_source,
+)
+from .latex_content import escape_latex, is_latex_document
+from .layout_contract import AffineTransform, RenderStrategy, SourceFidelityLayout
 from .models import BookDetail, MarginSegment, Page
 
 
@@ -29,6 +33,7 @@ _PREAMBLE = r"""\documentclass[UTF8,fontset=fandol,oneside,openany,linespread=1,
 \usepackage{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{mathrsfs}
+""" + MATHRSFS_FONT_SHAPES + r"""
 \usepackage{longtable,array}
 \usepackage{fancyhdr}
 \usepackage[normalem]{ulem}
@@ -51,7 +56,6 @@ _PREAMBLE = r"""\documentclass[UTF8,fontset=fandol,oneside,openany,linespread=1,
 \EbookCJKFont{\setCJKfamilyfont{zhhei}}{FandolHei-Regular}{FandolHei-Bold}
 \EbookCJKFont[FakeBold=1.5]{\setCJKfamilyfont{zhkai}}{FandolKai-Regular}{FandolKai-Regular}
 \raggedbottom
-\allowdisplaybreaks[1]
 \pagestyle{fancy}
 \fancyhf{}
 \renewcommand{\headrulewidth}{0pt}
@@ -116,6 +120,24 @@ _COMPILE_TIMEOUT_SECONDS = 120
 
 class LatexCompileError(Exception):
     """A readable dependency, source or typesetting error for the HTTP layer."""
+
+    def __init__(self, message: str, *, code: str | None = None,
+                 page_number: int | None = None, line_id: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.page_number = page_number
+        self.line_id = line_id
+
+
+@dataclass(frozen=True)
+class LatexDocument:
+    source: str
+    page_order: list[int]
+    render_strategy: RenderStrategy = "legacy_template"
+    source_to_output_affine: AffineTransform | None = None
+    canvas_scale: float | None = None
+    output_width_bp: float | None = None
+    output_height_bp: float | None = None
 
 
 def _number(value: float) -> str:
@@ -183,28 +205,23 @@ def _cover(page: Page, font_size: float, line_height: float) -> str:
         return r"\null"
     title = {"title", "subtitle"}
     authors = {"author", "translator", "editor"}
-    groups = [
-        [field for field in page.cover_fields if field.kind in title],
-        [field for field in page.cover_fields if field.kind in authors],
-        [field for field in page.cover_fields if field.kind not in title | authors],
-    ]
     parts = [r"\begin{center}", r"\vspace*{0pt}"]
     if page.page_kind == "back_cover":
         parts.append(r"\vfill")
     else:
         parts.append(r"\vspace*{0.08\textwidth}")
-    for index, fields in enumerate(groups):
-        if not fields:
-            continue
-        if index:
+    previous_group = None
+    for field in page.cover_fields:
+        group = 0 if field.kind in title else 1 if field.kind in authors else 2
+        if previous_group is not None and group != previous_group:
             parts.append(r"\vspace{1.5em}")
-        for field in fields:
-            scale = 2.0 if field.kind == "title" else 1.35 if field.kind == "subtitle" else 1
-            content = _plain_lines(field.text)
-            if field.kind == "title":
-                content = rf"\textbf{{{content}}}"
-            size = font_size * scale
-            parts.append(rf"{{\fontsize{{{_number(size)}bp}}{{{_number(size * line_height)}bp}}\selectfont {content}\par}}")
+        previous_group = group
+        scale = 2.0 if field.kind == "title" else 1.35 if field.kind == "subtitle" else 1
+        content = rf"\shortstack[c]{{{_plain_lines(field.text)}}}"
+        if field.kind == "title":
+            content = rf"\textbf{{{content}}}"
+        size = font_size * scale
+        parts.append(rf"{{\fontsize{{{_number(size)}bp}}{{{_number(size * line_height)}bp}}\selectfont {content}\par}}")
     if page.page_kind == "front_cover":
         parts.append(r"\vfill")
     parts.append(r"\end{center}")
@@ -229,14 +246,90 @@ def build_latex(detail: BookDetail, print_version: bool = False) -> str:
         if index:
             parts.append(r"\clearpage")
         parts.append(_page_setup(page, margin, font_size, layout.line_height, print_version))
+        # newgeometry restores the class size; reapply the configured size/baseline.
+        parts.append(r"\normalsize")
         if page.page_kind == "content":
-            validate_latex_fragment(page.text)
-            content = normalize_latex_layout(page.text) if page.text.strip() else r"\null"
+            content = page.text if page.text.strip() else r"\null"
             parts.extend((r"\begingroup", content, r"\par\endgroup"))
         else:
             parts.append(_cover(page, font_size, layout.line_height))
     parts.append(r"\end{document}")
     return "\n".join(parts) + "\n"
+
+
+def generate_source_fidelity_latex(layout: SourceFidelityLayout) -> str:
+    """Save a standalone document at the native source-canvas dimensions."""
+    width, height = canvas_dimensions(layout)
+    return render_fidelity_source(
+        layout, canvas_width_bp=width, canvas_height_bp=height,
+        output_width_bp=width, output_height_bp=height,
+    )
+
+
+def _fidelity_document(detail: BookDetail, page: Page, position: int, print_version: bool) -> LatexDocument:
+    source_layout = page.layout_source
+    if source_layout is None:
+        raise LatexCompileError(
+            f"源页 {page.number} 缺少原书布局，请先校准或显式选择现有模板/自定义源码预览",
+            code="LAYOUT_UNVERIFIED", page_number=page.number,
+        )
+    width_mm, height_mm, default_margin, default_font = PAPER_SIZES[detail.book.paper_size]
+    settings = detail.book.layout
+    width, height = canvas_dimensions(source_layout, width_mm * 72 / 25.4)
+    # These are preview defaults, never persisted as measured source facts.
+    layout = source_layout.model_copy(update={
+        "body_font_size_bp": source_layout.body_font_size_bp or settings.font_size_pt or default_font,
+        "body_font_family": source_layout.body_font_family or settings.font_family,
+    })
+    if settings.source_fidelity_paper == "source":
+        output_width, output_height = width, height
+        scale, x, y = 1.0, 0.0, 0.0
+    else:
+        output_width, output_height = width_mm * 72 / 25.4, height_mm * 72 / 25.4
+        margin = (settings.margin_mm if settings.margin_mm is not None else default_margin) * 72 / 25.4
+        left = right = margin
+        if print_version and page.page_side == "left":
+            left, right = margin * 0.8, margin * 1.2
+        elif print_version and page.page_side == "right":
+            left, right = margin * 1.2, margin * 0.8
+        scale = min((output_width - left - right) / width, (output_height - 2 * margin) / height)
+        if scale <= 0:
+            raise LatexCompileError("目标纸型的边距未留下可用画布空间，请减小边距", page_number=page.number)
+        x = left + (output_width - left - right - width * scale) / 2
+        y = margin + (output_height - 2 * margin - height * scale) / 2
+    try:
+        source = render_fidelity_source(
+            layout, canvas_width_bp=width, canvas_height_bp=height,
+            output_width_bp=output_width, output_height_bp=output_height,
+            scale=scale, offset_x_bp=x, offset_y_bp=y,
+        )
+    except FidelityLayoutError as error:
+        raise LatexCompileError(
+            f"源页 {page.number}：{error}", code="LAYOUT_UNVERIFIED",
+            page_number=page.number, line_id=error.line_id,
+        ) from error
+    return LatexDocument(
+        source, [position], "source_fidelity", (width * scale, 0, 0, height * scale, x, y),
+        scale, output_width, output_height,
+    )
+
+
+def build_latex_documents(detail: BookDetail, print_version: bool = False) -> list[LatexDocument]:
+    """Compile every source page independently, keeping complete custom sources exact."""
+    documents = []
+    for position, page in enumerate(detail.pages, 1):
+        if page.render_strategy == "source_fidelity":
+            documents.append(_fidelity_document(detail, page, position, print_version))
+        elif is_latex_document(page.text):
+            documents.append(LatexDocument(page.text, [position], "custom_latex"))
+        else:
+            page_detail = detail.model_copy(update={"pages": [page]})
+            width, height, _, _ = PAPER_SIZES[detail.book.paper_size]
+            documents.append(LatexDocument(
+                build_latex(page_detail, print_version), [position], page.render_strategy,
+                output_width_bp=width * 72 / 25.4, output_height_bp=height * 72 / 25.4,
+            ))
+    return documents
 
 
 def _compile_reason(output: str) -> str:
@@ -247,13 +340,18 @@ def _compile_reason(output: str) -> str:
             name = Path(match.group(1)).name if match else "所需宏包或字体"
             return f"缺少 LaTeX 文件 {name}；请预先安装完整的 TeX 发行版及所需宏包"
         if "Undefined control sequence" in line:
-            return "正文含有编译器不认识的命令，请检查 LaTeX 片段"
+            return "源码含有编译器不认识的命令，请检查 LaTeX 源码"
         if "font" in line.lower() and ("cannot be found" in line or "not loadable" in line):
-            return "缺少所需字体；请检查 TeX 发行版中的 Fandol 字体"
+            return "缺少所需字体；请检查 LaTeX 源码指定的字体"
         if line.startswith("!") or re.match(r"(?:\./)?document\.tex:\d+:", line):
             reason = re.sub(r"^[! ]+", "", line)
             reason = re.sub(r"[A-Za-z]:[\\/][^\s\"'`]+", "[路径]", reason)
             reason = re.sub(r"(?<!\S)/(?:[^\s/]+/)+[^\s\"'`]*", "[路径]", reason)
+            if r"\bfseries" in reason and "invalid in math mode" in reason:
+                return (
+                    reason[:240]
+                    + r"；\bfseries 用于文字模式；公式内部请按实际字形使用 \boldsymbol 等数学命令，并检查下标范围及外层括号。"
+                )
             return reason[:240]
     return "XeLaTeX 未能完成排版，请检查公式括号、环境、表格列数与文字转义"
 
@@ -291,7 +389,7 @@ def _xelatex_executable() -> str:
 
 
 async def compile_pdf(source: str, output_dir: Path) -> Path:
-    """Compile the trusted document returned by build_latex, never an upload."""
+    """Compile a LaTeX source with the existing XeLaTeX execution restrictions."""
     executable = _xelatex_executable()
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -299,7 +397,8 @@ async def compile_pdf(source: str, output_dir: Path) -> Path:
     compiled_path = output_dir / "compiled.pdf"
     pdf_path.unlink(missing_ok=True)
     compiled_path.unlink(missing_ok=True)
-    (output_dir / "document.tex").write_text(source, encoding="utf-8")
+    (output_dir / "compiled.ebook-metrics.csv").unlink(missing_ok=True)
+    (output_dir / "document.tex").write_text(source, encoding="utf-8", newline="")
     environment = os.environ.copy()
     environment["PATH"] = str(Path(executable).parent) + os.pathsep + environment.get("PATH", "")
     environment.update({"openin_any": "p", "openout_any": "p", "TEXMFOUTPUT": str(output_dir), "shell_escape": "f"})

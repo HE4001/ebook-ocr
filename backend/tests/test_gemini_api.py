@@ -17,6 +17,7 @@ from backend.model_client import create_model_client
 from backend.pipeline import BookProcessor
 from backend.responses_client import ModelServiceError, ResponsesClient
 from backend.storage import Storage
+from backend.tests.layout_response_fixtures import page_response
 
 
 @contextmanager
@@ -28,8 +29,7 @@ def upstream(handler):
 
 
 def normal(kind="content", text="正文"):
-    return {"page_kind": kind, "page_side": "unknown", "header_segments": [],
-            "body_markdown": text if kind == "content" else "", "footer_segments": []}
+    return page_response(text, kind)
 
 
 def answer(value, signature="opaque-signature"):
@@ -65,6 +65,7 @@ def temporary_book(count=1, context=False):
             name = f"page-{number:04d}.png"
             Image.new("RGB", (16, 16), "white").save(root / name)
             pages.append((number, 16, 16, name))
+        (root / "source.png").write_bytes((root / "page-0001.png").read_bytes())
         storage.create_book("gemini-test", "测试", "input.png", pages)
         settings = {**storage.get_settings(), "api_protocol": "gemini",
                     "base_url": "https://gemini.invalid/v1beta", "models_path": "/models",
@@ -174,17 +175,20 @@ class GeminiApiTests(unittest.TestCase):
 class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_pipeline_native_schema_retry_attempts_and_thought_usage(self):
         requests = []
-        value = {**normal(), "page_side": "right", "footer_segments": [{
+        value = page_response(footer_segments=[{
             "kind": "page_number", "text": "3", "alignment": "right", "row": 1,
             "font_size": "small", "bold": False, "italic": False,
-        }]}
+        }])
         def handler(request):
             requests.append(request)
             return httpx.Response(503 if len(requests) == 1 else 200, json=answer(value))
         with temporary_book() as (storage, settings), upstream(handler), patch("backend.gemini_client.asyncio.sleep", return_value=None):
             await BookProcessor(storage).process("gemini-test", settings, "test-key")
             page = storage.get_pages("gemini-test")[0]
-            self.assertEqual((page.status, page.text, page.attempts), ("ready", "正文", 2))
+            self.assertEqual((page.status, page.attempts), ("ready", 2))
+            self.assertIn("正文", page.text)
+            self.assertEqual(page.render_strategy, "source_fidelity")
+            self.assertEqual(page.layout_source.lines[0].latex, "正文")
             self.assertEqual(page.page_side, "right")
             self.assertEqual(page.usage.model_dump(), {"input_tokens": 4, "output_tokens": 14, "total_tokens": 18, "complete": True})
         payload = json.loads(requests[-1].content)
@@ -195,30 +199,31 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
         self.assertEqual(json.loads(requests[0].content), payload)
 
-    async def test_special_pages_have_independent_same_image_requests_and_keep_signed_history(self):
+    async def test_special_pages_use_one_request_and_keep_signed_history(self):
         for kind in ("front_cover", "back_cover"):
             with self.subTest(kind=kind), temporary_book(3, context=True) as (storage, settings):
                 fields = [{"kind": "title", "text": "原图书名"}]
-                values = [answer(normal()), answer(normal(kind)), answer({"page_kind": kind, "cover_fields": fields}), answer(normal(text="后页"))]
+                values = [answer(normal()), answer(page_response(kind=kind, cover_fields=fields)),
+                          answer(normal(text="后页"))]
                 requests = []
                 def handler(request):
                     requests.append(json.loads(request.content))
                     return httpx.Response(200, json=values[len(requests) - 1])
                 with upstream(handler):
                     await BookProcessor(storage).process("gemini-test", settings, "test-key")
-                first, routing, special, following = requests
-                self.assertEqual([len(p["contents"]) for p in requests], [1, 3, 1, 5])
-                self.assertEqual(routing["contents"][1], values[0]["candidates"][0]["content"])
+                first, cover_request, following = requests
+                self.assertEqual([len(p["contents"]) for p in requests], [1, 3, 5])
+                self.assertEqual(cover_request["contents"][1], values[0]["candidates"][0]["content"])
                 self.assertEqual(following["contents"][3], values[1]["candidates"][0]["content"])
-                self.assertEqual(special["contents"][0]["parts"][1], routing["contents"][-1]["parts"][1])
-                self.assertNotEqual(special["systemInstruction"], first["systemInstruction"])
-                self.assertEqual(set(special["generationConfig"]["responseJsonSchema"]["properties"]), {"page_kind", "cover_fields"})
+                self.assertEqual(cover_request["systemInstruction"], first["systemInstruction"])
+                self.assertEqual(cover_request["generationConfig"]["responseJsonSchema"],
+                                 first["generationConfig"]["responseJsonSchema"])
                 cover = storage.get_pages("gemini-test")[1]
-                self.assertEqual((cover.status, cover.page_kind, cover.text, cover.attempts), ("ready", kind, "", 2))
+                self.assertEqual((cover.status, cover.page_kind, cover.text, cover.attempts), ("ready", kind, "", 1))
                 self.assertEqual([field.model_dump() for field in cover.cover_fields], fields)
                 self.assertEqual(cover.page_side, "unknown")
-                self.assertEqual(cover.usage.model_dump(), {"input_tokens": 4, "output_tokens": 14, "total_tokens": 18, "complete": True})
-                self.assertEqual(storage.get_pages("gemini-test")[2].text, "后页")
+                self.assertEqual(cover.usage.model_dump(), {"input_tokens": 2, "output_tokens": 7, "total_tokens": 9, "complete": True})
+                self.assertIn("后页", storage.get_pages("gemini-test")[2].text)
 
     async def test_failures_do_not_pollute_context_or_leak_upstream_details_and_reset(self):
         client = GeminiClient(GeminiConfig("https://gemini.invalid/v1beta", "/models", "test-key", 15, context_reuse_enabled=True))
@@ -252,13 +257,15 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
             await client.request_page("models/manual-model", page_input())
         self.assertEqual(len(requests[-1]["contents"]), 1)
 
-    async def test_special_kind_mismatch_is_visible_pipeline_failure(self):
-        outcomes = [answer(normal("front_cover")), answer({"page_kind": "back_cover", "cover_fields": []})]
+    async def test_cover_with_content_layout_is_visible_pipeline_failure(self):
+        invalid = normal("front_cover")
+        invalid["layout"] = normal()["layout"]
+        outcomes = [answer(invalid)]
         with temporary_book(context=True) as (storage, settings), upstream(lambda request: httpx.Response(200, json=outcomes.pop(0))):
             await BookProcessor(storage).process("gemini-test", settings, "test-key")
             page = storage.get_pages("gemini-test")[0]
-            self.assertEqual((page.status, page.attempts), ("failed", 2))
-            self.assertIn("页面类型", page.error)
+            self.assertEqual((page.status, page.attempts), ("failed", 1))
+            self.assertIn("页面结构无效", page.error)
             self.assertEqual(page.cover_fields, [])
 
 

@@ -12,6 +12,11 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from backend.main import create_app
+from backend.models import StructuredPageResult
+from backend.pipeline import BookProcessor
+from backend.responses_client import ModelServiceError
+from backend.storage import Storage
+from backend.tests.layout_response_fixtures import page_response
 
 
 class ConcurrentProofreadingTests(unittest.TestCase):
@@ -25,6 +30,7 @@ class ConcurrentProofreadingTests(unittest.TestCase):
                     book_dir.mkdir()
                     image = BytesIO()
                     Image.new('RGB', (32, 24), 'white').save(image, format='PNG')
+                    (book_dir / 'source.png').write_bytes(image.getvalue())
                     for number in range(1, 5):
                         (book_dir / f'page-{number:04d}.png').write_bytes(image.getvalue())
                     storage.create_book(book_id, '校对并发', 'pages.png', [
@@ -53,7 +59,7 @@ class ConcurrentProofreadingTests(unittest.TestCase):
                             started.set()
                             if not await asyncio.to_thread(release.wait, 5):
                                 raise AssertionError('识别模拟未释放')
-                        return f'OCR {number}'
+                        return StructuredPageResult.model_validate(page_response(f'OCR {number}'))
 
                     def wait_finished():
                         deadline = time.monotonic() + 5
@@ -100,7 +106,48 @@ class ConcurrentProofreadingTests(unittest.TestCase):
                         self.assertEqual(client.post(base + '/process', json={'pages': [3]}).status_code, 200)
                         wait_finished()
                         self.assertEqual(called[-1], 3)
-                        self.assertEqual(storage.get_pages(book_id)[2].text, 'OCR 3')
+                        self.assertIn('OCR 3', storage.get_pages(book_id)[2].text)
+                        self.assertEqual(storage.get_pages(book_id)[2].layout_source.lines[0].latex, 'OCR 3')
+
+
+class InFlightRevisionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_revision_survives_old_result_failure_and_cancellation(self):
+        for outcome in ('result', 'failure', 'cancellation'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                storage = Storage(Path(directory))
+                storage.initialize()
+                book_id = 'revision-race'
+                book_dir = storage.books_root / book_id
+                book_dir.mkdir()
+                Image.new('RGB', (32, 24), 'white').save(book_dir / 'source.png')
+                (book_dir / 'page.png').write_bytes((book_dir / 'source.png').read_bytes())
+                storage.create_book(book_id, '并发修订', 'source.png', [(1, 32, 24, 'page.png')])
+                started, release = asyncio.Event(), asyncio.Event()
+
+                async def recognize(*_args):
+                    started.set()
+                    await release.wait()
+                    if outcome == 'failure':
+                        raise ModelServiceError('旧任务失败')
+                    return StructuredPageResult.model_validate(page_response('旧识别正文'))
+
+                with patch('backend.pipeline.PageAgent.run', recognize):
+                    task = asyncio.create_task(BookProcessor(storage).process(book_id, storage.get_settings(), 'mock'))
+                    await started.wait()
+                    storage.save_manual_text(book_id, 1, '最新人工源码')
+                    revision = storage.get_pages(book_id)[0].content_revision
+                    if outcome == 'cancellation':
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    else:
+                        release.set()
+                        await task
+                page = storage.get_pages(book_id)[0]
+                self.assertEqual((page.status, page.text, page.content_revision), ('ready', '最新人工源码', revision))
+                self.assertEqual(page.render_strategy, 'custom_latex')
+                self.assertIsNone(page.error)
+                self.assertIsNone(page.layout_source)
 
 
 if __name__ == '__main__':

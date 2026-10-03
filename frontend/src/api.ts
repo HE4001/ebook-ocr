@@ -1,4 +1,4 @@
-import type { Arrangement, Book, BookDetail, LayoutSettings, Page, PageDraft, PaperSize, PdfCompileResult, Settings } from './types'
+import type { Arrangement, Book, BookDetail, LayoutCalibrationUpdate, LayoutSettings, Page, PageDraft, PaperSize, PdfCompileResult, RenderStrategy, Settings } from './types'
 
 const API_PREFIX = '/api'
 
@@ -10,7 +10,7 @@ function detailMessage(value: unknown, fallback: string): string {
   return fallback
 }
 
-async function request<T>(path: string, init?: RequestInit, responseFormat: 'json' | 'text' = 'json'): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, responseFormat: 'json' | 'response' = 'json'): Promise<T> {
   const requestPath = `${API_PREFIX}${path}`
   let response: Response
   try {
@@ -31,7 +31,7 @@ async function request<T>(path: string, init?: RequestInit, responseFormat: 'jso
     throw new Error(`本地接口 ${requestPath} 请求失败（HTTP ${response.status}）${suffix}`)
   }
   if (response.status === 204) return undefined as T
-  if (responseFormat === 'text') return await response.text() as T
+  if (responseFormat === 'response') return response as T
   return response.json() as Promise<T>
 }
 
@@ -56,8 +56,9 @@ export const api = {
       body: JSON.stringify(order),
     }),
   pagePreviewUrl: (id: string, number: number) => `${API_PREFIX}/books/${encodeURIComponent(id)}/pages/${number}/preview`,
+  compiledPageUrl: (pdfUrl: string, outputPage: number) => pdfUrl.replace(/\.pdf$/, `/pages/${outputPage}.png`),
   getBook: (id: string) => request<BookDetail>(`/books/${encodeURIComponent(id)}`),
-  saveBookLayout: (id: string, changes: { paper_size?: PaperSize; layout?: LayoutSettings }) => request<Book>(`/books/${encodeURIComponent(id)}/layout`, {
+  saveBookLayout: (id: string, changes: { paper_size?: PaperSize; layout?: LayoutSettings; render_strategy?: RenderStrategy }) => request<Book>(`/books/${encodeURIComponent(id)}/layout`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(changes),
@@ -68,7 +69,17 @@ export const api = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(draft),
   }),
-  exportLatex: (id: string, printVersion: boolean) => request<string>(`/books/${encodeURIComponent(id)}/export.tex?print_version=${printVersion}`, undefined, 'text'),
+  savePageLayout: (id: string, number: number, draft: LayoutCalibrationUpdate) => request<Page>(`/books/${encodeURIComponent(id)}/pages/${number}/layout`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft),
+  }),
+  compilePageLayout: (id: string, number: number, draft: LayoutCalibrationUpdate, printVersion: boolean) => request<PdfCompileResult>(`/books/${encodeURIComponent(id)}/pages/${number}/compile-layout-pdf?print_version=${printVersion}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft),
+  }),
+  exportLatex: async (id: string, printVersion: boolean) => {
+    const response = await request<Response>(`/books/${encodeURIComponent(id)}/export.tex?print_version=${printVersion}`, undefined, 'response')
+    const extension = response.headers.get('Content-Type')?.startsWith('application/zip') ? '.zip' : '.tex'
+    return { blob: await response.blob(), extension }
+  },
   deleteBook: (id: string) => request<void>(`/books/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   uploadBook: (file: File) => {
     const form = new FormData()
