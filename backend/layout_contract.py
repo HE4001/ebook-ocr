@@ -209,11 +209,14 @@ class PdfSourceGeometry(LayoutModel):
 class PageSourceMetadata(LayoutModel):
     book_id: str
     page_number: int = Field(ge=1)
+    page_id: str = ""
     source_id: str
+    source_file_id: str = ""
     source_page: int = Field(ge=1)
+    source_version: int = Field(default=1, ge=1)
     source_kind: Literal["pdf", "image"]
-    source_file_fingerprint: str
-    image_fingerprint: str
+    source_file_fingerprint: str = ""  # Existing cache compatibility only.
+    image_fingerprint: str = ""
     canonical_width_px: int = Field(gt=0)
     canonical_height_px: int = Field(gt=0)
     source_width_px: int | None = Field(default=None, gt=0)
@@ -232,6 +235,17 @@ class PageSourceMetadata(LayoutModel):
         return self
 
 
+class SourceRegionAsset(LayoutModel):
+    """A local source crop retained in the document and every resource export."""
+
+    asset_id: LayoutId
+    region_id: LayoutId | None = None
+    bbox: BBox
+    image_name: str = Field(min_length=1, max_length=1_000)
+    purpose: Literal["figure", "uncertain_content", "source_page"]
+    reason: str = Field(default="", max_length=2_000)
+
+
 class SourceFidelityLayout(LayoutObservation):
     source: PageSourceMetadata
     content_revision: int = Field(ge=0)
@@ -244,6 +258,9 @@ class SourceFidelityLayout(LayoutObservation):
     body_font_size_bp: float | None = Field(default=None, gt=0, le=200)
     body_font_family: FontFamily | None = None
     body_font_basis: EvidenceBasis | None = None
+    source_assets: list[SourceRegionAsset] = Field(default_factory=list, max_length=500)
+    source_disposition: Literal["transcribed", "regions_preserved", "source_page_preserved"] = "transcribed"
+    disposition_reason: str | None = Field(default=None, max_length=2_000)
 
     @model_validator(mode="after")
     def validate_canvas(self) -> "SourceFidelityLayout":

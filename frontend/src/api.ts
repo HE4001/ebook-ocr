@@ -1,4 +1,4 @@
-import type { Arrangement, Book, BookDetail, LayoutCalibrationUpdate, LayoutSettings, Page, PageDraft, PaperSize, PdfCompileResult, RenderStrategy, Settings } from './types'
+import type { Arrangement, Book, BookDetail, ExportManifest, ExportManifestCreate, Issue, LayoutCalibrationUpdate, LayoutSettings, Page, PageDraft, PageResult, PaperSize, PdfCompileResult, RenderStrategy, Run, RunCreate, Settings } from './types'
 
 const API_PREFIX = '/api'
 
@@ -15,7 +15,8 @@ async function request<T>(path: string, init?: RequestInit, responseFormat: 'jso
   let response: Response
   try {
     response = await fetch(requestPath, init)
-  } catch {
+  } catch (error) {
+    if (init?.signal?.aborted) throw error
     throw new Error(`无法连接本地服务（请求 ${requestPath}），请确认后端已启动。`)
   }
 
@@ -58,6 +59,25 @@ export const api = {
   pagePreviewUrl: (id: string, number: number) => `${API_PREFIX}/books/${encodeURIComponent(id)}/pages/${number}/preview`,
   compiledPageUrl: (pdfUrl: string, outputPage: number) => pdfUrl.replace(/\.pdf$/, `/pages/${outputPage}.png`),
   getBook: (id: string) => request<BookDetail>(`/books/${encodeURIComponent(id)}`),
+  createRun: (id: string, run: RunCreate) => request<Run>(`/books/${encodeURIComponent(id)}/runs`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(run),
+  }),
+  listRuns: (id: string, signal?: AbortSignal) => request<Run[]>(`/books/${encodeURIComponent(id)}/runs`, { signal }),
+  getRun: (id: string, runId: string, signal?: AbortSignal) => request<Run>(`/books/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`, { signal }),
+  pauseRun: (id: string, runId: string) => request<Run>(`/books/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/pause`, { method: 'POST' }),
+  resumeRun: (id: string, runId: string) => request<Run>(`/books/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' }),
+  getResults: (id: string, offset: number, limit: number, signal?: AbortSignal) => request<PageResult[]>(`/books/${encodeURIComponent(id)}/results?offset=${offset}&limit=${limit}`, { signal }),
+  getIssues: (id: string, offset: number, limit: number, signal?: AbortSignal) => request<Issue[]>(`/books/${encodeURIComponent(id)}/issues?offset=${offset}&limit=${limit}`, { signal }),
+  createExportManifest: (id: string, manifest: ExportManifestCreate) => request<ExportManifest>(`/books/${encodeURIComponent(id)}/export-manifests`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(manifest),
+  }),
+  getExportManifest: (id: string, manifestId: string, signal?: AbortSignal) => request<ExportManifest>(`/books/${encodeURIComponent(id)}/export-manifests/${encodeURIComponent(manifestId)}`, { signal }),
+  manifestDownloadUrl: (id: string, manifestId: string, format: 'pdf' | 'partial_pdf' | 'latex' | 'json') => `${API_PREFIX}/books/${encodeURIComponent(id)}/export-manifests/${encodeURIComponent(manifestId)}/${format}`,
+  downloadManifest: async (id: string, manifestId: string, format: 'pdf' | 'partial_pdf' | 'latex' | 'json', signal?: AbortSignal) => {
+    const response = await request<Response>(`/books/${encodeURIComponent(id)}/export-manifests/${encodeURIComponent(manifestId)}/${format}`, { signal }, 'response')
+    const extension = format === 'latex' ? '.zip' : format === 'json' ? '.json' : '.pdf'
+    return { blob: await response.blob(), extension }
+  },
   saveBookLayout: (id: string, changes: { paper_size?: PaperSize; layout?: LayoutSettings; render_strategy?: RenderStrategy }) => request<Book>(`/books/${encodeURIComponent(id)}/layout`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

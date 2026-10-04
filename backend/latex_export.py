@@ -14,7 +14,7 @@ from pathlib import Path
 from .fidelity_rendering import (
     GENERATOR_VERSION, MATHRSFS_FONT_SHAPES, FidelityLayoutError, canvas_dimensions, render_fidelity_source,
 )
-from .latex_content import escape_latex, is_latex_document
+from .latex_content import escape_latex, is_latex_document, latex_image_resources, source_resource_name
 from .layout_contract import AffineTransform, RenderStrategy, SourceFidelityLayout
 from .models import BookDetail, MarginSegment, Page
 
@@ -30,7 +30,7 @@ PAPER_SIZES = {
 }
 
 _PREAMBLE = r"""\documentclass[UTF8,fontset=fandol,oneside,openany,linespread=1,autoindent=false]{ctexbook}
-\usepackage{geometry}
+\usepackage{geometry,graphicx}
 \usepackage{amsmath,amssymb}
 \usepackage{mathrsfs}
 """ + MATHRSFS_FONT_SHAPES + r"""
@@ -138,6 +138,7 @@ class LatexDocument:
     canvas_scale: float | None = None
     output_width_bp: float | None = None
     output_height_bp: float | None = None
+    resource_names: tuple[str, ...] = ()
 
 
 def _number(value: float) -> str:
@@ -270,7 +271,7 @@ def _fidelity_document(detail: BookDetail, page: Page, position: int, print_vers
     source_layout = page.layout_source
     if source_layout is None:
         raise LatexCompileError(
-            f"源页 {page.number} 缺少原书布局，请先校准或显式选择现有模板/自定义源码预览",
+            f"源页 {page.number} 尚未取得可生成的原书布局",
             code="LAYOUT_UNVERIFIED", page_number=page.number,
         )
     width_mm, height_mm, default_margin, default_font = PAPER_SIZES[detail.book.paper_size]
@@ -311,6 +312,7 @@ def _fidelity_document(detail: BookDetail, page: Page, position: int, print_vers
     return LatexDocument(
         source, [position], "source_fidelity", (width * scale, 0, 0, height * scale, x, y),
         scale, output_width, output_height,
+        tuple(source_resource_name(asset.image_name) for asset in layout.source_assets),
     )
 
 
@@ -321,15 +323,30 @@ def build_latex_documents(detail: BookDetail, print_version: bool = False) -> li
         if page.render_strategy == "source_fidelity":
             documents.append(_fidelity_document(detail, page, position, print_version))
         elif is_latex_document(page.text):
-            documents.append(LatexDocument(page.text, [position], "custom_latex"))
+            documents.append(LatexDocument(page.text, [position], "custom_latex",
+                                           resource_names=latex_image_resources(page.text)))
         else:
             page_detail = detail.model_copy(update={"pages": [page]})
             width, height, _, _ = PAPER_SIZES[detail.book.paper_size]
             documents.append(LatexDocument(
                 build_latex(page_detail, print_version), [position], page.render_strategy,
                 output_width_bp=width * 72 / 25.4, output_height_bp=height * 72 / 25.4,
+                resource_names=latex_image_resources(page.text),
             ))
     return documents
+
+
+def copy_document_resources(document: LatexDocument, book_dir: Path, output_dir: Path) -> None:
+    """Copy exactly the referenced assets while retaining book-relative names."""
+    root = book_dir.resolve()
+    for name in document.resource_names:
+        relative = source_resource_name(name)
+        source = (root / relative).resolve()
+        if not source.is_relative_to(root) or not source.is_file():
+            raise LatexCompileError(f"缺少源区域资源：{relative}", code="SOURCE_RESOURCE_MISSING")
+        target = output_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
 
 
 def _compile_reason(output: str) -> str:

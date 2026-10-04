@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import { PdfPreview } from './PdfPreview'
-import { downloadBlob, downloadText, downloadUrl, safeFilename } from './downloads'
 import ProjectOrganizer from './ProjectOrganizer'
+import WorkflowDashboard from './WorkflowDashboard'
 import { PageEditor } from './PageEditor'
 import { LayoutCalibration } from './LayoutCalibration'
 import { SourceComparison } from './SourceComparison'
@@ -11,12 +11,13 @@ import { calibrationFromPage } from './layoutDraft'
 import { LayoutSettingsForm } from './LayoutSettingsForm'
 import { ReasoningControl } from './ReasoningControl'
 import { bindingPageSide, PAPER_SIZES } from './paper'
-import type { ApiProtocol, BBox, Book, BookDetail, LayoutCalibrationUpdate, LayoutSettings, Notice, Page, PageDraft, PaperSize, PdfCompileResult, RenderDiagnostic, RenderStrategy, Settings, Usage } from './types'
+import type { ApiProtocol, BBox, Book, BookDetail, LayoutCalibrationUpdate, LayoutSettings, Notice, Page, PageDraft, PaperSize, PdfCompileResult, RenderDiagnostic, RenderStrategy, Run, Settings, Usage } from './types'
 
 const STATUS_LABEL: Record<string, string> = {
-  uploaded: '待处理', processing: '处理中', pausing: '正在暂停', paused: '已暂停', ready: '已完成',
+  uploaded: '待处理', processing: '处理中', pausing: '正在暂停', paused: '已暂停', ready: '已有结果',
   failed: '失败', interrupted: '已中断',
 }
+const RUN_STATUS_LABEL: Record<Run['status'], string> = { queued: '排队中', running: '自动处理中', pausing: '正在暂停', paused: '已暂停', succeeded: '处理结束', failed: '处理失败', interrupted: '已中断' }
 
 const DEFAULT_API_BASES: Record<ApiProtocol, string> = {
   openai_responses: 'https://api.openai.com/v1',
@@ -74,14 +75,6 @@ function geminiGenerationEndpoint(settings: Settings): string {
   const collection = endpoint(settings.base_url, settings.models_path).replace(/\/+$/, '')
   const model = settings.extraction_model.trim().replace(/^models\//, '')
   return `${collection}/${model ? encodeURIComponent(model) : '{model}'}:generateContent`
-}
-
-function connectionTestMessage(result: { ok: boolean; message: string }, protocol: ApiProtocol) {
-  if (!result.ok && /HTTP\s+404\b/i.test(result.message)) {
-    const pathName = protocol === 'gemini' ? 'Gemini Models 资源集合路径' : 'Responses 接入路径'
-    return { ...result, message: `模型服务返回 HTTP 404：请检查实际 POST 地址、${pathName}和模型名称。这不能证明 API 密钥有误。` }
-  }
-  return result
 }
 
 function UsageView({ usage, attempts }: { usage: Usage; attempts?: number }) {
@@ -254,7 +247,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
     setSaving(true)
     setTestResult(null)
     try {
-      setTestResult(connectionTestMessage(await api.testSettings(), settings.api_protocol))
+      setTestResult(await api.testSettings())
     } catch (error) {
       setTestResult({ ok: false, message: errorText(error) })
     } finally {
@@ -298,7 +291,7 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
           <label><span>服务器模型</span><select value={models?.includes(settings.extraction_model) ? settings.extraction_model : ''} onChange={(event) => update('extraction_model', event.target.value)} disabled={saving || modelsLoading || !models?.length}><option value="" disabled>{models?.length ? '选择模型，不会自动保存' : '获取模型后选择'}</option>{models?.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
           <small>{isGemini ? '仅列出服务声明支持 generateContent 的模型；不保证支持图片输入或结构化输出，请确认所选模型能力。' : '模型列表仅提供名称，不代表模型支持 Responses 或图片输入，请向供应商确认。'}</small>
         </div>
-        <label><span>页面代理模型 ID</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} placeholder="手动填写，或从上方列表选择" disabled={saving} /><small>{isGemini && '可填裸模型 ID 或 models/ 开头的完整资源名。'}保存后用于逐页识别，返回页眉、LaTeX 正文和页脚。</small></label>
+        <label><span>自动识别与复核模型 ID</span><input value={settings.extraction_model} onChange={(event) => update('extraction_model', event.target.value)} placeholder="手动填写，或从上方列表选择" disabled={saving} /><small>{isGemini && '可填裸模型 ID 或 models/ 开头的完整资源名。'}任务使用所选模型识别、独立复核及必要的局部修复。</small></label>
         <ReasoningControl protocol={settings.api_protocol} value={settings.reasoning_effort} onChange={(value) => update('reasoning_effort', value)} disabled={saving} />
         <div className="field-grid compact-grid">
           <label><span>超时秒数</span><input type="number" min={5} max={600} value={settings.timeout_seconds} onChange={(event) => update('timeout_seconds', Number(event.target.value))} disabled={saving} /></label>
@@ -320,28 +313,25 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
           </select>
           <small id="context-reuse-pages-help">含首张页面。按编排顺序连续分组，组间并行、组内依次识别，最终页序不变；每次开始处理都会建立新对话。</small>
         </label>}
-        {testResult && <div className={testResult.ok ? 'inline-result success-box' : 'inline-result error-box'}>{testResult.message}</div>}
-        <div className="button-row"><button className="primary" onClick={save} disabled={saving || modelsLoading || needsNewKey}>{saving ? '请稍候…' : '保存设置'}</button><button onClick={test} disabled={saving || modelsLoading || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存当前改动' : undefined}>主动测试连接</button></div>
-        {hasUnsavedChanges && <p className="settings-warning">有未保存改动。请先保存，再测试模型连接。</p>}
-        <p className="settings-footnote">获取模型只查询列表，不保存设置或发送推理请求。保存设置不会联系模型服务。主动测试使用已保存配置发送请求，可能产生供应商用量。</p>
+        {testResult && <div className={testResult.ok ? 'inline-result success-box' : 'inline-result error-box'}>配置检查：{testResult.message}</div>}
+        <div className="button-row"><button className="primary" onClick={save} disabled={saving || modelsLoading || needsNewKey}>{saving ? '请稍候…' : '保存设置'}</button><button onClick={test} disabled={saving || modelsLoading || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存当前改动' : undefined}>检查已保存配置</button></div>
+        {hasUnsavedChanges && <p className="settings-warning">有未保存改动。请先保存，再检查已保存配置。</p>}
+        <p className="settings-footnote">获取模型只查询列表，不保存设置或发送推理请求。保存设置及配置检查不会调用模型；实际图片与结构化输出能力由首次正常页面请求确认。</p>
       </div>
     </main>
   )
 }
 
-type WorkspaceView = 'upload' | 'organize' | 'workspace' | 'preview' | 'settings'
+type WorkspaceView = 'dashboard' | 'upload' | 'organize' | 'workspace' | 'preview' | 'settings'
 type PdfResult = { key: string; result: PdfCompileResult | null; error: string | null; origin: 'saved' | 'source_draft' | 'layout_draft' }
 
 const STRATEGY_LABEL: Record<RenderStrategy, string> = { source_fidelity: '原书还原', legacy_template: '现有模板', custom_latex: '自定义源码' }
 
 function projectView(book: Book): WorkspaceView {
-  if (!book.upload_confirmed) return 'upload'
-  return book.selection_confirmed ? 'workspace' : 'organize'
+  return book.page_count ? 'dashboard' : 'upload'
 }
 
 function projectStatus(book: Book): string {
-  if (!book.upload_confirmed) return '待确认资料'
-  if (!book.selection_confirmed) return '待编排'
   return STATUS_LABEL[book.status] ?? book.status
 }
 
@@ -401,7 +391,7 @@ function PaperSizeControl({ value, saving, disabled, onChange }: {
 }
 
 export default function App() {
-  const [view, setView] = useState<WorkspaceView>('upload')
+  const [view, setView] = useState<WorkspaceView>('dashboard')
   const [books, setBooks] = useState<Book[]>([])
   const [selectedBookId, setSelectedBookId] = useState<string | null>(null)
   const [detail, setDetail] = useState<BookDetail | null>(null)
@@ -415,6 +405,8 @@ export default function App() {
   const [proofingFocus, setProofingFocus] = useState<ProofingFocus | null>(null)
   const [organizerDirty, setOrganizerDirty] = useState(false)
   const [organizerBusy, setOrganizerBusy] = useState(false)
+  const [workflowBusy, setWorkflowBusy] = useState(false)
+  const [automaticRun, setAutomaticRun] = useState<Run | null>(null)
   const [notice, setNotice] = useState<Notice>(null)
   const [initialLoading, setInitialLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -500,6 +492,15 @@ export default function App() {
     }
   }, [applyDetail])
 
+  const refreshCurrentBook = useCallback(() => {
+    const id = selectedBookIdRef.current
+    if (id) void loadDetail(id, true)
+  }, [loadDetail])
+  const updateAutomaticRun = useCallback((value: Run | null) => {
+    if (value && value.book_id !== selectedBookIdRef.current) return
+    setAutomaticRun(value)
+  }, [])
+
   useEffect(() => { void loadBooks() }, [loadBooks])
   useEffect(() => {
     setDirty(false)
@@ -511,25 +512,25 @@ export default function App() {
     setDetail(null)
     setSelectedPageNumber(1)
     setPrintVersion(false)
+    setAutomaticRun(null)
+    setWorkflowBusy(false)
     if (selectedBookId) void loadDetail(selectedBookId, false, true)
   }, [selectedBookId, loadDetail])
   useEffect(() => {
-    if (!selectedBookId || actionBusy || layoutSaving || compiling || !['processing', 'pausing'].includes(detail?.book.status ?? '')) return
+    if (!selectedBookId || automaticRun || actionBusy || layoutSaving || compiling || !['processing', 'pausing'].includes(detail?.book.status ?? '')) return
     const timer = window.setInterval(() => void loadDetail(selectedBookId, true), 2000)
     return () => window.clearInterval(timer)
-  }, [selectedBookId, detail?.book.status, actionBusy, layoutSaving, compiling, loadDetail])
+  }, [selectedBookId, detail?.book.status, automaticRun, actionBusy, layoutSaving, compiling, loadDetail])
 
   const sourcePage = useMemo(() => detail?.pages.find((page) => page.number === selectedPageNumber) ?? null, [detail, selectedPageNumber])
-  const sourcePageHasResult = sourcePage && (sourcePage.status === 'ready' || Boolean(sourcePage.text || sourcePage.cover_fields.length || sourcePage.header_segments.length || sourcePage.footer_segments.length))
-  const pendingPages = detail?.pages.filter((page) => page.status !== 'ready') ?? []
-  const pagesToProcess = pendingPages.map((page) => page.number)
   const bindingPageCount = detail?.pages.filter((page) => bindingPageSide(page, detail?.book.layout.source_fidelity_paper) !== 'unknown').length ?? 0
   const effectivePrintVersion = printVersion && bindingPageCount > 0
-  const isRunning = detail?.book.status === 'processing' || detail?.book.status === 'pausing'
-  const busy = actionBusy || saving || layoutSaving || uploading || deleting || organizerBusy || compiling !== null
+  const isRunning = Boolean(automaticRun && ['queued', 'running', 'pausing', 'paused'].includes(automaticRun.status))
+    || detail?.book.status === 'processing' || detail?.book.status === 'pausing'
+  const localBusy = actionBusy || saving || layoutSaving || uploading || deleting || organizerBusy || compiling !== null
+  const busy = localBusy || workflowBusy
   const processLocked = isRunning || busy
-  const editLocked = busy || sourcePage?.status === 'processing'
-  const progress = detail?.book.selected_page_count ? Math.round(detail.book.completed_pages / detail.book.selected_page_count * 100) : 0
+  const editLocked = busy
   const oldBackendContract = Boolean(detail && (!Array.isArray(detail.files) || !detail.book.usage || detail.book.content_format !== 'latex' || !detail.book.layout
     || detail.pages.some((page) => typeof page.text !== 'string' || !page.page_kind || !Array.isArray(page.cover_fields) || !Array.isArray(page.header_segments) || !Array.isArray(page.footer_segments) || !page.usage)))
 
@@ -562,7 +563,7 @@ export default function App() {
     && proofingFocus.layout_revision === sourcePage.layout_revision ? proofingFocus : null
 
   const leaveDrafts = () => {
-    const message = organizerDirty ? '页面编排尚未确认，确定离开并放弃这些调整吗？' : layoutDirty ? '整书排版设置尚未保存，确定离开并放弃吗？' : '当前页有未保存修改，确定离开并放弃吗？'
+    const message = organizerDirty ? '页面编排尚未保存，确定离开并放弃这些调整吗？' : layoutDirty ? '整书排版设置尚未保存，确定离开并放弃吗？' : '当前页有未保存修改，确定离开并放弃吗？'
     if ((dirty || calibrationDirty || organizerDirty || layoutDirty) && !window.confirm(message)) return false
     setDirty(false)
     setCalibrationDirty(false)
@@ -639,7 +640,7 @@ export default function App() {
       const value = await api.uploadFiles(id, files)
       applyDetail({ book: value.book, files: value.files, pages: value.order.map((number) => value.pages.find((page) => page.number === number)!) })
       setView('upload')
-      setNotice({ kind: 'success', text: `已添加 ${files.length} 个文件。项目现有 ${value.files.length} 个文件，请确认资料后继续编排。` })
+      setNotice({ kind: 'success', text: `已添加 ${files.length} 个文件。可按默认页序开始自动任务，或主动调整编排。上传没有发送模型请求。` })
     } catch (error) {
       const message = errorText(error)
       setUploadError(message)
@@ -650,74 +651,18 @@ export default function App() {
     }
   }
 
-  const confirmUpload = async () => {
-    if (!detail || processLocked || detail.files.length === 0) return
-    setActionBusy(true)
-    try {
-      const value = await api.confirmUpload(detail.book.id)
-      applyDetail({ book: value.book, files: value.files, pages: value.order.map((number) => value.pages.find((page) => page.number === number)!) })
-      setView('organize')
-      setNotice({ kind: 'success', text: '资料已确认。请选择页面、调整文件和页内顺序，再确认最终编排。' })
-    } catch (error) {
-      setNotice({ kind: 'error', text: errorText(error) })
-    } finally {
-      setActionBusy(false)
-    }
-  }
-
   const confirmArrangement = (value: BookDetail) => {
     invalidatePdfs()
     applyDetail(value)
     setOrganizerDirty(false)
-    setView('workspace')
-    setNotice({ kind: 'success', text: `编排已确认，共 ${value.pages.length} 页。可以开始识别并逐页校对。` })
-  }
-
-  const processPages = async (pages: number[]) => {
-    if (!detail?.book.selection_confirmed || processLocked || pages.length === 0) return
-    const bookId = detail.book.id
-    const targets = detail.pages.filter((page) => pages.includes(page.number))
-    const discardDraft = (dirty || calibrationDirty) && pages.includes(selectedPageNumber)
-    if ((targets.some((page) => page.status === 'ready' || Boolean(page.text || page.cover_fields.length || page.header_segments.length || page.footer_segments.length)) || discardDraft)
-      && !window.confirm(`这次处理会产生新的模型用量，成功后会覆盖本次处理页面已有的识别或校对文本。${discardDraft ? '当前未保存修改也会被放弃。' : ''}确定继续吗？`)) return
-    setActionBusy(true)
-    try {
-      const result = await api.processBook(bookId, pages)
-      if (result.started && discardDraft) {
-        setDirty(false)
-        setCalibrationDirty(false)
-        setPageDraft(draftFromPage(sourcePage))
-        setCalibrationDraft(sourcePage ? calibrationFromPage(sourcePage) : null)
-      }
-      if (result.started) invalidatePdfs()
-      setNotice({ kind: 'success', text: result.started ? '处理已开始，页面完成后自动更新，最终顺序保持不变。' : '当前没有需要处理的页面。' })
-      await loadDetail(bookId, true)
-    } catch (error) {
-      setNotice({ kind: 'error', text: errorText(error) })
-    } finally {
-      setActionBusy(false)
-    }
-  }
-
-  const pauseBook = async () => {
-    if (!selectedBookId) return
-    setActionBusy(true)
-    try {
-      await api.pauseBook(selectedBookId)
-      setNotice({ kind: 'info', text: '已请求暂停。等待所有已开始的页面完成后暂停，不再开始新页面。' })
-      await loadDetail(selectedBookId, true)
-    } catch (error) {
-      setNotice({ kind: 'error', text: errorText(error) })
-      await loadDetail(selectedBookId, true)
-    } finally {
-      setActionBusy(false)
-    }
+    setView('dashboard')
+    setNotice({ kind: 'success', text: `编排已保存，共 ${value.pages.length} 页。可在任务总览一次开始自动处理。` })
   }
 
   const deleteBook = async () => {
     if (!detail || processLocked) return
     const book = detail.book
-    if (!window.confirm(`确定删除项目「${book.title}」吗？这会删除项目内全部源文件、识别和校对结果，且无法撤销。`)) return
+    if (!window.confirm(`确定删除项目「${book.title}」吗？这会删除项目内全部源文件、自动结果和人工稿，且无法撤销。`)) return
     setDeleting(true)
     try {
       await api.deleteBook(book.id)
@@ -921,34 +866,6 @@ export default function App() {
     }
   }
 
-  const exportJson = async () => {
-    if (!detail) return
-    setActionBusy(true)
-    try {
-      const data = await api.exportBook(detail.book.id)
-      const name = safeFilename(data.book.title)
-      downloadText(name + '.json', JSON.stringify(data, null, 2), 'application/json;charset=utf-8')
-      setNotice({ kind: 'success', text: 'JSON 已下载。' })
-    } catch (error) {
-      setNotice({ kind: 'error', text: errorText(error) })
-    } finally {
-      setActionBusy(false)
-    }
-  }
-
-  const exportLatex = async () => {
-    setActionBusy(true)
-    try {
-      const source = await api.exportLatex(detail!.book.id, effectivePrintVersion)
-      downloadBlob(safeFilename(detail!.book.title) + source.extension, source.blob)
-      setNotice({ kind: 'success', text: source.extension === '.zip' ? 'LaTeX 源码包已下载。' : 'LaTeX 源码已下载。' })
-    } catch (error) {
-      setNotice({ kind: 'error', text: errorText(error) })
-    } finally {
-      setActionBusy(false)
-    }
-  }
-
   return (
     <div className="app-shell">
       <header className="topbar no-print">
@@ -968,7 +885,7 @@ export default function App() {
                 <button className={book.id === selectedBookId && !newProject ? 'book-item selected' : 'book-item'} onClick={() => chooseBook(book.id)} disabled={busy} key={book.id} aria-current={book.id === selectedBookId && !newProject ? 'page' : undefined}>
                   <span className="book-item-title">{book.title}</span>
                   <span className="project-file-count">{book.file_count} 个文件 · {book.page_count} 页</span>
-                  <span className="book-item-meta"><span className={statusClass(book.status)}>{projectStatus(book)}</span>{book.selection_confirmed && <span>{book.completed_pages} / {book.selected_page_count} 已完成</span>}</span>
+                  <span className="book-item-meta"><span className={statusClass(book.status)}>{book.id === selectedBookId && automaticRun ? RUN_STATUS_LABEL[automaticRun.status] : projectStatus(book)}</span><span>{book.selected_page_count} 页已编排</span></span>
                 </button>
               ))}</div>
             )}
@@ -984,51 +901,51 @@ export default function App() {
                 </form>
               </section>
             ) : !selectedBookId ? (
-              <div className="welcome-state"><span className="welcome-icon">页</span><h1>多份资料，一本书稿</h1><p>先建立项目，汇集 PDF 与图片；确认页序后，再识别和校对。</p><button className="primary" onClick={beginProject} disabled={busy}>新建第一个项目</button></div>
+              <div className="welcome-state"><span className="welcome-icon">页</span><h1>多份资料，一本书稿</h1><p>建立项目并上传 PDF 或图片，一次开始后自动识别、复核和生成输出。</p><button className="primary" onClick={beginProject} disabled={busy}>新建第一个项目</button></div>
             ) : detailLoading || !detail || detail.book.id !== selectedBookId ? <div className="center-state">正在读取项目…</div>
               : oldBackendContract ? <div className="center-state"><h2>后端仍在运行旧版本</h2><p>请运行 <code>ocr.bat Restart</code>，以加载当前 LaTeX 正文和排版接口。</p></div>
               : <>
                 <header className="book-header project-header no-print">
                   <div className="book-overview">
                     <div className="book-heading">
-                      <p className="eyebrow">当前项目</p><div className="book-title-row"><h1>{detail.book.title}</h1><span className={statusClass(detail.book.status)}>{projectStatus(detail.book)}</span></div>
-                      <div className="book-meta"><p className="book-summary"><span>{detail.files.length} 个文件</span><span>源资料 {detail.book.page_count} 页</span>{detail.book.selection_confirmed && <><span>编排 {detail.book.selected_page_count} 页</span><span>已完成 {detail.book.completed_pages} 页</span></>}</p></div>
+                      <p className="eyebrow">当前项目</p><div className="book-title-row"><h1>{detail.book.title}</h1><span className={statusClass(detail.book.status)}>{automaticRun ? RUN_STATUS_LABEL[automaticRun.status] : projectStatus(detail.book)}</span></div>
+                      <div className="book-meta"><p className="book-summary"><span>{detail.files.length} 个文件</span><span>源资料 {detail.book.page_count} 页</span><span>编排 {detail.pages.length} 页 · r{detail.book.arrangement_revision}</span></p></div>
                     </div>
                     <button className="book-delete danger-action" onClick={deleteBook} disabled={processLocked}>{deleting ? '删除中…' : '删除项目'}</button>
                   </div>
-                  <nav className="workflow-nav" aria-label="项目处理步骤">
-                    <button className={view === 'upload' ? 'current' : ''} aria-current={view === 'upload' ? 'step' : undefined} onClick={() => changeView('upload')} disabled={busy}><span>1</span><strong>上传资料</strong><small>{detail.book.upload_confirmed ? '已确认' : '确认文件'}</small></button>
-                    <button className={view === 'organize' ? 'current' : ''} aria-current={view === 'organize' ? 'step' : undefined} onClick={() => changeView('organize')} disabled={!detail.book.upload_confirmed || busy || isRunning}><span>2</span><strong>页面编排</strong><small>{detail.book.selection_confirmed ? '已确认' : '选页与排序'}</small></button>
-                    <button className={view === 'workspace' ? 'current' : ''} aria-current={view === 'workspace' ? 'step' : undefined} onClick={() => changeView('workspace')} disabled={!detail.book.selection_confirmed || busy}><span>3</span><strong>逐页校对</strong><small>识别与编辑</small></button>
-                    <button className={view === 'preview' ? 'current' : ''} aria-current={view === 'preview' ? 'step' : undefined} onClick={() => changeView('preview')} disabled={!detail.book.selection_confirmed || busy}><span>4</span><strong>整书预览</strong><small>预览与导出</small></button>
+                  <nav className="workflow-nav" aria-label="项目视图">
+                    <button className={view === 'dashboard' ? 'current' : ''} aria-current={view === 'dashboard' ? 'page' : undefined} onClick={() => changeView('dashboard')} disabled={busy}><span>总</span><strong>自动任务</strong><small>进度、结果与导出</small></button>
+                    <button className={view === 'upload' ? 'current' : ''} aria-current={view === 'upload' ? 'page' : undefined} onClick={() => changeView('upload')} disabled={busy}><span>资</span><strong>上传资料</strong><small>添加源文件</small></button>
+                    <button className={view === 'organize' ? 'current' : ''} aria-current={view === 'organize' ? 'page' : undefined} onClick={() => changeView('organize')} disabled={busy || isRunning || !detail.files.length}><span>序</span><strong>页面编排</strong><small>可选调整</small></button>
+                    <button className={view === 'workspace' ? 'current' : ''} aria-current={view === 'workspace' ? 'page' : undefined} onClick={() => changeView('workspace')} disabled={busy || !detail.pages.length}><span>编</span><strong>高级编辑</strong><small>主动编辑与校准</small></button>
+                    <button className={view === 'preview' ? 'current' : ''} aria-current={view === 'preview' ? 'page' : undefined} onClick={() => changeView('preview')} disabled={busy || !detail.pages.length}><span>览</span><strong>高级排版</strong><small>已保存稿预览</small></button>
                   </nav>
                 </header>
-                {view === 'upload' ? (
+                <div hidden={view !== 'dashboard'}><WorkflowDashboard key={detail.book.id} detail={detail} disabled={localBusy || dirty || calibrationDirty || organizerDirty || layoutDirty} onBusyChange={setWorkflowBusy} onRunChange={updateAutomaticRun} onBookUpdated={refreshCurrentBook} onOrganize={() => changeView('organize')} onSettings={() => changeView('settings')} /></div>
+                {view === 'dashboard' ? null : view === 'upload' ? (
                   <section className="project-upload">
-                    <div className="upload-intro"><div><p className="eyebrow">项目资料</p><h2>{detail.files.length ? '确认本次使用的文件' : '把资料添加到这个项目'}</h2><p>支持一次选择多个 PDF、PNG 或 JPEG，可分批继续添加。</p></div><span className="file-total">{detail.files.length}<small>个文件</small></span></div>
+                    <div className="upload-intro"><div><p className="eyebrow">项目资料</p><h2>{detail.files.length ? '项目中的源文件' : '把资料添加到这个项目'}</h2><p>支持一次选择多个 PDF、PNG 或 JPEG。上传不会发送模型请求。</p></div><span className="file-total">{detail.files.length}<small>个文件</small></span></div>
                     <input ref={fileInput} className="visually-hidden" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={upload} disabled={processLocked} />
-                    <div className="upload-target"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M8 11V5h12l5 5v17H8V21M20 5v6h5M3 16h13m-4-4 4 4-4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg><div><strong>{uploading ? '正在添加文件并读取页面…' : 'PDF 和图片，一起加入'}</strong><p>{isRunning ? '处理运行中；暂停后可添加资料。' : detail.book.selection_confirmed ? '添加新资料后，需要重新确认上传与编排。已有识别结果会保留。' : '上传完成后点击下方确认，再选择页面和编排顺序。'}</p></div><button className="primary" onClick={() => fileInput.current?.click()} disabled={processLocked}>{uploading ? '上传中…' : '选择文件'}</button></div>
+                    <div className="upload-target"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M8 11V5h12l5 5v17H8V21M20 5v6h5M3 16h13m-4-4 4 4-4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg><div><strong>{uploading ? '正在添加文件并读取页面…' : 'PDF 和图片，一起加入'}</strong><p>{isRunning ? '本轮页序已冻结；任务结束后可添加资料。' : '新页默认加入页序。上传后可直接开始自动任务，也可主动调整顺序；已有稿件会保留。'}</p></div><button className="primary" onClick={() => fileInput.current?.click()} disabled={processLocked}>{uploading ? '上传中…' : '选择文件'}</button></div>
                     {uploadError && <div className="upload-error" role="alert"><strong>文件添加未完成</strong><p>{uploadError}</p><span>下方列表显示当前项目已保存的文件，请核对后再继续添加。</span></div>}
                     {detail.files.length > 0 && <div className="source-groups">{(['pdf', 'image'] as const).map((kind) => {
                       const files = detail.files.filter((file) => file.kind === kind)
                       return files.length > 0 && <section className="source-group" key={kind}><div className="source-group-heading"><h3>{kind === 'pdf' ? 'PDF 文档' : '图片'}</h3><span>{files.length} 个文件 · {files.reduce((total, file) => total + file.page_count, 0)} 页</span></div><ul>{files.map((file) => <li key={file.id}><span className={'file-kind ' + kind}>{kind === 'pdf' ? 'PDF' : '图'}</span><span className="source-filename" title={file.filename}>{file.filename}</span><span className="source-pages">{file.page_count} 页</span></li>)}</ul></section>
                     })}</div>}
-                    <div className="upload-confirm"><p>{detail.files.length ? `共 ${detail.files.length} 个文件、${detail.book.page_count} 页。确认后进入页面编排。` : '先添加至少一个文件，再确认资料。'}</p><button className="primary" onClick={confirmUpload} disabled={processLocked || detail.files.length === 0}>{actionBusy ? '确认中…' : detail.book.upload_confirmed ? '进入页面编排' : '确认上传，开始编排'}</button></div>
+                    <div className="upload-confirm"><p>{detail.files.length ? `共 ${detail.files.length} 个文件、${detail.book.page_count} 页。到任务总览一次确认范围、模型、纸型和额度即可开始。` : '添加文件后即可设置并开始自动任务。'}</p><div className="button-row"><button onClick={() => changeView('organize')} disabled={processLocked || !detail.files.length}>调整页序（可选）</button><button className="primary" onClick={() => changeView('dashboard')} disabled={busy || !detail.pages.length}>进入自动任务总览</button></div></div>
                   </section>
-                ) : view === 'organize' ? <ProjectOrganizer key={detail.book.id} bookId={detail.book.id} onConfirmed={confirmArrangement} onNotice={showNotice} disabled={processLocked} onDirtyChange={setOrganizerDirty} onBusyChange={setOrganizerBusy} />
+                ) : view === 'organize' ? <ProjectOrganizer key={detail.book.id} bookId={detail.book.id} onSaved={confirmArrangement} onNotice={showNotice} disabled={processLocked} onDirtyChange={setOrganizerDirty} onBusyChange={setOrganizerBusy} />
                   : view === 'preview' ? <>
                     <section className="preview-toolbar no-print" aria-labelledby="preview-title">
                       <div className="preview-heading">
-                        <div><h2 id="preview-title">预览与导出</h2><p>{detail.pages.length} 个源页已编排 · 整书只使用已保存内容和布局，实际输出范围见页映射</p></div>
+                        <div><h2 id="preview-title">高级排版与预览</h2><p>{detail.pages.length} 个源页已编排 · 主动调整已保存稿；自动任务无需打开此页或手动编译</p></div>
                         <div className="button-row export-buttons">
-                          <button onClick={() => void exportJson()} disabled={busy}>下载 JSON</button>
-                          <button onClick={() => void exportLatex()} disabled={processLocked || layoutDirty}>下载 LaTeX</button>
-                          <button onClick={() => downloadUrl(safeFilename(detail.book.title) + '.pdf', currentBookPdf!.result!.pdf_url!)} disabled={busy || !currentBookPdf?.result?.pdf_url || layoutDirty}>下载 PDF</button>
+                          <button onClick={() => changeView('dashboard')} disabled={busy}>回总览导出同一清单</button>
                           <button className="primary" onClick={() => void compileBook()} disabled={processLocked || layoutDirty}>{compiling === 'book' ? '正在生成 PDF…' : '生成/更新 PDF'}</button>
                         </div>
                       </div>
                       <div className="preview-options">
-                        <PaperSizeControl value={detail.book.paper_size} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
+                        <PaperSizeControl value={detail.book.paper_size} saving={layoutSaving} disabled={processLocked} onChange={savePaperSize} />
                         <div className="print-layout-option">
                           <span className={`binding-preview${effectivePrintVersion ? ' is-bound' : ''}`} aria-hidden="true"><i /><i /></span>
                           <label className="print-version-control">
@@ -1043,23 +960,20 @@ export default function App() {
                         <details className="export-help"><summary>导出与打印说明</summary><p>PDF 与 LaTeX 使用已保存内容和布局。原书还原页按原页画布整体映射；现有模板页使用项目排版；完整自定义文档保留自身文档类、宏包、纸张和排版。单份源码下载为 .tex，混合内容或多份独立文档下载为 ZIP 源码包。</p><p>装订选项按已知原页侧别应用；未知页侧保持居中。实际输出纸张、页数和比例以页映射为准。内容、布局、页序或项目排版变化后请更新 PDF；PDF 生成需要本机 XeLaTeX 及源码所需宏包和字体。</p></details>
                         <ToolbarUsage usage={detail.book.usage} />
                       </div>
-                      <LayoutSettingsForm key={detail.book.id} layout={detail.book.layout} paperSize={detail.book.paper_size} renderStrategy={detail.book.render_strategy} dirty={layoutDirty} saving={layoutSaving} disabled={busy} onDirtyChange={(changed) => { invalidatePdfs(); setLayoutDirty(changed) }} onSave={saveLayoutSettings} />
+                      <LayoutSettingsForm key={detail.book.id} layout={detail.book.layout} paperSize={detail.book.paper_size} renderStrategy={detail.book.render_strategy} dirty={layoutDirty} saving={layoutSaving} disabled={processLocked} onDirtyChange={(changed) => { invalidatePdfs(); setLayoutDirty(changed) }} onSave={saveLayoutSettings} />
                     </section>
                     <div className="book-pdf-preview"><PdfPreview result={currentBookPdf?.result ?? null} error={currentBookPdf?.error ?? null} loading={compiling === 'book'} title="整书 PDF 预览" onDiagnostic={locateDiagnostic} emptyMessage={layoutDirty ? '先保存排版设置，再生成整书 PDF。' : '点击“生成/更新 PDF”查看已保存书稿；内容或布局变化后需重新生成。'} /></div>
                   </> : <>
-                    <section className="proofing-toolbar no-print" aria-label="逐页校对工具栏">
+                    <section className="proofing-toolbar no-print" aria-label="主动编辑工具栏">
                       <div className="proofing-controls">
                         <div className="proofing-status">
-                          <div className="proofing-status-title"><h2>{isRunning ? (detail.book.status === 'pausing' ? '正在暂停识别' : '正在逐页识别') : pendingPages.length ? `待识别 ${pendingPages.length} 页` : detail.pages.length ? '页面已全部识别' : '编排暂无页面'}</h2><span>{detail.book.completed_pages} / {detail.book.selected_page_count} 页</span></div>
-                          <div className="progress-track" role="progressbar" aria-label="已编排页面识别进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><span style={{ width: progress + '%' }} /></div>
-                          <p>{isRunning ? '已开始的页面会完成并保存结果' : pendingPages.length ? '识别完成后，可逐页检查并保存校对' : detail.pages.length ? '可继续校对，或进入整书预览' : '返回页面编排，加入需要识别的页面'}</p>
+                          <div className="proofing-status-title"><h2>高级编辑</h2><span>{detail.pages.length} 个编排页</span></div>
+                          <p>主动修改源码或校准布局；自动任务不依赖这里的操作。运行中保存新编辑后，旧候选不会覆盖它。</p>
                         </div>
-                        <PaperSizeControl value={detail.book.paper_size} saving={layoutSaving} disabled={busy} onChange={savePaperSize} />
+                        <PaperSizeControl value={detail.book.paper_size} saving={layoutSaving} disabled={processLocked} onChange={savePaperSize} />
                         <div className="button-row proofing-actions">
-                          <button onClick={() => changeView('organize')} disabled={processLocked}>修改编排</button>
-                          {pagesToProcess.length > 0 && <button onClick={() => void processPages(pagesToProcess)} className="primary" disabled={processLocked}>{isRunning ? '处理中…' : '识别未完成页'}</button>}
-                          {isRunning && <button onClick={pauseBook} disabled={actionBusy || detail.book.status === 'pausing'}>{detail.book.status === 'pausing' ? '正在暂停…' : '暂停处理'}</button>}
-                          {!isRunning && detail.pages.length > 0 && pendingPages.length === 0 && <button className="primary" onClick={() => changeView('preview')} disabled={busy}>整书预览 <span aria-hidden="true">→</span></button>}
+                          <button className="primary" onClick={() => changeView('dashboard')} disabled={busy}>自动任务总览</button>
+                          <button onClick={() => changeView('preview')} disabled={busy}>高级排版预览</button>
                         </div>
                       </div>
                       <ToolbarUsage usage={detail.book.usage} />
@@ -1068,10 +982,10 @@ export default function App() {
                     <div className="workspace-grid">
                       <aside className="page-rail" aria-label="已编排页面">{detail.pages.map((page, index) => <div className="page-row unconfirmed" key={page.number}><button className={page.number === selectedPageNumber ? 'page-link selected' : 'page-link'} onClick={() => choosePage(page)} disabled={busy} aria-current={page.number === selectedPageNumber ? 'page' : undefined}><span className="page-order-label">编排第 {index + 1} 页</span><span className="page-source-name" title={sourceLabel(page)}>{sourceLabel(page)}</span><span className={statusClass(page.status)}>{STATUS_LABEL[page.status] ?? page.status}</span></button></div>)}</aside>
                       {sourcePage ? <div className="proofing-area">
-                        <div className="page-heading"><div><p className="eyebrow">编排第 {detail.pages.findIndex((page) => page.number === sourcePage.number) + 1} 页</p><div className="button-row"><h2 className="proofing-source-title">{sourceLabel(sourcePage)}</h2><span className={statusClass(sourcePage.status)}>{STATUS_LABEL[sourcePage.status] ?? sourcePage.status}</span><button onClick={() => void processPages([sourcePage.number])} disabled={processLocked} title="仅识别当前页面">{sourcePageHasResult ? '重新识别本页' : '识别本页'}</button></div></div><UsageView usage={sourcePage.usage} attempts={sourcePage.attempts} /></div>
+                        <div className="page-heading"><div><p className="eyebrow">编排第 {detail.pages.findIndex((page) => page.number === sourcePage.number) + 1} 页</p><div className="button-row"><h2 className="proofing-source-title">{sourceLabel(sourcePage)}</h2><span className={statusClass(sourcePage.status)}>{STATUS_LABEL[sourcePage.status] ?? sourcePage.status}</span></div></div><UsageView usage={sourcePage.usage} attempts={sourcePage.attempts} /></div>
                         {sourcePage.error && <div className="page-error">{sourcePage.error}</div>}
                         <p className="page-layout-note">已保存策略：{STRATEGY_LABEL[sourcePage.render_strategy]} · 内容 r{sourcePage.content_revision} / 布局 r{sourcePage.layout_revision}<span>项目纸型：{PAPER_SIZES[detail.book.paper_size].label} · {detail.book.layout.source_fidelity_paper === 'source' ? '还原页采用源页尺寸' : '还原页整体映射到项目纸型'}</span></p>
-                        {sourcePage.render_strategy === 'source_fidelity' && !sourcePage.layout_source && <p className="missing-layout-note">本页缺少原书布局，需校准；目前没有原书还原通过结论。</p>}
+                        {sourcePage.render_strategy === 'source_fidelity' && !sourcePage.layout_source && <p className="missing-layout-note">本页尚无保存的原书布局。自动任务会恢复布局；这里也可主动编辑。</p>}
                         {sourcePage.render_strategy === 'custom_latex' && <p className="source-authority-summary">版式由源码控制。保留的原书布局不会覆盖当前源码。</p>}
                         <SourceComparison key={`${detail.book.id}-${sourcePage.number}`} bookId={detail.book.id} page={sourcePage} result={comparisonResult} loading={compiling === 'page'} focus={currentProofingFocus} />
                         <div className="page-preview-result">
@@ -1079,13 +993,13 @@ export default function App() {
                           <PdfPreview result={comparisonResult} error={currentPagePdf?.error ?? null} loading={compiling === 'page'} title={`${sourceLabel(sourcePage)} PDF 预览`} onDiagnostic={locateDiagnostic} emptyMessage="选择下方编辑方式，预览本页草稿后查看质量诊断和完整 PDF。" />
                         </div>
                         <details className="page-editing" open>
-                          <summary>本页校对与校准{dirty || calibrationDirty ? ' · 未保存草稿' : ''}</summary>
+                          <summary>本页主动编辑与校准{dirty || calibrationDirty ? ' · 未保存草稿' : ''}</summary>
                           <div className="page-editor-tabs" role="group" aria-label="编辑方式"><button aria-pressed={pageEditMode === 'layout'} onClick={() => switchPageEditor('layout')} disabled={editLocked || sourcePage.page_kind !== 'content'}>原书布局校准</button><button aria-pressed={pageEditMode === 'source'} onClick={() => switchPageEditor('source')} disabled={editLocked}>自由源码 / 书目信息</button></div>
-                          {editLocked && <div className="lock-note">{sourcePage.status === 'processing' ? '本页正在识别，暂不可编辑；可切换到其他页面校对。' : '正在更新，本页暂不可编辑。'}</div>}
+                          {editLocked && <div className="lock-note">正在保存或生成预览，请稍候。</div>}
                           {pageEditMode === 'layout' ? <LayoutCalibration key={`${detail.book.id}-${sourcePage.number}-${sourcePage.content_revision}-${sourcePage.layout_revision}-${calibrationEditorRevision}`} page={sourcePage} draft={calibrationDraft} dirty={calibrationDirty} disabled={editLocked} saving={saving} onChange={changeCalibrationDraft} onEditing={() => { invalidatePdfs(); setCalibrationDirty(true) }} onSave={() => void saveCalibration()} onPreview={() => void compilePage()} onLocate={locateRegion} onRestore={() => { invalidatePdfs(); setCalibrationDraft(calibrationFromPage(sourcePage)); setCalibrationDirty(false); setCalibrationEditorRevision((value) => value + 1) }} />
                             : <section className="text-panel"><div className="panel-title"><strong>自由源码编辑</strong><div className="button-row"><button onClick={() => void compilePage()} disabled={editLocked || layoutDirty}>{compiling === 'page' ? '正在生成…' : '预览本页源码草稿'}</button><button className="primary" onClick={savePage} disabled={!dirty || editLocked}>{saving ? '保存中…' : '保存本页源码'}</button></div></div><PageEditor draft={pageDraft} onChange={changePageDraft} disabled={editLocked} /></section>}
                         </details>
-                      </div> : <div className="page-list-empty"><h2>编排暂无页面</h2><p>返回页面编排，选择需要识别和校对的页面。</p><button onClick={() => changeView('organize')} disabled={processLocked}>进入页面编排</button></div>}
+                      </div> : <div className="page-list-empty"><h2>编排暂无页面</h2><p>添加资料或调整编排后，可开始自动任务。</p><button onClick={() => changeView('organize')} disabled={processLocked}>调整页面编排</button></div>}
                     </div>
                   </>}
               </>}

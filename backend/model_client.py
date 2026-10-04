@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .gemini_client import GeminiClient, GeminiConfig
-from .responses_client import ResponsesClient, ResponsesConfig
+from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig
 
 
 def create_model_client(
@@ -11,7 +11,10 @@ def create_model_client(
 ) -> ResponsesClient | GeminiClient:
     if context_reuse_enabled is None:
         context_reuse_enabled = settings.get("context_reuse_enabled", False)
-    if settings.get("api_protocol", "openai_responses") == "gemini":
+    protocol = settings.get("api_protocol", "openai_responses")
+    if protocol not in {"openai_responses", "gemini"}:
+        raise ModelServiceError("不支持的模型服务协议", configuration_error=True)
+    if protocol == "gemini":
         return GeminiClient(GeminiConfig(
             base_url=settings["base_url"],
             models_path=settings["models_path"],

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import io
-import hashlib
 import math
-from functools import lru_cache
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +15,8 @@ from .layout_contract import PageSourceMetadata, PdfSourceGeometry
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_RENDER_PIXELS = 20_000_000
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+# All PyMuPDF access, including previews and compilation, uses this lock.
+IMAGE_LOCK = threading.RLock()
 
 
 class ImportFailure(ValueError):
@@ -25,7 +26,8 @@ class ImportFailure(ValueError):
 def import_document(data: bytes, filename: str, book_dir: Path) -> list[tuple[int, int, int, str]]:
     suffix = Path(filename).suffix.lower()
     if suffix == ".pdf":
-        return _import_pdf(data, book_dir)
+        with IMAGE_LOCK:
+            return _import_pdf(data, book_dir)
     if suffix in {".png", ".jpg", ".jpeg"}:
         return _import_image(data, suffix, book_dir)
     raise ImportFailure("仅支持 PDF、PNG 和 JPEG 文件")
@@ -64,6 +66,11 @@ def _save_single_pdf_page(document: fitz.Document, index: int, target: Path) -> 
 
 
 def ensure_pdf_pages(book_dir: Path, page_numbers: list[int]) -> None:
+    with IMAGE_LOCK:
+        _ensure_pdf_pages(book_dir, page_numbers)
+
+
+def _ensure_pdf_pages(book_dir: Path, page_numbers: list[int]) -> None:
     """Create missing single-page PDFs for an already imported source PDF.
 
     Only the requested missing pages are created; existing files and rendered
@@ -101,6 +108,11 @@ def ensure_pdf_pages(book_dir: Path, page_numbers: list[int]) -> None:
 
 
 def prepare_pdf_page(book_dir: Path, number: int) -> tuple[int, int, int, str]:
+    with IMAGE_LOCK:
+        return _prepare_pdf_page(book_dir, number)
+
+
+def _prepare_pdf_page(book_dir: Path, number: int) -> tuple[int, int, int, str]:
     """Prepare and reuse assets for one selected source PDF page."""
     ensure_pdf_pages(book_dir, [number])
     image_name = f"page-{number:04d}.png"
@@ -175,23 +187,24 @@ def prepare_source_page(book_dir: Path, record: dict[str, Any]) -> tuple[int, in
     return record["width"], record["height"], record["image_name"]
 
 
-def _file_fingerprint(path: Path) -> str:
-    with path.open("rb") as source:
-        return hashlib.file_digest(source, "sha256").hexdigest()
-
-
-@lru_cache(maxsize=128)
-def _cached_source_fingerprint(path: Path, mtime_ns: int, size: int) -> str:
-    return _file_fingerprint(path)
-
-
-def _source_file_fingerprint(path: Path) -> str:
-    resolved = path.resolve()
-    stat = resolved.stat()
-    return _cached_source_fingerprint(resolved, stat.st_mtime_ns, stat.st_size)
+def prepare_page(
+    book_dir: Path, record: dict[str, Any],
+) -> tuple[int, int, str, PageSourceMetadata]:
+    """Prepare one immutable source page and its reversible provenance."""
+    with IMAGE_LOCK:
+        width, height, image_name = prepare_source_page(book_dir, record)
+        metadata = read_page_source_metadata(
+            book_dir, {**record, "width": width, "height": height, "image_name": image_name},
+        )
+    return width, height, image_name, metadata
 
 
 def read_page_source_metadata(book_dir: Path, record: dict[str, Any]) -> PageSourceMetadata:
+    with IMAGE_LOCK:
+        return _read_page_source_metadata(book_dir, record)
+
+
+def _read_page_source_metadata(book_dir: Path, record: dict[str, Any]) -> PageSourceMetadata:
     """Read provenance for an already prepared canonical image, without rendering.
 
     Pixel transforms map continuous image edges, so a flipped x=0 maps to
@@ -205,10 +218,12 @@ def read_page_source_metadata(book_dir: Path, record: dict[str, Any]) -> PageSou
     common = {
         "book_id": record["book_id"],
         "page_number": record["number"],
+        "page_id": record.get("page_id", ""),
         "source_id": record["source_id"],
+        "source_file_id": record.get("source_file_id", record["source_id"]),
+        "source_version": record.get("source_version", 1),
         "source_page": record["source_page"],
         "source_kind": record["source_kind"],
-        "image_fingerprint": _file_fingerprint(image_path),
         "canonical_width_px": width,
         "canonical_height_px": height,
     }
@@ -230,7 +245,7 @@ def read_page_source_metadata(book_dir: Path, record: dict[str, Any]) -> PageSou
                 rotation=rotation, width_bp=crop_width, height_bp=crop_height,
             )
         return PageSourceMetadata(
-            **common, source_file_fingerprint=_source_file_fingerprint(source_path),
+            **common,
             source_coordinate_space="unrotated_crop_bp",
             canonical_to_source_affine=transforms[rotation], pdf_geometry=geometry,
         )
@@ -256,13 +271,18 @@ def read_page_source_metadata(book_dir: Path, record: dict[str, Any]) -> PageSou
     # Pillow treats unsupported EXIF orientations as the unchanged image.
     transform = transforms[orientation] if orientation in transforms else transforms[1]
     return PageSourceMetadata(
-        **common, source_file_fingerprint=_source_file_fingerprint(source_path),
+        **common,
         source_width_px=source_width, source_height_px=source_height,
         source_coordinate_space="original_image_px", canonical_to_source_affine=transform,
     )
 
 
 def prepare_source_preview(book_dir: Path, record: dict[str, Any]) -> Path:
+    with IMAGE_LOCK:
+        return _prepare_source_preview(book_dir, record)
+
+
+def _prepare_source_preview(book_dir: Path, record: dict[str, Any]) -> Path:
     """Cache a small preview of only the requested page, without preparing OCR assets."""
     directory = book_dir / record["source_directory"]
     target = directory / f'preview-{record["source_page"]:04d}.png'

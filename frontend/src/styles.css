@@ -250,7 +250,7 @@ input:disabled,textarea:disabled { background: #f1f0eb; color: #777; }
 .project-header .book-heading h1 { font-family: inherit; font-size: 1.35rem; font-weight: 650; }
 .project-header .book-overview { padding-bottom: .8rem; }
 .project-header .book-delete { font-size: .8rem; }
-.workflow-nav { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: .35rem; max-width: 940px; padding: .6rem 0; border-top: 1px solid var(--line); }
+.workflow-nav { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: .35rem; max-width: 1060px; padding: .6rem 0; border-top: 1px solid var(--line); }
 .workflow-nav button { display: grid; grid-template-columns: 28px minmax(0,1fr); align-items: center; gap: .1rem .65rem; min-height: 58px; padding: .55rem .75rem; border: 1px solid transparent; border-radius: 7px; background: transparent; text-align: left; color: var(--muted); }
 .workflow-nav button > span { grid-row: span 2; display: grid; place-items: center; width: 26px; height: 26px; border: 1px solid var(--line); border-radius: 7px; font: .75rem ui-monospace,Consolas,monospace; }
 .workflow-nav strong { font-size: .84rem; }

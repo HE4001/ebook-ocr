@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -12,41 +13,49 @@ from typing import AsyncIterator
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from .compile_service import compile_documents, failed_result, render_output_page
-from .importers import ImportFailure, import_document, prepare_source_preview
+from .compile_service import (
+    compile_documents, failed_result, generate_manifest_outputs, render_output_page, same_source_identity,
+)
+from .importers import ImportFailure, import_document, prepare_page as _prepare_page, prepare_source_preview
 from .latex_export import (
     GENERATOR_VERSION, FidelityLayoutError, LatexCompileError,
     build_latex_documents, generate_source_fidelity_latex,
 )
 from .layout_contract import SourceFidelityLayout
+from .latex_content import source_resource_name
 from .models import (
     Arrangement,
     ArrangementUpdate,
     Book,
     BookDetail,
     ConnectionTestResult,
+    ExportManifest,
+    ExportManifestCreate,
+    Issue,
     LayoutCalibrationUpdate,
     LayoutUpdate,
     ModelsRequest,
     ModelsResult,
     Page,
     PageUpdate,
+    PageResult,
     PdfCompileResult,
     PagesRequest,
     PauseResult,
     ProcessRequest,
     ProcessResult,
     ProjectCreate,
+    Run,
+    RunCreate,
     SettingsOut,
     SettingsUpdate,
 )
-from .pipeline import BookProcessor, _prepare_page
+from .pipeline import WorkflowProcessor
 from .gemini_client import fetch_gemini_models
-from .model_client import create_model_client
 from .responses_client import ModelServiceError, fetch_models
 from .storage import RevisionConflict, Storage
 
@@ -54,6 +63,9 @@ from .storage import RevisionConflict, Storage
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 ASSET_NAME = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 COMPILED_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+UNFINISHED_RUN_STATUSES = {"queued", "running", "pausing", "paused"}
+MANIFEST_FILE_KEYS = {"pdf", "partial_pdf", "latex", "json"}
+logger = logging.getLogger(__name__)
 
 
 class RuntimeSecrets:
@@ -78,11 +90,11 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     secrets = RuntimeSecrets()
     running: dict[str, asyncio.Task[None]] = {}
     pause_requests: dict[str, asyncio.Event] = {}
-    pending_pages: dict[str, list[int]] = {}
-    manually_saved_pages: dict[str, set[int]] = {}
+    active_run_ids: dict[str, str] = {}
     uploading: set[str] = set()
     preview_lock = asyncio.Lock()
     compile_locks: dict[str, asyncio.Lock] = {}
+    manifest_locks: dict[str, asyncio.Lock] = {}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -137,12 +149,98 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         )
 
     def ensure_idle(book_id: str) -> None:
-        if is_running(book_id) or book_id in uploading:
-            raise HTTPException(status_code=409, detail="项目正在处理或上传，请稍后操作")
+        if (is_running(book_id) or book_id in uploading
+                or any(run.status in UNFINISHED_RUN_STATUSES for run in storage.list_runs(book_id))):
+            raise HTTPException(status_code=409, detail="项目正在上传或有未结束任务，请结束或恢复任务后操作")
 
-    def ensure_arranged(book: Book) -> None:
-        if not book.upload_confirmed or not book.selection_confirmed:
-            raise HTTPException(status_code=409, detail="请先确认上传并完成页面编排")
+    def ensure_run(book_id: str, run_id: str) -> Run:
+        ensure_book(book_id)
+        try:
+            UUID(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="任务不存在") from exc
+        run = storage.get_run(book_id, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return run
+
+    def ensure_manifest(book_id: str, manifest_id: str) -> ExportManifest:
+        ensure_book(book_id)
+        try:
+            UUID(manifest_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="导出清单不存在") from exc
+        manifest = storage.get_export_manifest(book_id, manifest_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="导出清单不存在")
+        return manifest
+
+    def ensure_run_available(book_id: str, run_id: str) -> None:
+        if book_id in uploading:
+            raise HTTPException(status_code=409, detail="项目正在上传，请稍后启动任务")
+        if (is_running(book_id) and active_run_ids.get(book_id) != run_id
+                or any(run.run_id != run_id and run.status in UNFINISHED_RUN_STATUSES
+                       for run in storage.list_runs(book_id))):
+            raise HTTPException(status_code=409, detail="项目已有未结束任务，请先完成或恢复该任务")
+
+    def dispatch_run(run: Run) -> Run:
+        ensure_run_available(run.book_id, run.run_id)
+        if is_running(run.book_id):
+            return ensure_run(run.book_id, run.run_id)
+        current_settings = storage.get_settings()
+        if (SettingsUpdate.validate_base_url(current_settings["base_url"])
+                != SettingsUpdate.validate_base_url(run.settings_snapshot["base_url"])
+                or current_settings.get("api_protocol", "openai_responses")
+                != run.settings_snapshot.get("api_protocol", "openai_responses")):
+            raise HTTPException(
+                status_code=409,
+                detail="当前 API 接入与任务冻结的地址或协议不同；请恢复原接入并保存其密钥，再恢复此任务",
+            )
+        pause_event = asyncio.Event()
+        api_key = secrets.api_key
+
+        async def execute() -> None:
+            try:
+                await WorkflowProcessor(storage).process_run(run.book_id, run.run_id, api_key, pause_event)
+            except asyncio.CancelledError:
+                if ensure_run(run.book_id, run.run_id).status in {"queued", "running", "pausing"}:
+                    storage.set_run_status(
+                        run.book_id, run.run_id, "interrupted",
+                        "服务退出中断任务；已发送但未取得结果的请求不会自动重发",
+                    )
+                raise
+            except Exception as error:
+                # Arbitrary exception text may contain an upstream URL or credential.
+                if ensure_run(run.book_id, run.run_id).status in {"queued", "running", "pausing"}:
+                    storage.set_run_status(run.book_id, run.run_id, "failed", "任务执行发生技术错误，已有结果保留")
+                logger.error("Workflow %s failed (%s)", run.run_id, type(error).__name__)
+                raise
+
+        storage.set_run_status(run.book_id, run.run_id, "running")
+        task = asyncio.create_task(execute(), name=f"workflow-{run.run_id}")
+        running[run.book_id] = task
+        active_run_ids[run.book_id] = run.run_id
+        pause_requests[run.book_id] = pause_event
+
+        def remove_finished(finished: asyncio.Task[None]) -> None:
+            if running.get(run.book_id) is finished:
+                running.pop(run.book_id, None)
+                active_run_ids.pop(run.book_id, None)
+                pause_requests.pop(run.book_id, None)
+            if not finished.cancelled():
+                finished.exception()  # The wrapper records and logs any failure without secrets.
+
+        task.add_done_callback(remove_finished)
+        return ensure_run(run.book_id, run.run_id)
+
+    async def populate_manifest(manifest: ExportManifest) -> ExportManifest:
+        async with manifest_locks.setdefault(manifest.manifest_id, asyncio.Lock()):
+            outputs = await generate_manifest_outputs(
+                storage.get_manifest_book(manifest.book_id, manifest.manifest_id), manifest,
+                storage.get_manifest_pages(manifest.book_id, manifest.manifest_id),
+                storage.books_root / manifest.book_id,
+            )
+            return storage.record_manifest_outputs(manifest.book_id, manifest.manifest_id, outputs)
 
     async def compiled_pdf(
         detail: BookDetail, print_version: bool, page_order: list[int] | None = None,
@@ -174,14 +272,12 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                                            current_sources, print_version, positions)
 
     def editable_page(book_id: str, number: int) -> Page:
-        ensure_arranged(ensure_book(book_id))
+        ensure_book(book_id)
         if book_id in uploading:
             raise HTTPException(status_code=409, detail="项目正在上传，请稍后保存")
         record = storage.get_page_record(book_id, number)
         if record is None or not record["selected"]:
             raise HTTPException(status_code=404, detail="页面不存在")
-        if record["status"] == "processing":
-            raise HTTPException(status_code=409, detail="本页正在识别，暂不能保存；可校对其他页面")
         return next(page for page in storage.get_pages(book_id) if page.number == number)
 
     async def calibrated_page(book_id: str, number: int, update: LayoutCalibrationUpdate) -> Page:
@@ -199,6 +295,16 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         except (ImportFailure, OSError, ValueError) as error:
             raise HTTPException(status_code=422, detail=f"无法读取当前来源：{error}") from error
         previous = page.layout_source
+        preservation = {}
+        if previous is not None:
+            if same_source_identity(previous.source, metadata):
+                preservation = {
+                    "source_assets": previous.source_assets,
+                    "source_disposition": previous.source_disposition,
+                    "disposition_reason": previous.disposition_reason,
+                }
+            elif previous.source_assets or previous.source_disposition != "transcribed":
+                raise HTTPException(status_code=409, detail="源页身份或版本已改变，不能丢弃或沿用旧源图保留资源")
         parameters = {name: getattr(previous, name) if previous is not None else None for name in (
             "canvas_width_bp", "canvas_height_bp", "canvas_basis",
             "body_font_size_bp", "body_font_family", "body_font_basis",
@@ -228,7 +334,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                     reasons.append(reason)
         layout = SourceFidelityLayout(
             **update.observation.model_dump(exclude={"review_reasons"}), review_reasons=reasons,
-            **parameters, source=metadata,
+            **parameters, **preservation, source=metadata,
             content_revision=page.content_revision + 1, layout_revision=page.layout_revision + 1,
             generated_content_revision=page.content_revision + 1, generator_version=GENERATOR_VERSION,
         )
@@ -324,12 +430,10 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             return ConnectionTestResult(ok=False, message="请先输入 API 密钥")
         if not model:
             return ConnectionTestResult(ok=False, message="请先填写模型名称")
-        try:
-            client = create_model_client(settings, secrets.api_key, context_reuse_enabled=False)
-            await client.test_connection(model)
-        except ModelServiceError as exc:
-            return ConnectionTestResult(ok=False, message=str(exc))
-        return ConnectionTestResult(ok=True, message="连接成功（文本请求，不代表视觉识别效果）")
+        return ConnectionTestResult(
+            ok=True,
+            message="仅配置检查，未请求模型；实际图片与 Schema 能力由正常首页面请求确认",
+        )
 
     @app.get("/api/books", response_model=list[Book])
     async def list_books() -> list[Book]:
@@ -397,8 +501,6 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     async def put_arrangement(book_id: str, request: ArrangementUpdate) -> BookDetail:
         book = ensure_book(book_id)
         ensure_idle(book_id)
-        if not book.upload_confirmed:
-            raise HTTPException(status_code=409, detail="请先确认上传文件")
         file_ids = {source.id for source in storage.get_files(book_id)}
         if len(request.file_order) != len(file_ids) or set(request.file_order) != file_ids:
             raise HTTPException(status_code=400, detail="文件排序必须包含全部文件且不能重复")
@@ -490,112 +592,184 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         storage.delete_book(book_id)
         return Response(status_code=204)
 
+    @app.post("/api/books/{book_id}/runs", response_model=Run, status_code=201)
+    async def create_run(book_id: str, request: RunCreate) -> Run:
+        ensure_book(book_id)
+        if book_id in uploading:
+            raise HTTPException(status_code=409, detail="项目正在上传，请稍后启动任务")
+        try:
+            run = storage.create_run(book_id, request, generator_version=GENERATOR_VERSION)
+        except RevisionConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        # A repeated client_request_id returns its original run, including a paused or finished one.
+        return dispatch_run(run) if run.status == "queued" else run
+
+    @app.get("/api/books/{book_id}/runs", response_model=list[Run])
+    async def list_runs(book_id: str) -> list[Run]:
+        ensure_book(book_id)
+        return storage.list_runs(book_id)
+
+    @app.get("/api/books/{book_id}/runs/{run_id}", response_model=Run)
+    async def get_run(book_id: str, run_id: str) -> Run:
+        return ensure_run(book_id, run_id)
+
+    @app.post("/api/books/{book_id}/runs/{run_id}/pause", response_model=Run)
+    async def pause_run(book_id: str, run_id: str) -> Run:
+        run = ensure_run(book_id, run_id)
+        if run.status in {"paused", "pausing"}:
+            return run
+        if run.status not in {"queued", "running"}:
+            raise HTTPException(status_code=409, detail="任务未在运行")
+        if not is_running(book_id) or active_run_ids.get(book_id) != run_id:
+            raise HTTPException(status_code=409, detail="任务没有活动处理进程")
+        pause_requests[book_id].set()
+        return storage.set_run_status(book_id, run_id, "pausing")
+
+    @app.post("/api/books/{book_id}/runs/{run_id}/resume", response_model=Run)
+    async def resume_run(book_id: str, run_id: str) -> Run:
+        run = ensure_run(book_id, run_id)
+        ensure_run_available(book_id, run_id)
+        if run.status == "running" and is_running(book_id) and active_run_ids.get(book_id) == run_id:
+            return run
+        if run.status not in {"paused", "interrupted"}:
+            raise HTTPException(status_code=409, detail="只能恢复已暂停或已中断的任务")
+        if is_running(book_id):
+            raise HTTPException(status_code=409, detail="任务正在结算，请稍后恢复")
+        return dispatch_run(run)
+
+    @app.get("/api/books/{book_id}/results", response_model=list[PageResult])
+    async def list_results(
+        book_id: str, offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=1000),
+    ) -> list[PageResult]:
+        ensure_book(book_id)
+        return storage.list_results(book_id, offset, limit)
+
+    @app.get("/api/books/{book_id}/issues", response_model=list[Issue])
+    async def list_issues(
+        book_id: str, offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=1000),
+    ) -> list[Issue]:
+        ensure_book(book_id)
+        return storage.list_issues(book_id, offset, limit)
+
+    @app.post("/api/books/{book_id}/export-manifests", response_model=ExportManifest, status_code=201)
+    async def create_manifest(book_id: str, request: ExportManifestCreate) -> ExportManifest:
+        ensure_book(book_id)
+        full_manifest_id = None
+        if request.run_id is not None:
+            run = ensure_run(book_id, request.run_id)
+            if run.status not in {"succeeded", "failed"} or any(task.result_status is None for task in run.tasks):
+                raise HTTPException(status_code=409, detail="任务尚未形成最终结果，请等待结束或导出当前已保存稿")
+            if request.expected_arrangement_revision != run.arrangement_revision:
+                raise HTTPException(status_code=409, detail="导出页序修订与任务快照不一致")
+            if request.page_ids is not None and not set(request.page_ids) <= set(run.page_ids):
+                raise HTTPException(status_code=422, detail="导出范围包含任务快照之外的页面")
+            if run.export_manifest_id is None:
+                existing = storage.create_export_manifest(
+                    book_id, expected_arrangement_revision=run.arrangement_revision, run_id=run.run_id,
+                    generator_version=GENERATOR_VERSION,
+                )
+            else:
+                existing = ensure_manifest(book_id, run.export_manifest_id)
+            full_manifest_id = existing.manifest_id
+            if request.page_ids is None or set(request.page_ids) == {page.page_id for page in existing.pages}:
+                return await populate_manifest(existing)
+        try:
+            manifest = storage.create_export_manifest(
+                book_id, expected_arrangement_revision=request.expected_arrangement_revision,
+                page_ids=request.page_ids, run_id=request.run_id, generator_version=GENERATOR_VERSION,
+            )
+        except RevisionConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if full_manifest_id is not None:
+            # A scoped download must not replace the run's full automatic output link.
+            storage.set_run_manifest(book_id, request.run_id, full_manifest_id)
+        return await populate_manifest(manifest)
+
+    @app.get("/api/books/{book_id}/export-manifests/{manifest_id}", response_model=ExportManifest)
+    async def get_manifest(book_id: str, manifest_id: str) -> ExportManifest:
+        return ensure_manifest(book_id, manifest_id)
+
+    @app.get("/api/books/{book_id}/export-manifests/{manifest_id}/{format}")
+    async def download_manifest(book_id: str, manifest_id: str, format: str) -> FileResponse:
+        manifest = ensure_manifest(book_id, manifest_id)
+        if format not in MANIFEST_FILE_KEYS:
+            raise HTTPException(status_code=404, detail="导出格式不存在")
+        relative = manifest.outputs.get(format)
+        if not relative:
+            raise HTTPException(status_code=404, detail="该格式尚未生成，请查看导出说明")
+        book_dir = (storage.books_root / book_id).resolve()
+        path = (book_dir / relative).resolve()
+        if not path.is_relative_to(book_dir) or not path.is_file():
+            raise HTTPException(status_code=404, detail="导出文件不存在")
+        pdf = format in {"pdf", "partial_pdf"}
+        extension = "pdf" if pdf else "zip" if format == "latex" else "json"
+        return FileResponse(
+            path, media_type="application/pdf" if pdf else "application/zip" if format == "latex" else "application/json",
+            filename=f"book-{book_id}{'-partial' if format == 'partial_pdf' else ''}.{extension}",
+            content_disposition_type="inline" if pdf else "attachment",
+        )
+
     @app.post("/api/books/{book_id}/process", response_model=ProcessResult)
     async def process_book(book_id: str, request: ProcessRequest | None = None) -> ProcessResult:
         book = ensure_book(book_id)
-        ensure_idle(book_id)
-        legacy_upload = all(source.id == "legacy" for source in storage.get_files(book_id)) and book.file_count == 1
-        if not legacy_upload:
-            ensure_arranged(book)
-        records = storage.get_page_records(book_id)
-        if request is not None and request.pages is not None:
-            numbers = set(request.pages)
-            if any(number < 1 or number > book.page_count for number in numbers):
-                raise HTTPException(status_code=400, detail="页码超出源文件范围")
-            records = [record for record in records if record["number"] in numbers]
-            if len(records) != len(numbers):
-                raise HTTPException(status_code=400, detail="所选页面不在当前清单中，请先添加页面")
-        if not records:
+        if not storage.get_pages(book_id):
             return ProcessResult(started=False)
-        settings = storage.get_settings()
-        if not secrets.api_key:
-            raise HTTPException(status_code=400, detail="请先设置 API 密钥")
-        if not settings["extraction_model"]:
-            raise HTTPException(status_code=400, detail="请先填写页面代理模型")
-        numbers = [record["number"] for record in records]
-        if not book.selection_confirmed:
-            storage.confirm_page_selection(book_id, numbers)
-        processor = BookProcessor(storage)
-        pause_requested = asyncio.Event()
-        manually_saved_pages[book_id] = set()
-        storage.begin_book(book_id)
-        task = asyncio.create_task(processor.process(
-            book_id, settings, secrets.api_key, pause_requested, records,
-            pending_pages=numbers,
-            manually_saved_pages=manually_saved_pages[book_id],
-        ))
-        running[book_id] = task
-        pause_requests[book_id] = pause_requested
-        pending_pages[book_id] = numbers
-
-        def remove_finished(_task: asyncio.Task[None]) -> None:
-            if running.get(book_id) is _task:
-                running.pop(book_id, None)
-                pause_requests.pop(book_id, None)
-                pending_pages.pop(book_id, None)
-                manually_saved_pages.pop(book_id, None)
-            if not _task.cancelled():
-                _task.exception()
-
-        task.add_done_callback(remove_finished)
+        paused = next((run for run in storage.list_runs(book_id) if run.status == "paused"), None)
+        if paused is not None:
+            requested = set(request.pages) if request is not None and request.pages is not None else None
+            if requested is not None and requested != {task.page_number for task in paused.tasks}:
+                raise HTTPException(status_code=409, detail="已有暂停任务；恢复时不能改变原处理范围")
+            await resume_run(book_id, paused.run_id)
+        else:
+            await create_run(book_id, RunCreate(
+                pages=request.pages if request is not None else None,
+                expected_arrangement_revision=book.arrangement_revision, client_request_id=str(uuid4()),
+            ))
         return ProcessResult(started=True)
 
     @app.post("/api/books/{book_id}/pause", response_model=PauseResult)
     async def pause_book(book_id: str) -> PauseResult:
         ensure_book(book_id)
-        task = running.get(book_id)
-        if task is None or task.done():
-            raise HTTPException(status_code=409, detail="该书籍未在处理")
-        pause_requested = pause_requests[book_id]
-        if not pause_requested.is_set():
-            pause_requested.set()
-            storage.request_pause(book_id)
+        run_id = active_run_ids.get(book_id)
+        if run_id is None:
+            raise HTTPException(status_code=409, detail="该项目未在处理")
+        await pause_run(book_id, run_id)
         return PauseResult(requested=True)
 
     @app.post("/api/books/{book_id}/pages", response_model=BookDetail)
     async def add_pages(book_id: str, request: PagesRequest) -> BookDetail:
         book = ensure_book(book_id)
-        if not book.selection_confirmed:
-            raise HTTPException(status_code=400, detail="请先选择处理范围")
+        ensure_idle(book_id)
         numbers = sorted(set(request.pages))
         if any(number < 1 or number > book.page_count for number in numbers):
             raise HTTPException(status_code=400, detail="页码超出源文件范围")
-        added = storage.add_pages(book_id, numbers)
-        active = is_running(book_id)
-        if active and not pause_requests[book_id].is_set():
-            for number in added:
-                record = storage.get_page_record(book_id, number)
-                if record is not None and record["status"] != "ready":
-                    pending_pages[book_id].append(number)
-        storage.refresh_book(book_id, processing=active)
+        storage.add_pages(book_id, numbers)
+        storage.refresh_book(book_id, processing=False)
         return book_detail(book_id)
 
     @app.delete("/api/books/{book_id}/pages/{number}", response_model=BookDetail)
     async def delete_page(book_id: str, number: int) -> BookDetail:
-        book = ensure_book(book_id)
-        if not book.selection_confirmed:
-            raise HTTPException(status_code=400, detail="请先选择处理范围")
+        ensure_book(book_id)
+        ensure_idle(book_id)
         record = storage.get_page_record(book_id, number)
         if record is None or not record["selected"]:
             raise HTTPException(status_code=404, detail="页面不在当前清单中")
-        if record["status"] == "processing":
-            raise HTTPException(status_code=409, detail="当前页面正在处理，暂不能删除")
         storage.remove_page(book_id, number)
-        if book_id in pending_pages:
-            pending_pages[book_id][:] = [page for page in pending_pages[book_id] if page != number]
-        storage.refresh_book(book_id, processing=is_running(book_id))
+        storage.refresh_book(book_id, processing=False)
         return book_detail(book_id)
 
     @app.put("/api/books/{book_id}/pages/{number}", response_model=Page)
     async def save_page(book_id: str, number: int, update: PageUpdate) -> Page:
-        ensure_arranged(ensure_book(book_id))
+        ensure_book(book_id)
         if book_id in uploading:
             raise HTTPException(status_code=409, detail="项目正在上传，请稍后保存")
         record = storage.get_page_record(book_id, number)
         if record is None or not record["selected"]:
             raise HTTPException(status_code=404, detail="页面不存在")
-        if record["status"] == "processing":
-            raise HTTPException(status_code=409, detail="本页正在识别，暂不能保存；可校对其他页面")
         active = is_running(book_id)
         try:
             storage.save_manual_text(
@@ -612,8 +786,6 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if active:
-            manually_saved_pages[book_id].add(number)
         pages = storage.get_pages(book_id)
         return next(page for page in pages if page.number == number)
 
@@ -630,8 +802,6 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except (FidelityLayoutError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        if is_running(book_id):
-            manually_saved_pages[book_id].add(number)
         return saved
 
     @app.post("/api/books/{book_id}/pages/{number}/compile-layout-pdf", response_model=PdfCompileResult)
@@ -646,8 +816,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
 
     @app.get("/api/books/{book_id}/export")
     async def export_book(book_id: str) -> JSONResponse:
-        book = ensure_book(book_id)
-        ensure_arranged(book)
+        ensure_book(book_id)
         payload = book_detail(book_id).model_dump(mode="json")
         return JSONResponse(
             content=payload,
@@ -658,13 +827,24 @@ def create_app(data_root: Path | None = None) -> FastAPI:
 
     @app.get("/api/books/{book_id}/export.tex")
     async def export_latex(book_id: str, print_version: bool = False) -> Response:
-        book = ensure_book(book_id)
-        ensure_arranged(book)
+        ensure_book(book_id)
+        book_dir = (storage.books_root / book_id).resolve()
+        resources: dict[str, Path] = {}
         try:
             documents = build_latex_documents(book_detail(book_id), print_version)
-        except LatexCompileError as error:
+            reserved_names = {"readme.txt", *(f"{index:04d}.tex" for index in range(1, len(documents) + 1))}
+            for document in documents:
+                for name in document.resource_names:
+                    relative = source_resource_name(name)
+                    path = (book_dir / relative).resolve()
+                    if not path.is_relative_to(book_dir) or not path.is_file():
+                        raise ValueError(f"引用的源资源不存在或超出书目录：{relative}")
+                    if relative.casefold() in reserved_names:
+                        raise ValueError(f"引用的源资源与源码包文件重名：{relative}")
+                    resources[relative] = path
+        except (LatexCompileError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        if len(documents) == 1:
+        if len(documents) == 1 and not resources:
             return Response(
                 content=documents[0].source,
                 media_type="text/plain; charset=utf-8",
@@ -673,17 +853,23 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         archive = BytesIO()
         instructions = [
             "请按以下顺序分别用 XeLaTeX 编译每份 .tex，再按相同顺序合并 PDF。",
-            "独立文档保留原源码，连续片段页使用应用模板；外部资源需自行准备。",
+            "独立文档保留原源码，连续片段页使用应用模板；引用资源保持包内的书目录相对路径。",
+            "请在解压目录编译；完整自定义文档所需的额外宏包和字体需自行准备。",
             "",
             "文件\t对应原页面编排位置",
         ]
-        with ZipFile(archive, "w", compression=ZIP_DEFLATED) as package:
-            for index, document in enumerate(documents, 1):
-                filename = f"{index:04d}.tex"
-                package.writestr(filename, document.source)
-                positions = ", ".join(str(position) for position in document.page_order)
-                instructions.append(f"{filename}\t{positions}")
-            package.writestr("README.txt", "\n".join(instructions) + "\n")
+        try:
+            with ZipFile(archive, "w", compression=ZIP_DEFLATED) as package:
+                for index, document in enumerate(documents, 1):
+                    filename = f"{index:04d}.tex"
+                    package.writestr(filename, document.source)
+                    positions = ", ".join(str(position) for position in document.page_order)
+                    instructions.append(f"{filename}\t{positions}")
+                for relative, path in resources.items():
+                    package.write(path, arcname=relative)
+                package.writestr("README.txt", "\n".join(instructions) + "\n")
+        except OSError as error:
+            raise HTTPException(status_code=422, detail="无法读取引用的源资源，源码包未生成") from error
         return Response(
             content=archive.getvalue(),
             media_type="application/zip",
@@ -692,7 +878,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/books/{book_id}/compile", response_model=PdfCompileResult)
     async def compile_book(book_id: str, print_version: bool = False) -> PdfCompileResult:
-        ensure_arranged(ensure_book(book_id))
+        ensure_book(book_id)
         return await compiled_pdf(book_detail(book_id), print_version)
 
     @app.post("/api/books/{book_id}/pages/{number}/compile", response_model=PdfCompileResult)
@@ -700,7 +886,6 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         book_id: str, number: int, update: PageUpdate, print_version: bool = False,
     ) -> PdfCompileResult:
         detail = book_detail(book_id)
-        ensure_arranged(detail.book)
         page = next((page for page in detail.pages if page.number == number), None)
         if page is None:
             raise HTTPException(status_code=404, detail="页面不存在")
@@ -774,7 +959,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     app.state.secrets = secrets
     app.state.running = running
     app.state.pause_requests = pause_requests
-    app.state.pending_pages = pending_pages
+    app.state.active_run_ids = active_run_ids
     return app
 
 

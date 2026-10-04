@@ -2,7 +2,7 @@
 
 更新时间：2026-10-04（W00—W11 verified）
 
-当前状态：Goal complete（工具已确认）；G1—G7 全部满足，全部模块已接受，最终差异及范围审计通过。
+当前状态：原书渲染 Goal complete（工具已确认）；G1—G7 的隔离验收结论保持。用户追加的识别 HTTP 400 已获得 Schema 拒绝详情，错误详情与引用展开补丁均已完成、静态接受；按用户要求不再测试，实际服务重试尚未验证。
 
 执行入口：[Goal 执行计划](RENDERING_REPAIR_GOAL.md)
 
@@ -98,6 +98,19 @@
 - 工具：本地 venv/PyMuPDF、Node/pnpm、Poppler 可用；XeLaTeX 在 `C:/Users/David/AppData/Roaming/TinyTeX/bin/windows/xelatex.exe`。验证进程只用隔离目录与独立端口。
 
 ## 迭代记录
+
+### 2026-10-04：页面识别 HTTP 400 跟进
+
+- 用户确认 OpenAI Responses，手动连接测试成功，实际识别页面失败。两种请求的差异是页面图片与完整布局 JSON Schema；当前文本连接测试不验证这些能力。
+- 主代理仅用 SQLite `mode=ro`、按字段查询非秘密配置：保存的服务主机为 `api.deepseek.com`，模型为 `deepseek-flash`，推理 `high`，上下文续接关闭，路径 `/responses`；未读取 credentials。官方文档已确认 Responses 和 flash 图片输入受支持，不能按旧知识改协议。
+- 两名 `gpt-6.1-sol / xhigh` 子代理分工静态审查 Schema、补充 HTTP 错误详情和 MockTransport 回归；均禁止运行、测试及 computer use。首轮未发现必须拒绝的通用 OpenAI Schema 缺陷，当时尚缺供应商具体错误消息。
+- 已确认实现缺陷：服务端 `error.message/param/code` 被丢弃，只显示状态码。诊断补丁保留有限长度的有效文本、脱敏当前密钥，保持请求参数、400 不重试、usage 回调和失败上下文不变；主代理要求总长适配流水线 1000 字符上限。
+- 主代理静态接受返工：message 600 字符、param/code 各 150，组合不超过流水线 1000 字符上限。新增 9 项 MockTransport 测试代码，包含失败保存错误详情、旧正文/布局/人工修订及用量保护；子代理没有运行测试。
+- 用户随后明确“不要测试了，改完就结束”。主代理立即中断已启动的后端回归，运行会话退出 1、没有取得测试结果；不将其记为通过或用旧 97 项结果代替本补丁验证。不再执行测试、构建、类型检查或运行验收。
+- 第一阶段状态：错误详情补丁已完成并静态接受，留在工作区；当时尚未获得拒绝原因，未修改 Schema。未修改协议、推理设置或重试策略，未发起真实模型请求、重启用户服务或写入原库。
+- 用户随后提供 `Invalid json schema: field anyOf: missing field type`，`code=invalid_request_error`。静态定位 `layout` 和公式编号等 `anyOf` 分支含裸 `$ref`，分支自身没有 `type`；这与服务端要求显式类型的错误吻合。
+- 原 Schema 子代理继续最小修复：先展开固定、无环模型的全部本地引用，再进行既有 Schema 整理；外层 `layout` 嵌入完整对象，不发送 `$ref/$defs`。对象分支显式 `type:object`，空值分支仍为 `type:null`。保留全部必填、禁止额外字段、空值、枚举、长度/范围约束及 `review_reasons=100`，v1 与本地 Pydantic 校验不变；仅同步既有断言的内嵌对象访问路径。
+- 主代理静态审查接受上述两文件差异并结束本轮，未运行测试、构建、类型检查、lint、试编译或真实请求。实际服务是否接受更新后完整 Schema 尚未验证；不把静态修复记为真实 OCR 已通过。
 
 ### 2026-10-04：用户追加本地合并指令
 

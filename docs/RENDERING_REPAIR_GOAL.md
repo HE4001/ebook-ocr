@@ -1,5 +1,7 @@
 # 原书版式修复：Goal 执行计划
 
+后续计划：2026-10-04 用户要求无人值守识别，并禁止所有执行代理测试及进行无意义验证，新的执行入口为[全流程重构 Goal](WORKFLOW_REDESIGN_GOAL.md)。本文件只保留旧渲染工作的历史记录，不作为新一轮指令；下文主代理运行验收等旧安排不适用于新Goal。新交付以编码和必要静态审查为准，不宣称实测效果。
+
 日期：2026-10-03
 
 状态：2026-10-04，Goal complete（工具已确认），G1—G7全部满足，W00—W11 verified；登记见[执行进度](RENDERING_REPAIR_PROGRESS.md)，实际结果见[验收报告](RENDERING_REPAIR_VERIFICATION.md)。下文保留启动指令及职责约束。

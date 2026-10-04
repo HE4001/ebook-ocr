@@ -7,11 +7,17 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from uuid import uuid4
 
 from .latex_content import is_latex_document
 from .latex_migration import legacy_blocks_to_markdown, markdown_to_latex
 from .layout_contract import LayoutObservation, PageSourceMetadata, RenderStrategy, SourceFidelityLayout
-from .models import Book, CoverField, LayoutSettings, MarginSegment, Page, PageKind, PaperSize, SourceFile, StructuredPageResult, Usage
+from .models import (
+    Assessment, Attempt, Book, CoverField, ExecutionStatus, ExportManifest,
+    ExportManifestPage, Issue, LayoutSettings, MarginSegment, Page, PageKind,
+    PageResult, PageTask, PaperSize, ResultStatus, Revision, Run, RunCounts,
+    RunCreate, RunStatus, SourceFile, StructuredPageResult, Usage, WorkflowStage,
+)
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -34,6 +40,10 @@ class RevisionConflict(ValueError):
     """The caller edited an older content or layout revision."""
 
 
+class RequestBudgetExceeded(ValueError):
+    """The frozen run or page request allowance has been exhausted."""
+
+
 class Storage:
     def __init__(self, data_root: Path):
         self.data_root = data_root.resolve()
@@ -44,6 +54,7 @@ class Storage:
         self.books_root.mkdir(parents=True, exist_ok=True)
         self._backup_before_latex_migration()
         self._backup_before_layout_migration()
+        self._backup_before_workflow_migration()
         with self._connect() as connection:
             connection.executescript(
                 """
@@ -223,6 +234,66 @@ class Storage:
                     (json.dumps(DEFAULT_SETTINGS, ensure_ascii=False),),
                 )
             self._migrate_latex_content(connection)
+            self._migrate_workflow(connection)
+
+    def _backup_before_workflow_migration(self) -> None:
+        backup_path = self.data_root / "app-before-workflow.db"
+        if not self.db_path.is_file() or backup_path.exists():
+            return
+        with closing(sqlite3.connect(self.db_path)) as source:
+            if not source.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pages'").fetchone():
+                return
+            if "page_id" in {row[1] for row in source.execute("PRAGMA table_info(pages)")}:
+                return
+            with closing(sqlite3.connect(backup_path)) as destination:
+                source.backup(destination)
+
+    def _migrate_workflow(self, connection: sqlite3.Connection) -> None:
+        page_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pages)")}
+        for name, definition in {
+            "page_id": "TEXT", "source_version": "INTEGER NOT NULL DEFAULT 1",
+            "current_revision_id": "TEXT", "result_status": "TEXT",
+            "manual_protected": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if name not in page_columns:
+                connection.execute(f"ALTER TABLE pages ADD COLUMN {name} {definition}")
+        book_columns = {row["name"] for row in connection.execute("PRAGMA table_info(books)")}
+        for name in ("arrangement_revision", "output_settings_version"):
+            if name not in book_columns:
+                connection.execute(f"ALTER TABLE books ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+        for statement in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS pages_page_id ON pages(page_id)",
+            "CREATE TABLE IF NOT EXISTS workflow_revisions (revision_id TEXT PRIMARY KEY, "
+            "book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE, page_id TEXT NOT NULL, "
+            "revision_json TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS workflow_runs (run_id TEXT PRIMARY KEY, "
+            "book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE, client_request_id TEXT NOT NULL, "
+            "status TEXT NOT NULL, request_limit INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, "
+            "snapshot_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, "
+            "UNIQUE(book_id,client_request_id))",
+            "CREATE TABLE IF NOT EXISTS workflow_tasks (run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) "
+            "ON DELETE CASCADE, page_id TEXT NOT NULL, task_json TEXT NOT NULL, PRIMARY KEY(run_id,page_id))",
+            "CREATE TABLE IF NOT EXISTS workflow_attempts (attempt_id TEXT PRIMARY KEY, "
+            "run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE, "
+            "page_id TEXT NOT NULL, legacy_attempt INTEGER NOT NULL, attempt_json TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS workflow_assessments (assessment_id TEXT PRIMARY KEY, "
+            "book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE, revision_id TEXT NOT NULL, "
+            "assessment_json TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS export_manifests (manifest_id TEXT PRIMARY KEY, "
+            "book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE, manifest_json TEXT NOT NULL)",
+        ):
+            connection.execute(statement)
+        rows = connection.execute("SELECT * FROM pages WHERE page_id IS NULL OR current_revision_id IS NULL").fetchall()
+        for old_page in rows:
+            page_id = old_page["page_id"] or str(uuid4())
+            # Historical ready pages have no independent assessment. Preserve old work by default.
+            protected = bool(old_page["text"] or old_page["status"] == "ready")
+            connection.execute(
+                "UPDATE pages SET page_id = ?, manual_protected = ? WHERE book_id = ? AND number = ?",
+                (page_id, int(protected), old_page["book_id"], old_page["number"]),
+            )
+            page = connection.execute("SELECT * FROM pages WHERE page_id = ?", (page_id,)).fetchone()
+            self._persist_current_revision(connection, page, origin="legacy")
 
     def _backup_before_layout_migration(self) -> None:
         backup_path = self.data_root / "app-before-layout.db"
@@ -285,6 +356,30 @@ class Storage:
 
     def recover_interrupted(self) -> None:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active_runs = connection.execute(
+                "SELECT run_id,status FROM workflow_runs WHERE status IN ('queued','running','pausing')",
+            ).fetchall()
+            for run in active_runs:
+                for task in self._tasks(connection, run["run_id"]):
+                    if task.state == "running":
+                        task.state = "interrupted"
+                        task.error = "程序退出中断本阶段；已发送但未结算的请求不会自动重发"
+                        self._write_task(connection, task)
+                connection.execute(
+                    "UPDATE workflow_runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                    ("paused" if run["status"] == "pausing" else "interrupted", self._now(), run["run_id"]),
+                )
+            for row in connection.execute("SELECT * FROM workflow_attempts").fetchall():
+                attempt = Attempt.model_validate_json(row["attempt_json"])
+                if attempt.state == "reserved":
+                    attempt.state = "unknown"
+                    attempt.error = "请求已预留且可能发送，程序退出前未取得结算结果"
+                    attempt.finished_at = self._now()
+                    connection.execute(
+                        "UPDATE workflow_attempts SET attempt_json = ? WHERE attempt_id = ?",
+                        (attempt.model_dump_json(), attempt.attempt_id),
+                    )
             connection.execute(
                 "UPDATE pages SET status = 'interrupted', error = ? "
                 "WHERE status IN ('processing', 'extracting', 'classifying')",
@@ -367,6 +462,7 @@ class Storage:
                 "VALUES (?, 'legacy', ?, ?, ?, 0, '')",
                 (book_id, filename, "pdf" if filename.lower().endswith(".pdf") else "image", len(pages)),
             )
+            self._initialize_new_pages(connection, book_id)
         book = self.get_book(book_id)
         assert book is not None
         return book
@@ -422,8 +518,10 @@ class Storage:
                     )
             connection.execute(
                 "UPDATE books SET page_count = ?, upload_confirmed = 0, selection_confirmed = 0, "
-                "status = 'uploaded', error = NULL WHERE id = ?", (number, book_id),
+                "status = 'uploaded', error = NULL, arrangement_revision = arrangement_revision + 1 "
+                "WHERE id = ?", (number, book_id),
             )
+            self._initialize_new_pages(connection, book_id)
 
     def confirm_upload(self, book_id: str) -> None:
         with self._connect() as connection:
@@ -448,7 +546,10 @@ class Storage:
                 "UPDATE pages SET selected = 1, position = ? WHERE book_id = ? AND number = ?",
                 [(position, book_id, number) for position, number in enumerate(page_order)],
             )
-            connection.execute("UPDATE books SET selection_confirmed = 1 WHERE id = ?", (book_id,))
+            connection.execute(
+                "UPDATE books SET selection_confirmed = 1, arrangement_revision = arrangement_revision + 1 WHERE id = ?",
+                (book_id,),
+            )
         self.refresh_book(book_id, processing=False)
 
     def list_books(self) -> list[Book]:
@@ -466,6 +567,7 @@ class Storage:
         render_strategy: RenderStrategy | None = None,
     ) -> None:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             if paper_size is not None:
                 connection.execute("UPDATE books SET paper_size = ? WHERE id = ?", (paper_size, book_id))
             if layout is not None:
@@ -478,13 +580,26 @@ class Storage:
                 ).fetchone()
                 if previous is None:
                     raise KeyError("book")
-                connection.execute(
-                    "UPDATE pages SET render_strategy = ? WHERE book_id = ? AND render_strategy = ?",
-                    (render_strategy, book_id, previous["render_strategy"]),
-                )
+                changed_pages = connection.execute(
+                    "SELECT * FROM pages WHERE book_id = ? AND render_strategy = ? AND render_strategy != ?",
+                    (book_id, previous["render_strategy"], render_strategy),
+                ).fetchall()
+                for page in changed_pages:
+                    self._archive_page(connection, page)
+                    connection.execute(
+                        "UPDATE pages SET render_strategy = ?,layout_revision = layout_revision + 1 WHERE page_id = ?",
+                        (render_strategy, page["page_id"]),
+                    )
+                    updated = connection.execute("SELECT * FROM pages WHERE page_id = ?", (page["page_id"],)).fetchone()
+                    current = self._revision(connection, page["current_revision_id"])
+                    self._persist_current_revision(connection, updated, origin=current.origin if current else "legacy")
                 connection.execute(
                     "UPDATE books SET render_strategy = ? WHERE id = ?", (render_strategy, book_id),
                 )
+            connection.execute(
+                "UPDATE books SET output_settings_version = output_settings_version + 1 WHERE id = ?", (book_id,),
+            )
+            connection.execute("UPDATE pages SET result_status = NULL WHERE book_id = ?", (book_id,))
 
     def delete_book(self, book_id: str) -> bool:
         book_dir = self.books_root / book_id
@@ -546,14 +661,22 @@ class Storage:
                 )
                 if result.rowcount:
                     added.append(number)
+            if added:
+                connection.execute(
+                    "UPDATE books SET arrangement_revision = arrangement_revision + 1 WHERE id = ?", (book_id,),
+                )
         return added
 
     def remove_page(self, book_id: str, number: int) -> None:
         with self._connect() as connection:
-            connection.execute(
+            result = connection.execute(
                 "UPDATE pages SET selected = 0 WHERE book_id = ? AND number = ?",
                 (book_id, number),
             )
+            if result.rowcount:
+                connection.execute(
+                    "UPDATE books SET arrangement_revision = arrangement_revision + 1 WHERE id = ?", (book_id,),
+                )
 
     def begin_book(self, book_id: str) -> None:
         with self._connect() as connection:
@@ -643,7 +766,7 @@ class Storage:
             page = connection.execute(
                 "SELECT * FROM pages WHERE book_id = ? AND number = ?", (book_id, number),
             ).fetchone()
-            if page is None or (
+            if page is None or page["manual_protected"] or (
                 expected_content_revision is not None
                 and expected_content_revision != page["content_revision"]
             ):
@@ -707,6 +830,10 @@ class Storage:
                     generated_revision, schema_version, layout_json, metadata_json,
                     book_id, number,
                 ),
+            )
+            self._persist_current_revision(
+                connection, connection.execute("SELECT * FROM pages WHERE page_id = ?", (page["page_id"],)).fetchone(),
+                origin="automatic",
             )
         self.refresh_book(book_id, processing=True)
         return True
@@ -803,6 +930,13 @@ class Storage:
                 (text, kind, page_side, fields_json, header_json, footer_json, strategy,
                  content_revision, generated_revision, layout_json, book_id, number),
             )
+            connection.execute(
+                "UPDATE pages SET manual_protected = 1, result_status = NULL WHERE page_id = ?", (page["page_id"],),
+            )
+            self._persist_current_revision(
+                connection, connection.execute("SELECT * FROM pages WHERE page_id = ?", (page["page_id"],)).fetchone(),
+                origin="manual",
+            )
             saved = self._saved_page(connection, book_id, number)
         self.refresh_book(book_id, processing=processing)
         return saved
@@ -839,6 +973,13 @@ class Storage:
                 (generated_text, content_revision, layout_revision, content_revision,
                  layout.schema_version, layout.model_dump_json(), layout.source.model_dump_json(), book_id, number),
             )
+            connection.execute(
+                "UPDATE pages SET manual_protected = 1, result_status = NULL WHERE page_id = ?", (page["page_id"],),
+            )
+            self._persist_current_revision(
+                connection, connection.execute("SELECT * FROM pages WHERE page_id = ?", (page["page_id"],)).fetchone(),
+                origin="manual",
+            )
             saved = self._saved_page(connection, book_id, number)
             processing = connection.execute(
                 "SELECT status FROM books WHERE id = ?", (book_id,),
@@ -861,11 +1002,15 @@ class Storage:
             page["book_id"], page["number"], page["source_id"], page["source_page"],
         ):
             raise ValueError("布局来源与项目页面不一致")
+        if (source.page_id and source.page_id != page["page_id"]) or source.source_version != page["source_version"]:
+            raise ValueError("布局来源版本与项目页面不一致")
+        if source.source_file_id and source.source_file_id != page["source_id"]:
+            raise ValueError("布局源资产与项目页面不一致")
 
     @staticmethod
     def _archive_page(connection: sqlite3.Connection, page: sqlite3.Row) -> None:
         connection.execute(
-            "INSERT INTO page_versions(book_id,page_number,content_revision,snapshot_json) VALUES (?,?,?,?)",
+            "INSERT OR IGNORE INTO page_versions(book_id,page_number,content_revision,snapshot_json) VALUES (?,?,?,?)",
             (page["book_id"], page["number"], page["content_revision"],
              json.dumps(dict(page), ensure_ascii=False)),
         )
@@ -975,6 +1120,9 @@ class Storage:
             status = "interrupted"
         return Page(
             number=row["number"], status=status, error=row["error"],
+            page_id=row["page_id"], source_version=row["source_version"],
+            current_revision_id=row["current_revision_id"], result_status=row["result_status"],
+            manual_protected=bool(row["manual_protected"]),
             source_id=row["source_id"], source_filename=row["source_filename"], source_page=row["source_page"],
             text=row["text"],
             render_strategy=row["render_strategy"],
@@ -995,3 +1143,805 @@ class Storage:
             usage=cls._usage(attempts, bool(row["usage_unknown"])),
             attempts=len(attempts),
         )
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _initialize_new_pages(self, connection: sqlite3.Connection, book_id: str) -> None:
+        for row in connection.execute(
+            "SELECT number FROM pages WHERE book_id = ? AND page_id IS NULL", (book_id,),
+        ).fetchall():
+            connection.execute(
+                "UPDATE pages SET page_id = ? WHERE book_id = ? AND number = ?",
+                (str(uuid4()), book_id, row["number"]),
+            )
+            page = connection.execute(
+                "SELECT * FROM pages WHERE book_id = ? AND number = ?", (book_id, row["number"]),
+            ).fetchone()
+            self._persist_current_revision(connection, page, origin="legacy")
+
+    def _persist_current_revision(
+        self, connection: sqlite3.Connection, page: sqlite3.Row, *, origin: str,
+    ) -> Revision:
+        metadata = (PageSourceMetadata.model_validate_json(page["source_metadata_json"])
+                    if page["source_metadata_json"] else None)
+        if metadata is not None:
+            metadata = metadata.model_copy(update={
+                "page_id": page["page_id"], "source_file_id": page["source_id"],
+                "source_version": page["source_version"],
+            })
+        layout = (SourceFidelityLayout.model_validate_json(page["layout_source_json"])
+                  if page["layout_source_json"] else None)
+        if layout is not None and metadata is not None:
+            layout = layout.model_copy(update={"source": metadata})
+        if layout is not None and layout.content_revision == page["content_revision"]:
+            layout = layout.model_copy(update={"layout_revision": page["layout_revision"]})
+        revision = Revision(
+            revision_id=str(uuid4()), parent_revision_id=page["current_revision_id"],
+            book_id=page["book_id"], page_id=page["page_id"], page_number=page["number"],
+            source_version=page["source_version"], content_revision=page["content_revision"],
+            layout_revision=page["layout_revision"], origin=origin, run_id=None,
+            text=page["text"], render_strategy=page["render_strategy"], layout_source=layout,
+            source_metadata=metadata, page_kind=page["page_kind"], page_side=page["page_side"],
+            cover_fields=[CoverField.model_validate(item) for item in json.loads(page["cover_fields_json"])],
+            header_segments=[MarginSegment.model_validate(item) for item in json.loads(page["header_segments_json"])],
+            footer_segments=[MarginSegment.model_validate(item) for item in json.loads(page["footer_segments_json"])],
+            generated_content_revision=page["generated_content_revision"],
+            generator_version=layout.generator_version if layout else None, created_at=self._now(),
+        )
+        self._insert_revision(connection, revision)
+        connection.execute(
+            "UPDATE pages SET current_revision_id = ?, result_status = NULL,source_metadata_json = ?,layout_source_json = ? WHERE page_id = ?",
+            (revision.revision_id, metadata.model_dump_json() if metadata else None,
+             layout.model_dump_json() if layout else None, revision.page_id),
+        )
+        return revision
+
+    @staticmethod
+    def _insert_revision(connection: sqlite3.Connection, revision: Revision) -> None:
+        connection.execute(
+            "INSERT INTO workflow_revisions(revision_id,book_id,page_id,revision_json) VALUES (?,?,?,?)",
+            (revision.revision_id, revision.book_id, revision.page_id, revision.model_dump_json()),
+        )
+
+    @staticmethod
+    def _revision(connection: sqlite3.Connection, revision_id: str) -> Revision | None:
+        row = connection.execute(
+            "SELECT revision_json FROM workflow_revisions WHERE revision_id = ?", (revision_id,),
+        ).fetchone()
+        return Revision.model_validate_json(row["revision_json"]) if row else None
+
+    def get_revision(self, revision_id: str) -> Revision | None:
+        with self._connect() as connection:
+            return self._revision(connection, revision_id)
+
+    @staticmethod
+    def _tasks(connection: sqlite3.Connection, run_id: str) -> list[PageTask]:
+        tasks = [PageTask.model_validate_json(row["task_json"]) for row in connection.execute(
+            "SELECT task_json FROM workflow_tasks WHERE run_id = ?", (run_id,),
+        ).fetchall()]
+        return sorted(tasks, key=lambda task: task.position)
+
+    @staticmethod
+    def _task(connection: sqlite3.Connection, run_id: str, page_id: str) -> PageTask:
+        row = connection.execute(
+            "SELECT task_json FROM workflow_tasks WHERE run_id = ? AND page_id = ?", (run_id, page_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError("task")
+        return PageTask.model_validate_json(row["task_json"])
+
+    @staticmethod
+    def _write_task(connection: sqlite3.Connection, task: PageTask) -> None:
+        connection.execute(
+            "UPDATE workflow_tasks SET task_json = ? WHERE run_id = ? AND page_id = ?",
+            (task.model_dump_json(), task.run_id, task.page_id),
+        )
+
+    @classmethod
+    def _run(cls, connection: sqlite3.Connection, row: sqlite3.Row) -> Run:
+        snapshot = json.loads(row["snapshot_json"])
+        tasks = cls._tasks(connection, row["run_id"])
+        attempts = [Attempt.model_validate_json(item["attempt_json"]) for item in connection.execute(
+            "SELECT attempt_json FROM workflow_attempts WHERE run_id = ?", (row["run_id"],),
+        ).fetchall()]
+        def total(field: str) -> int | None:
+            values = [getattr(item.usage, field) for item in attempts if getattr(item.usage, field) is not None]
+            return sum(values) if values else None
+        return Run(
+            run_id=row["run_id"], book_id=row["book_id"],
+            arrangement_revision=snapshot["arrangement_revision"], page_ids=snapshot["page_ids"],
+            settings_snapshot=snapshot["settings"], policy=snapshot["policy"], status=row["status"],
+            request_limit=row["request_limit"], request_count=row["request_count"],
+            generator_version=snapshot["generator_version"], created_at=row["created_at"],
+            updated_at=row["updated_at"], error=row["error"], tasks=tasks,
+            export_manifest_id=snapshot.get("export_manifest_id"),
+            usage=Usage(input_tokens=total("input_tokens"), output_tokens=total("output_tokens"),
+                        total_tokens=total("total_tokens"),
+                        complete=bool(attempts) and all(item.usage.complete and item.state != "reserved" for item in attempts)),
+            counts=RunCounts(
+                total=len(tasks), completed=sum(task.result_status is not None for task in tasks),
+                auto_passed=sum(task.result_status == "auto_passed" for task in tasks),
+                completed_with_issues=sum(task.result_status == "completed_with_issues" for task in tasks),
+                failed=sum(task.result_status == "failed" for task in tasks),
+            ),
+        )
+
+    def create_run(
+        self, book_id: str, request: RunCreate, *, settings_snapshot: dict[str, Any] | None = None,
+        generator_version: str = "workflow-v1",
+    ) -> Run:
+        settings = self.get_settings() if settings_snapshot is None else settings_snapshot
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                "SELECT * FROM workflow_runs WHERE book_id = ? AND client_request_id = ?",
+                (book_id, request.client_request_id),
+            ).fetchone()
+            if previous:
+                return self._run(connection, previous)
+            book = connection.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+            if book is None:
+                raise KeyError("book")
+            if book["arrangement_revision"] != request.expected_arrangement_revision:
+                raise RevisionConflict("页序已更新，请使用最新编排启动任务")
+            if connection.execute(
+                "SELECT 1 FROM workflow_runs WHERE book_id = ? AND status IN ('queued','running','pausing','paused')",
+                (book_id,),
+            ).fetchone():
+                raise RevisionConflict("项目已有未结束任务，请先完成或恢复该任务")
+            records = connection.execute(
+                "SELECT pages.*, source_files.filename AS source_filename, source_files.kind AS source_kind, "
+                "source_files.directory AS source_directory, source_files.page_count AS source_page_count "
+                "FROM pages JOIN source_files ON pages.book_id = source_files.book_id AND pages.source_id = source_files.id "
+                "WHERE pages.book_id = ? AND selected = 1 ORDER BY pages.position,pages.number", (book_id,),
+            ).fetchall()
+            selected_ids = set(request.page_ids) if request.page_ids is not None else None
+            selected_numbers = set(request.pages) if request.pages is not None else None
+            if selected_ids is not None:
+                if not selected_ids <= {row["page_id"] for row in records}:
+                    raise ValueError("处理范围包含未编排页面")
+                records = [row for row in records if row["page_id"] in selected_ids]
+            if selected_numbers is not None:
+                if not selected_numbers <= {row["number"] for row in records}:
+                    raise ValueError("处理范围包含未编排页面")
+                records = [row for row in records if row["number"] in selected_numbers]
+            if not records:
+                raise ValueError("处理范围不能为空")
+            page_ids = [row["page_id"] for row in records]
+            if not set(request.policy.replace_page_ids) <= set(page_ids):
+                raise ValueError("人工稿替换范围必须属于本轮处理范围")
+            safe_settings = {key: settings.get(key, default) for key, default in DEFAULT_SETTINGS.items()}
+            safe_settings.update(paper_size=book["paper_size"], layout=json.loads(book["layout_json"]),
+                                 render_strategy=book["render_strategy"], output_settings_version=book["output_settings_version"],
+                                 title=book["title"], filename=book["filename"])
+            source_fields = ("page_id", "number", "source_id", "source_page", "source_version", "width", "height",
+                             "image_name", "source_filename", "source_kind", "source_directory", "source_page_count")
+            run_id, now = str(uuid4()), self._now()
+            snapshot = {"arrangement_revision": book["arrangement_revision"], "page_ids": page_ids,
+                        "settings": safe_settings, "policy": request.policy.model_dump(),
+                        "generator_version": generator_version,
+                        "sources": {row["page_id"]: {key: row[key] for key in source_fields} for row in records}}
+            connection.execute(
+                "INSERT INTO workflow_runs(run_id,book_id,client_request_id,status,request_limit,snapshot_json,created_at,updated_at) "
+                "VALUES (?,?,?,'queued',?,?,?,?)",
+                (run_id, book_id, request.client_request_id,
+                 request.request_limit if request.request_limit is not None else 3 * len(records),
+                 json.dumps(snapshot, ensure_ascii=False), now, now),
+            )
+            for position, row in enumerate(records):
+                task = PageTask(
+                    run_id=run_id, page_id=row["page_id"], page_number=row["number"], source_version=row["source_version"],
+                    position=position, base_revision_id=row["current_revision_id"],
+                    base_content_revision=row["content_revision"], base_layout_revision=row["layout_revision"],
+                )
+                if row["manual_protected"] and row["page_id"] not in request.policy.replace_page_ids:
+                    task.stage, task.state, task.result_status = "finalize", "succeeded", "completed_with_issues"
+                    task.stage_data = {"protected_manual": True, "final_revision_id": row["current_revision_id"],
+                                       "candidate_not_adopted_reason": "启动时默认保护已有人工稿；历史内容未经过本轮自动复核"}
+                connection.execute(
+                    "INSERT INTO workflow_tasks(run_id,page_id,task_json) VALUES (?,?,?)",
+                    (run_id, row["page_id"], task.model_dump_json()),
+                )
+            return self._run(connection, connection.execute("SELECT * FROM workflow_runs WHERE run_id = ?", (run_id,)).fetchone())
+
+    def get_run(self, book_id: str, run_id: str) -> Run | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM workflow_runs WHERE book_id = ? AND run_id = ?", (book_id, run_id)).fetchone()
+            return self._run(connection, row) if row else None
+
+    def get_run_book(self, book_id: str, run_id: str) -> Book:
+        run = self.get_run(book_id, run_id)
+        book = self.get_book(book_id)
+        if run is None or book is None:
+            raise KeyError("run or book")
+        settings = run.settings_snapshot
+        return book.model_copy(update={
+            "paper_size": settings["paper_size"], "layout": LayoutSettings.model_validate(settings["layout"]),
+            "render_strategy": settings["render_strategy"], "arrangement_revision": run.arrangement_revision,
+            "output_settings_version": settings["output_settings_version"], "title": settings["title"],
+            "filename": settings["filename"], "page_count": len(run.page_ids), "selected_page_count": len(run.page_ids),
+        })
+
+    def list_runs(self, book_id: str) -> list[Run]:
+        with self._connect() as connection:
+            return [self._run(connection, row) for row in connection.execute(
+                "SELECT * FROM workflow_runs WHERE book_id = ? ORDER BY created_at DESC", (book_id,),
+            ).fetchall()]
+
+    def get_run_tasks(self, run_id: str) -> list[PageTask]:
+        with self._connect() as connection:
+            return self._tasks(connection, run_id)
+
+    def get_task(self, run_id: str, page_id: str) -> PageTask | None:
+        with self._connect() as connection:
+            try:
+                return self._task(connection, run_id, page_id)
+            except KeyError:
+                return None
+
+    def update_task(
+        self, run_id: str, page_id: str, *, stage: WorkflowStage | None = None,
+        state: ExecutionStatus | None = None, candidate_revision_id: str | None = None,
+        completed_stage: WorkflowStage | None = None, stage_data: dict | None = None,
+        error: str | None = None, result_status: ResultStatus | None = None,
+    ) -> PageTask:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._task(connection, run_id, page_id)
+            for name, value in (("stage", stage), ("state", state), ("candidate_revision_id", candidate_revision_id),
+                                ("result_status", result_status)):
+                if value is not None:
+                    setattr(task, name, value)
+            task.error = error
+            if completed_stage is not None and completed_stage not in task.completed_stages:
+                task.completed_stages.append(completed_stage)
+            if stage_data is not None:
+                task.stage_data.update(stage_data)
+            self._write_task(connection, task)
+            connection.execute("UPDATE workflow_runs SET updated_at = ? WHERE run_id = ?", (self._now(), run_id))
+            return task
+
+    def set_run_status(self, book_id: str, run_id: str, status: RunStatus, error: str | None = None) -> Run:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if not connection.execute("SELECT 1 FROM workflow_runs WHERE book_id = ? AND run_id = ?", (book_id, run_id)).fetchone():
+                raise KeyError("run")
+            tasks = self._tasks(connection, run_id)
+            if status == "succeeded":
+                if any(task.result_status is None for task in tasks):
+                    raise ValueError("页面尚未全部形成终态，不能结束为成功")
+                failed = sum(task.result_status == "failed" for task in tasks)
+                if failed:
+                    status, error = "failed", error or f"{failed} 页发生技术失败，输出不完整"
+            connection.execute("UPDATE workflow_runs SET status = ?,error = ?,updated_at = ? WHERE run_id = ?",
+                               (status, error, self._now(), run_id))
+            legacy_status = {"queued": "processing", "running": "processing", "pausing": "pausing", "paused": "paused",
+                             "succeeded": "ready", "failed": "failed", "interrupted": "interrupted"}[status]
+            completed = sum(task.result_status is not None for task in tasks)
+            connection.execute("UPDATE books SET status = ?,completed_pages = ?,error = ? WHERE id = ?",
+                               (legacy_status, completed, error, book_id))
+            return self._run(connection, connection.execute("SELECT * FROM workflow_runs WHERE run_id = ?", (run_id,)).fetchone())
+
+    def get_run_page_record(self, run_id: str, page_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM workflow_runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError("run")
+            task = self._task(connection, run_id, page_id)
+            snapshot = json.loads(row["snapshot_json"])
+            record = connection.execute("SELECT * FROM pages WHERE page_id = ? AND book_id = ?", (page_id, row["book_id"])).fetchone()
+            if record is None:
+                raise KeyError("page")
+            data = dict(record)
+            data.update(snapshot["sources"][page_id])
+            data.update(book_id=row["book_id"], content_revision=task.base_content_revision,
+                        layout_revision=task.base_layout_revision, current_revision_id=task.base_revision_id,
+                        settings_snapshot=snapshot["settings"])
+            base = self._revision(connection, task.base_revision_id)
+            if base is not None:
+                data.update(text=base.text, render_strategy=base.render_strategy, page_kind=base.page_kind, page_side=base.page_side,
+                            generated_content_revision=base.generated_content_revision,
+                            layout_source_json=base.layout_source.model_dump_json() if base.layout_source else None,
+                            source_metadata_json=base.source_metadata.model_dump_json() if base.source_metadata else None,
+                            cover_fields_json=json.dumps([item.model_dump() for item in base.cover_fields], ensure_ascii=False),
+                            header_segments_json=json.dumps([item.model_dump() for item in base.header_segments], ensure_ascii=False),
+                            footer_segments_json=json.dumps([item.model_dump() for item in base.footer_segments], ensure_ascii=False))
+            return data
+
+    def reserve_attempt(self, run_id: str, page_id: str, stage: WorkflowStage, *, retry: bool = False) -> Attempt:
+        if stage not in {"recognize", "verify", "repair"}:
+            raise ValueError("只有识别、复核和修复阶段可预留模型请求")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute("SELECT * FROM workflow_runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError("run")
+            if run["status"] != "running":
+                raise RequestBudgetExceeded("任务已暂停或结束，不能启动新请求")
+            task = self._task(connection, run_id, page_id)
+            if task.result_status is not None or task.request_count >= 6:
+                raise RequestBudgetExceeded("本页已结束或已达到六次物理请求上限")
+            counter = {"recognize": "recognize_count", "verify": "review_count", "repair": "repair_count"}[stage]
+            logical_limit = 2 if stage == "verify" else 1
+            if retry:
+                last = [attempt for attempt in self._attempts(connection, run_id, page_id) if attempt.stage == stage]
+                if task.retry_count >= 2 or not last or last[-1].state != "failed":
+                    raise RequestBudgetExceeded("暂时错误重试名额已用尽，或上次请求结果不能安全重发")
+            elif getattr(task, counter) >= logical_limit:
+                raise RequestBudgetExceeded("本阶段已达到逻辑调用轮数上限")
+            elif stage == "verify" and task.review_count == 1 and task.repair_count == 0:
+                raise RequestBudgetExceeded("第二次复核仅用于本页唯一一轮内容修复之后")
+            # First requests earmark their basic allowance. Retry/repair requests may
+            # only use the remainder after every unfinished page's first review.
+            basic_needed = 0
+            for other in self._tasks(connection, run_id):
+                if other.result_status is not None or other.state == "failed":
+                    continue
+                recognize_needed = int(other.recognize_count == 0)
+                review_needed = int(other.review_count == 0)
+                if other.page_id == page_id and not retry:
+                    if stage == "recognize":
+                        recognize_needed = 0
+                    elif stage == "verify":
+                        review_needed = 0
+                basic_needed += recognize_needed + review_needed
+            basic_request = not retry and stage in {"recognize", "verify"} and getattr(task, counter) == 0
+            reserved_for_other_stages = 0 if basic_request else basic_needed
+            if run["request_count"] + 1 + reserved_for_other_stages > run["request_limit"]:
+                raise RequestBudgetExceeded("本轮额度不足；已为未处理页面保留基本识别与复核名额")
+            task.request_count += 1
+            if retry:
+                task.retry_count += 1
+            else:
+                setattr(task, counter, getattr(task, counter) + 1)
+            self._write_task(connection, task)
+            now = self._now()
+            attempt = Attempt(attempt_id=str(uuid4()), run_id=run_id, page_id=page_id,
+                              stage=stage, ordinal=task.request_count, retry=retry, created_at=now)
+            legacy_attempt = connection.execute(
+                "SELECT COALESCE(MAX(attempt),0)+1 FROM page_attempts WHERE book_id = ? AND page_number = ?",
+                (run["book_id"], task.page_number),
+            ).fetchone()[0]
+            connection.execute("INSERT INTO page_attempts(book_id,page_number,attempt) VALUES (?,?,?)",
+                               (run["book_id"], task.page_number, legacy_attempt))
+            connection.execute(
+                "INSERT INTO workflow_attempts(attempt_id,run_id,page_id,legacy_attempt,attempt_json) VALUES (?,?,?,?,?)",
+                (attempt.attempt_id, run_id, page_id, legacy_attempt, attempt.model_dump_json()),
+            )
+            connection.execute("UPDATE workflow_runs SET request_count = request_count + 1,updated_at = ? WHERE run_id = ?",
+                               (now, run_id))
+            return attempt
+
+    @staticmethod
+    def _attempts(connection: sqlite3.Connection, run_id: str, page_id: str | None = None) -> list[Attempt]:
+        rows = connection.execute(
+            "SELECT attempt_json FROM workflow_attempts WHERE run_id = ?" + (" AND page_id = ?" if page_id else ""),
+            (run_id, page_id) if page_id else (run_id,),
+        ).fetchall()
+        return sorted((Attempt.model_validate_json(row["attempt_json"]) for row in rows), key=lambda attempt: attempt.created_at)
+
+    def get_attempts(self, run_id: str, page_id: str | None = None) -> list[Attempt]:
+        with self._connect() as connection:
+            return self._attempts(connection, run_id, page_id)
+
+    def finish_run_attempt(
+        self, attempt_id: str, *, state: str, usage: Usage | None = None,
+        provider_request_id: str | None = None, error: str | None = None,
+    ) -> Attempt:
+        if state not in {"succeeded", "failed", "unknown"}:
+            raise ValueError("请求结算状态不正确")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM workflow_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if row is None:
+                raise KeyError("attempt")
+            attempt = Attempt.model_validate_json(row["attempt_json"])
+            if attempt.state != "reserved":
+                return attempt
+            attempt.state, attempt.finished_at = state, self._now()
+            if usage is not None:
+                attempt.usage = usage
+            attempt.provider_request_id, attempt.error = provider_request_id, error
+            connection.execute("UPDATE workflow_attempts SET attempt_json = ? WHERE attempt_id = ?",
+                               (attempt.model_dump_json(), attempt_id))
+            task = self._task(connection, attempt.run_id, attempt.page_id)
+            run = connection.execute("SELECT book_id FROM workflow_runs WHERE run_id = ?", (attempt.run_id,)).fetchone()
+            connection.execute(
+                "UPDATE page_attempts SET returned = ?,input_tokens = ?,output_tokens = ?,total_tokens = ? "
+                "WHERE book_id = ? AND page_number = ? AND attempt = ?",
+                (int(state != "unknown"), attempt.usage.input_tokens, attempt.usage.output_tokens,
+                 attempt.usage.total_tokens, run["book_id"], task.page_number, row["legacy_attempt"]),
+            )
+            return attempt
+
+    def reserve_compile(self, run_id: str, page_id: str) -> int:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._task(connection, run_id, page_id)
+            row = connection.execute("SELECT status FROM workflow_runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row["status"] != "running" or task.compile_count >= 4:
+                raise RequestBudgetExceeded("任务已停止或本页已达到四次候选编译上限")
+            task.compile_count += 1
+            self._write_task(connection, task)
+            return task.compile_count
+
+    def save_candidate(
+        self, run_id: str, page_id: str, *, layout_source: SourceFidelityLayout | None,
+        text: str, page_kind: PageKind = "content", page_side: str = "unknown",
+        cover_fields: list[CoverField] | None = None, header_segments: list[MarginSegment] | None = None,
+        footer_segments: list[MarginSegment] | None = None, generator_version: str | None = None,
+        parent_revision_id: str | None = None,
+    ) -> Revision:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._task(connection, run_id, page_id)
+            run = connection.execute("SELECT * FROM workflow_runs WHERE run_id = ?", (run_id,)).fetchone()
+            snapshot = json.loads(run["snapshot_json"])
+            source = snapshot["sources"][page_id]
+            if parent_revision_id is not None:
+                parent = self._revision(connection, parent_revision_id)
+                if parent is None or parent.page_id != page_id or parent.book_id != run["book_id"]:
+                    raise ValueError("候选父修订不属于本页")
+            content_revision, layout_revision = task.base_content_revision + 1, task.base_layout_revision + 1
+            if layout_source is not None:
+                metadata = layout_source.source
+                if (metadata.book_id, metadata.page_id, metadata.source_id, metadata.source_page, metadata.source_version) != (
+                    run["book_id"], page_id, source["source_id"], source["source_page"], task.source_version,
+                ):
+                    raise ValueError("候选布局与冻结源资产不一致")
+                layout_source = layout_source.model_copy(update={
+                    "content_revision": content_revision, "layout_revision": layout_revision,
+                    "generated_content_revision": content_revision if text else None,
+                    "generator_version": generator_version or snapshot["generator_version"],
+                })
+            revision = Revision(
+                revision_id=str(uuid4()), parent_revision_id=parent_revision_id or task.candidate_revision_id or task.base_revision_id,
+                book_id=run["book_id"], page_id=page_id, page_number=task.page_number,
+                source_version=task.source_version, content_revision=content_revision, layout_revision=layout_revision,
+                origin="automatic", run_id=run_id, text=text, render_strategy="source_fidelity",
+                layout_source=layout_source, source_metadata=layout_source.source if layout_source else None,
+                page_kind=page_kind, page_side=page_side, cover_fields=cover_fields or [],
+                header_segments=header_segments or [], footer_segments=footer_segments or [],
+                generated_content_revision=content_revision if layout_source is not None and text else None,
+                generator_version=generator_version or snapshot["generator_version"], created_at=self._now(),
+            )
+            self._insert_revision(connection, revision)
+            task.candidate_revision_id = revision.revision_id
+            self._write_task(connection, task)
+            return revision
+
+    def save_assessment(self, assessment: Assessment) -> Assessment:
+        with self._connect() as connection:
+            revision = self._revision(connection, assessment.revision_id)
+            task = self._task(connection, assessment.run_id, assessment.page_id)
+            run = connection.execute("SELECT book_id FROM workflow_runs WHERE run_id = ?", (assessment.run_id,)).fetchone()
+            related_revision = assessment.revision_id in {task.base_revision_id, task.stage_data.get("final_revision_id")}
+            if (revision is None or revision.page_id != assessment.page_id or revision.book_id != run["book_id"]
+                or (revision.run_id != assessment.run_id and not related_revision)):
+                raise ValueError("复核必须关联本轮本页候选或已保留修订")
+            if any((issue.run_id, issue.page_id, issue.revision_id) != (
+                assessment.run_id, assessment.page_id, assessment.revision_id,
+            ) for issue in assessment.issues):
+                raise ValueError("问题必须关联同一候选修订")
+            connection.execute(
+                "INSERT INTO workflow_assessments(assessment_id,book_id,revision_id,assessment_json) VALUES (?,?,?,?)",
+                (assessment.assessment_id, revision.book_id, revision.revision_id, assessment.model_dump_json()),
+            )
+            return assessment
+
+    @staticmethod
+    def _assessment(connection: sqlite3.Connection, revision_id: str, *, run_id: str | None = None) -> Assessment | None:
+        query = "SELECT assessment_json FROM workflow_assessments WHERE revision_id = ? ORDER BY rowid DESC"
+        if run_id is None:
+            query += " LIMIT 1"
+        # A retained revision may have conclusions from several runs.
+        for row in connection.execute(query, (revision_id,)):
+            assessment = Assessment.model_validate_json(row["assessment_json"])
+            if run_id is None or assessment.run_id == run_id:
+                return assessment
+        return None
+
+    def get_assessment(self, revision_id: str) -> Assessment | None:
+        with self._connect() as connection:
+            return self._assessment(connection, revision_id)
+
+    def adopt_candidate(self, run_id: str, page_id: str, revision_id: str, result_status: ResultStatus) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._task(connection, run_id, page_id)
+            run = connection.execute("SELECT * FROM workflow_runs WHERE run_id = ?", (run_id,)).fetchone()
+            snapshot = json.loads(run["snapshot_json"])
+            revision = self._revision(connection, revision_id)
+            if revision is None or (revision.page_id, revision.run_id) != (page_id, run_id):
+                raise ValueError("只能采用本轮本页候选")
+            page = connection.execute("SELECT * FROM pages WHERE page_id = ? AND book_id = ?", (page_id, run["book_id"])).fetchone()
+            if page is None:
+                raise KeyError("page")
+            authorized = not page["manual_protected"] or page_id in snapshot["policy"]["replace_page_ids"]
+            matches = (page["current_revision_id"] == task.base_revision_id and page["content_revision"] == task.base_content_revision
+                       and page["layout_revision"] == task.base_layout_revision and page["source_version"] == task.source_version)
+            if not authorized or not matches or result_status == "failed":
+                current_source = connection.execute(
+                    "SELECT pages.*,source_files.filename AS source_filename,source_files.kind AS source_kind,"
+                    "source_files.directory AS source_directory,source_files.page_count AS source_page_count "
+                    "FROM pages JOIN source_files ON pages.book_id = source_files.book_id AND pages.source_id = source_files.id "
+                    "WHERE pages.page_id = ?", (page_id,),
+                ).fetchone()
+                source_fields = ("page_id", "number", "source_id", "source_page", "source_version", "width", "height",
+                                 "image_name", "source_filename", "source_kind", "source_directory", "source_page_count")
+                task.stage_data.update(final_revision_id=page["current_revision_id"],
+                                       final_source={key: current_source[key] for key in source_fields},
+                                       candidate_not_adopted_reason=("候选技术失败；保留已有采用修订" if result_status == "failed"
+                                                                    else "运行中页面已编辑或启动时未授权替换人工稿；保留当前采用修订"))
+                task.result_status = "failed" if result_status == "failed" else "completed_with_issues"
+                self._write_task(connection, task)
+                return False
+            assessment = self._assessment(connection, revision_id)
+            if result_status == "auto_passed" and (assessment is None or any(
+                getattr(assessment, name) != "passed" for name in ("content", "layout", "coverage")
+            ) or any(issue.severity in {"error", "warning"} for issue in assessment.issues)
+                or (revision.layout_source is not None and revision.layout_source.source_disposition != "transcribed")):
+                raise ValueError("自动通过必须有内容、布局和覆盖结论，且不能包含不确定源图保留")
+            self._archive_page(connection, page)
+            layout = revision.layout_source
+            current_output_version = connection.execute(
+                "SELECT output_settings_version FROM books WHERE id = ?", (run["book_id"],),
+            ).fetchone()[0]
+            current_result_status = result_status if current_output_version == snapshot["settings"]["output_settings_version"] else None
+            connection.execute(
+                "UPDATE pages SET current_revision_id = ?,result_status = ?,status = ?,error = NULL,text = ?, "
+                "render_strategy = ?,content_revision = ?,layout_revision = ?,generated_content_revision = ?, "
+                "layout_schema_version = ?,layout_source_json = ?,source_metadata_json = ?,page_kind = ?,page_side = ?, "
+                "cover_fields_json = ?,header_segments_json = ?,footer_segments_json = ?,manual_protected = 0 WHERE page_id = ?",
+                (revision_id, current_result_status, "failed" if result_status == "failed" else "ready", revision.text,
+                 revision.render_strategy, revision.content_revision, revision.layout_revision, revision.generated_content_revision,
+                 layout.schema_version if layout else None, layout.model_dump_json() if layout else None,
+                 revision.source_metadata.model_dump_json() if revision.source_metadata else None,
+                 revision.page_kind, revision.page_side,
+                 json.dumps([item.model_dump() for item in revision.cover_fields], ensure_ascii=False),
+                 json.dumps([item.model_dump() for item in revision.header_segments], ensure_ascii=False),
+                 json.dumps([item.model_dump() for item in revision.footer_segments], ensure_ascii=False), page_id),
+            )
+            task.stage_data["final_revision_id"] = revision_id
+            task.result_status = result_status
+            self._write_task(connection, task)
+            return True
+
+    def create_export_manifest(
+        self, book_id: str, *, expected_arrangement_revision: int, page_ids: list[str] | None = None,
+        run_id: str | None = None, generator_version: str = "workflow-v1",
+    ) -> ExportManifest:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            book = connection.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+            if book is None:
+                raise KeyError("book")
+            tasks: dict[str, PageTask] = {}
+            if run_id is not None:
+                run = connection.execute("SELECT * FROM workflow_runs WHERE book_id = ? AND run_id = ?", (book_id, run_id)).fetchone()
+                if run is None:
+                    raise KeyError("run")
+                snapshot = json.loads(run["snapshot_json"])
+                arrangement_revision = snapshot["arrangement_revision"]
+                settings = snapshot["settings"]
+                generator_version = snapshot["generator_version"]
+                tasks = {task.page_id: task for task in self._tasks(connection, run_id)}
+                order = snapshot["page_ids"]
+                sources = snapshot["sources"]
+            else:
+                arrangement_revision = book["arrangement_revision"]
+                settings = {"paper_size": book["paper_size"], "layout": json.loads(book["layout_json"]),
+                            "render_strategy": book["render_strategy"], "output_settings_version": book["output_settings_version"],
+                            "title": book["title"], "filename": book["filename"]}
+                rows = connection.execute(
+                    "SELECT pages.*,source_files.filename AS source_filename FROM pages JOIN source_files "
+                    "ON pages.book_id = source_files.book_id AND pages.source_id = source_files.id "
+                    "WHERE pages.book_id = ? AND selected = 1 ORDER BY pages.position,pages.number", (book_id,),
+                ).fetchall()
+                sources = {row["page_id"]: dict(row) for row in rows}
+                order = [row["page_id"] for row in rows]
+            if arrangement_revision != expected_arrangement_revision:
+                raise RevisionConflict("导出页序修订与所选快照不一致")
+            if page_ids is not None:
+                if not set(page_ids) <= set(order):
+                    raise ValueError("导出范围包含快照之外的页面")
+                scope = set(page_ids)
+                order = [page_id for page_id in order if page_id in scope]
+            if not order:
+                raise ValueError("导出范围不能为空")
+            entries, issues = [], []
+            for position, page_id in enumerate(order):
+                task = tasks.get(page_id)
+                source = task.stage_data.get("final_source", sources[page_id]) if task else sources[page_id]
+                revision_id = (task.stage_data.get("final_revision_id") or task.base_revision_id) if task else source["current_revision_id"]
+                revision = self._revision(connection, revision_id)
+                if revision is None:
+                    raise ValueError("输出页面缺少已保存修订")
+                status = task.result_status if task else source["result_status"]
+                assessment = self._assessment(connection, revision_id, run_id=run_id)
+                explanation = task.stage_data.get("candidate_not_adopted_reason") if task else None
+                if task and (task.stage_data.get("protected_manual") or explanation):
+                    if status != "failed":
+                        status = "completed_with_issues"
+                    preserved_issues = [Issue(
+                        issue_id=str(uuid4()), run_id=task.run_id, page_id=page_id, revision_id=revision_id,
+                        category="preserved_revision", severity="warning", reason=explanation or "保留已有稿件",
+                        disposition="保留采用版本；本轮候选检查不代表保留稿已复核；历史ready不作为本轮质量通过",
+                    )]
+                    if status == "failed" and task.error and not (
+                        assessment and any(issue.reason == task.error for issue in assessment.issues)
+                    ):
+                        preserved_issues.append(Issue(
+                            issue_id=str(uuid4()), run_id=task.run_id, page_id=page_id, revision_id=revision_id,
+                            category="execution_failed", severity="error", reason=task.error,
+                            disposition="本轮技术失败；保留采用版本，输出不完整",
+                        ))
+                    if assessment is None:
+                        assessment = Assessment(
+                            assessment_id=str(uuid4()), revision_id=revision_id, run_id=task.run_id, page_id=page_id,
+                            layout="failed" if status == "failed" else "unverified",
+                            coverage="failed" if status == "failed" else "unverified",
+                            rule_version="preserved-v1", issues=preserved_issues, created_at=self._now(),
+                        )
+                    else:
+                        # Keep this run's errors and incomplete checks on the retained revision.
+                        assessment = assessment.model_copy(update={"issues": [*assessment.issues, *preserved_issues]})
+                if assessment:
+                    issues.extend(assessment.issues)
+                entries.append(ExportManifestPage(
+                    page_id=page_id, page_number=source["number"], position=position, revision_id=revision_id,
+                    source_file_id=source["source_id"], source_page=source["source_page"], source_version=revision.source_version,
+                    source_filename=source["source_filename"], image_name=source["image_name"], result_status=status,
+                    assessment=assessment,
+                ))
+            manifest = ExportManifest(
+                manifest_id=str(uuid4()), book_id=book_id, run_id=run_id, arrangement_revision=arrangement_revision,
+                output_settings_version=settings["output_settings_version"], settings_snapshot=settings,
+                generator_version=generator_version, pages=entries,
+                complete=all(entry.result_status != "failed" and (run_id is None or entry.result_status is not None) for entry in entries),
+                issues=issues, created_at=self._now(),
+            )
+            connection.execute("INSERT INTO export_manifests(manifest_id,book_id,manifest_json) VALUES (?,?,?)",
+                               (manifest.manifest_id, book_id, manifest.model_dump_json()))
+            if run_id is not None:
+                snapshot["export_manifest_id"] = manifest.manifest_id
+                connection.execute("UPDATE workflow_runs SET snapshot_json = ?,updated_at = ? WHERE run_id = ?",
+                                   (json.dumps(snapshot, ensure_ascii=False), self._now(), run_id))
+            return manifest
+
+    def get_export_manifest(self, book_id: str, manifest_id: str) -> ExportManifest | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT manifest_json FROM export_manifests WHERE book_id = ? AND manifest_id = ?",
+                                     (book_id, manifest_id)).fetchone()
+            return ExportManifest.model_validate_json(row["manifest_json"]) if row else None
+
+    def record_manifest_outputs(self, book_id: str, manifest_id: str, outputs: dict[str, str]) -> ExportManifest:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT manifest_json FROM export_manifests WHERE book_id = ? AND manifest_id = ?",
+                                     (book_id, manifest_id)).fetchone()
+            if row is None:
+                raise KeyError("manifest")
+            manifest = ExportManifest.model_validate_json(row["manifest_json"])
+            manifest = manifest.model_copy(update={"outputs": {**manifest.outputs, **outputs}})
+            connection.execute("UPDATE export_manifests SET manifest_json = ? WHERE manifest_id = ?",
+                               (manifest.model_dump_json(), manifest_id))
+            return manifest
+
+    def set_run_manifest(self, book_id: str, run_id: str, manifest_id: str) -> Run:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM workflow_runs WHERE book_id = ? AND run_id = ?", (book_id, run_id)).fetchone()
+            manifest = connection.execute("SELECT 1 FROM export_manifests WHERE book_id = ? AND manifest_id = ?",
+                                          (book_id, manifest_id)).fetchone()
+            if row is None or manifest is None:
+                raise KeyError("run or manifest")
+            snapshot = json.loads(row["snapshot_json"])
+            snapshot["export_manifest_id"] = manifest_id
+            connection.execute("UPDATE workflow_runs SET snapshot_json = ?,updated_at = ? WHERE run_id = ?",
+                               (json.dumps(snapshot, ensure_ascii=False), self._now(), run_id))
+            return self._run(connection, connection.execute("SELECT * FROM workflow_runs WHERE run_id = ?", (run_id,)).fetchone())
+
+    def get_manifest_pages(self, book_id: str, manifest_id: str) -> list[Page]:
+        manifest = self.get_export_manifest(book_id, manifest_id)
+        if manifest is None:
+            raise KeyError("manifest")
+        with self._connect() as connection:
+            pages = []
+            for entry in manifest.pages:
+                revision = self._revision(connection, entry.revision_id)
+                if revision is None:
+                    raise KeyError("revision")
+                pages.append(Page(
+                    number=entry.page_number, page_id=entry.page_id, source_id=entry.source_file_id,
+                    source_filename=entry.source_filename, source_page=entry.source_page, source_version=entry.source_version,
+                    current_revision_id=revision.revision_id, result_status=entry.result_status,
+                    manual_protected=revision.origin in {"manual", "legacy"},
+                    status="failed" if entry.result_status == "failed" else ("ready" if revision.text or revision.layout_source else "uploaded"),
+                    error=None, text=revision.text, render_strategy=revision.render_strategy,
+                    content_revision=revision.content_revision, layout_revision=revision.layout_revision,
+                    generated_content_revision=revision.generated_content_revision, layout_source=revision.layout_source,
+                    source_metadata=revision.source_metadata, page_kind=revision.page_kind, page_side=revision.page_side,
+                    cover_fields=revision.cover_fields, header_segments=revision.header_segments, footer_segments=revision.footer_segments,
+                    usage=Usage(input_tokens=None, output_tokens=None, total_tokens=None, complete=False), attempts=0,
+                ))
+            return pages
+
+    def get_manifest_book(self, book_id: str, manifest_id: str) -> Book:
+        manifest = self.get_export_manifest(book_id, manifest_id)
+        book = self.get_book(book_id)
+        if manifest is None or book is None:
+            raise KeyError("manifest or book")
+        settings = manifest.settings_snapshot
+        return book.model_copy(update={
+            "paper_size": settings["paper_size"], "layout": LayoutSettings.model_validate(settings["layout"]),
+            "render_strategy": settings["render_strategy"], "arrangement_revision": manifest.arrangement_revision,
+            "output_settings_version": manifest.output_settings_version, "title": settings.get("title", book.title),
+            "filename": settings.get("filename", book.filename),
+            "page_count": len(manifest.pages), "selected_page_count": len(manifest.pages),
+        })
+
+    def list_results(self, book_id: str, offset: int = 0, limit: int = 100) -> list[PageResult]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM pages WHERE book_id = ? AND selected = 1 ORDER BY position,number LIMIT ? OFFSET ?",
+                (book_id, limit, offset),
+            ).fetchall()
+            results = []
+            for row in rows:
+                assessment = self._assessment(connection, row["current_revision_id"])
+                layout = SourceFidelityLayout.model_validate_json(row["layout_source_json"]) if row["layout_source_json"] else None
+                results.append(PageResult(
+                    page_id=row["page_id"], page_number=row["number"], current_revision_id=row["current_revision_id"],
+                    result_status=row["result_status"],
+                    content=assessment.content if assessment else "unverified",
+                    layout=assessment.layout if assessment and row["result_status"] is not None else "unverified",
+                    coverage=assessment.coverage if assessment else "unverified",
+                    source_disposition=layout.source_disposition if layout else None, issues=assessment.issues if assessment else [],
+                ))
+            return results
+
+    def list_issues(self, book_id: str, offset: int = 0, limit: int = 100) -> list[Issue]:
+        with self._connect() as connection:
+            latest = connection.execute("SELECT snapshot_json FROM workflow_runs WHERE book_id = ? ORDER BY created_at DESC LIMIT 1",
+                                        (book_id,)).fetchone()
+            if latest:
+                manifest_id = json.loads(latest["snapshot_json"]).get("export_manifest_id")
+                if manifest_id:
+                    row = connection.execute("SELECT manifest_json FROM export_manifests WHERE manifest_id = ?", (manifest_id,)).fetchone()
+                    if row:
+                        return ExportManifest.model_validate_json(row["manifest_json"]).issues[offset:offset + limit]
+            issues = []
+            for row in connection.execute("SELECT current_revision_id FROM pages WHERE book_id = ? AND selected = 1 ORDER BY position,number",
+                                          (book_id,)).fetchall():
+                assessment = self._assessment(connection, row["current_revision_id"])
+                if assessment:
+                    issues.extend(assessment.issues)
+            return issues[offset:offset + limit]
+
+    def replace_page_source(
+        self, book_id: str, page_id: str, *, source_file_id: str, source_page: int,
+        width: int, height: int, image_name: str,
+    ) -> None:
+        """Register a new asset version; the caller retains the previous asset files."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            page = connection.execute("SELECT * FROM pages WHERE book_id = ? AND page_id = ?", (book_id, page_id)).fetchone()
+            if page is None:
+                raise KeyError("page")
+            source = connection.execute("SELECT page_count FROM source_files WHERE book_id = ? AND id = ?",
+                                        (book_id, source_file_id)).fetchone()
+            if source is None or not 1 <= source_page <= source["page_count"] or width <= 0 or height <= 0:
+                raise ValueError("替换源资产或页面尺寸不正确")
+            self._archive_page(connection, page)
+            connection.execute(
+                "UPDATE pages SET source_id = ?,source_page = ?,source_version = source_version + 1,width = ?,height = ?,"
+                "image_name = ?,source_metadata_json = NULL,layout_source_json = NULL,layout_schema_version = NULL,"
+                "generated_content_revision = NULL,render_strategy = 'custom_latex',content_revision = content_revision + 1,"
+                "layout_revision = layout_revision + 1,manual_protected = 1,result_status = NULL WHERE page_id = ?",
+                (source_file_id, source_page, width, height, image_name, page_id),
+            )
+            updated = connection.execute("SELECT * FROM pages WHERE page_id = ?", (page_id,)).fetchone()
+            self._persist_current_revision(connection, updated, origin="manual")

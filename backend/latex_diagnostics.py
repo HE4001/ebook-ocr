@@ -7,14 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .fidelity_rendering import (
-    MEASUREMENT_VERSION, FidelityItem, fidelity_items, line_font_size,
+    MEASUREMENT_VERSION, FidelityItem, canvas_dimensions, fidelity_items, line_font_size,
 )
 from .latex_export import LatexDocument
-from .layout_contract import BoxBp, normalized_bbox_to_bp, tex_pt_to_bp
+from .layout_contract import BoxBp, SourceFidelityLayout, normalized_bbox_to_bp, tex_pt_to_bp
 from .models import Page, QualityStatus, RenderDiagnostic
 
 
-DIAGNOSTICS_VERSION = "layout-diagnostics-v1"
+DIAGNOSTICS_VERSION = "layout-diagnostics-v2"
 
 _OVERFULL = re.compile(
     r"Overfull \\([hv])box \((\d+(?:\.\d+)?)pt too (?:wide|high)\)([^\n]*)"
@@ -147,11 +147,11 @@ def diagnose_document(
 
     if document.render_strategy != "source_fidelity":
         add("LAYOUT_UNVERIFIED", "当前源码由模板或自定义文档控制，生成器未覆盖其全部自然尺寸。",
-            "结合输出范围检查与原图核对；需要原行测量时，请显式校准原书布局。", coverage="partial")
+            "系统保留现有源码，并将其自然尺寸覆盖记录为未完成。", coverage="partial")
         return diagnostics
     layout = page.layout_source
     if layout is None:
-        add("LAYOUT_UNVERIFIED", "此源页缺少原书布局。", "校准原行位置，或显式选择现有模板/自定义源码。", coverage="none")
+        add("LAYOUT_UNVERIFIED", "此源页缺少原书布局。", "自动布局未形成可用原行位置，按源内容保留策略处理。", coverage="none")
         return diagnostics
     if (layout.content_revision != page.content_revision or layout.layout_revision != page.layout_revision
             or layout.source.page_number != page.number or layout.source.source_id != page.source_id
@@ -159,15 +159,31 @@ def diagnose_document(
             or (page.generated_content_revision is not None and page.generated_content_revision != page.content_revision)):
         add("LAYOUT_SOURCE_MISMATCH", "当前布局、来源或生成源码与页面修订不一致。", "保存当前布局并重新生成本修订源码。", severity="error")
     if layout.canvas_basis in {"project", None} and (layout.canvas_width_bp is not None or layout.source.pdf_geometry is None):
-        add("LAYOUT_UNVERIFIED", "原页物理尺寸尚未确认，当前画布保持原图比例并采用项目临时尺寸。",
-            "确认原页尺寸或人工指定画布，记录尺寸依据。", coverage="partial")
+        add("SOURCE_PHYSICAL_SIZE_ASSUMED", "原页没有可靠物理尺寸，画布保持原图比例并采用项目纸宽。",
+            "尺寸依据已记录，系统按此画布检查自然尺寸与输出范围。", basis="project")
     for reason in layout.review_reasons:
-        add("SOURCE_CONTENT_REVIEW", reason, "对照源图修正对应原行或确认内容。", severity="warning", basis="source_observation")
-    if any(region.kind == "figure" for region in layout.regions):
-        add("LAYOUT_UNVERIFIED", "此页含尚未重建的图形区域。", "对照源图核对图形；本次正文排版结果不能证明图形完整。", coverage="partial")
+        add("SOURCE_CONTENT_REVIEW", reason, "系统执行有限复核与局部修复，仍不确定的区域保留源图。", severity="warning", basis="source_observation")
+    for asset in layout.source_assets:
+        if asset.purpose != "figure":
+            diagnostics.append(RenderDiagnostic(
+                **identity, code="SOURCE_PAGE_PRESERVED" if asset.purpose == "source_page" else "SOURCE_REGION_PRESERVED",
+                severity="warning", message=asset.reason or "未完成可靠转录的内容已保留源图。",
+                suggestion="源图保留结果自动提供；图像替代不计为成功文字化。",
+                basis="source_asset", coverage="partial", block_id=asset.region_id, source_bbox=asset.bbox,
+            ))
+    if layout.source_disposition == "source_page_preserved":
+        return diagnostics
+    figures = {asset.region_id for asset in layout.source_assets if asset.purpose == "figure"}
+    for region in layout.regions:
+        if region.kind == "figure" and region.region_id not in figures:
+            diagnostics.append(RenderDiagnostic(
+                **identity, code="SOURCE_FIGURE_MISSING", severity="error", message="源图形区域尚未保留。",
+                suggestion="自动保存该图形区域并随输出打包。", basis="source_observation", coverage="partial",
+                block_id=region.region_id, source_bbox=region.bbox,
+            ))
     if layout.lines:
         if layout.body_frame is None and any(line.kind in {"text", "equation", "table", "caption"} for line in layout.lines):
-            add("LAYOUT_UNVERIFIED", "正文版心尚未校准，无法完整判断版心越界。", "在原图上确认正文版心。", coverage="partial")
+            add("LAYOUT_UNVERIFIED", "正文版心尚未定位，无法完整判断版心越界。", "系统结合源图行带自动恢复正文版心。", coverage="partial")
         confirmed = {"file_metadata", "local_measurement", "manual"}
         unconfirmed_font = any(
             ((line.style.font_size_bp is None or line.style.font_family is None)
@@ -178,11 +194,11 @@ def diagnose_document(
             for line in layout.lines
         )
         if unconfirmed_font:
-            add("LAYOUT_UNVERIFIED", "部分字体或字号来自临时配置、模型估计或缺少依据。", "校准正文基准和页内字体例外，确认字号后重新编译。", coverage="partial")
+            add("LAYOUT_UNVERIFIED", "部分字体或字号来自临时配置、模型估计或缺少依据。", "系统按样式组进行本地字形拟合；不能确定时标记输出。", coverage="partial")
         if any(line.basis not in confirmed for line in layout.lines):
-            add("LAYOUT_UNVERIFIED", "部分原行位置或基线尚未经过人工/本地测量确认。", "核对原图基线及原行区域，更新其依据。", coverage="partial")
+            add("LAYOUT_UNVERIFIED", "部分原行位置或基线尚未取得本地测量依据。", "系统从源图行带恢复位置；不能确定时保留源区域。", coverage="partial")
         if any(group.align_x is None or group.basis not in confirmed for group in layout.equation_groups if len(group.line_ids) > 1):
-            add("LAYOUT_UNVERIFIED", "部分多行公式组的锚点尚未确认。", "校准公式组的共同锚点并核对行序与编号。", coverage="partial")
+            add("LAYOUT_UNVERIFIED", "部分多行公式组的锚点尚未确定。", "系统恢复公式组共同锚点；不能确定时保留公式源区域。", coverage="partial")
     if document.source_to_output_affine is None or document.canvas_scale is None:
         add("LAYOUT_UNVERIFIED", "缺少本次源画布到输出页的坐标映射。", "重新生成当前页的编译文档与页映射。", coverage="none")
         return diagnostics
@@ -206,6 +222,11 @@ def diagnose_document(
     placed = []
     page_box = (0.0, 0.0, document.output_width_bp, document.output_height_bp)
     for item in items:
+        if any(asset.purpose == "uncertain_content" and item.source_bbox is not None
+               and asset.bbox[0] <= item.source_bbox[0] and asset.bbox[1] <= item.source_bbox[1]
+               and asset.bbox[2] >= item.source_bbox[2] and asset.bbox[3] >= item.source_bbox[3]
+               for asset in layout.source_assets):
+            continue  # Opaque source replacement is checked as an asset, not as successful text.
         measured = measurements[item.token]
         source_box = measured_item_bbox(item, measured)
         if source_box[0] == source_box[2] or source_box[1] == source_box[3]:
@@ -242,6 +263,52 @@ def diagnose_document(
                     "核对两行基线、公式高度与编号位置；数学结构内部叠放不参与此检查。",
                     severity="warning", basis=MEASUREMENT_VERSION, item=other, box=other_output)
     return diagnostics
+
+
+def local_geometry_adjustment(
+    layout: SourceFidelityLayout, diagnostics: list[RenderDiagnostic],
+    measurements: dict[str, NaturalMeasurement],
+) -> SourceFidelityLayout | None:
+    """Move measured boxes within observed regions; never alter text or font sizes."""
+    if layout.source_disposition == "source_page_preserved" or not measurements:
+        return None
+    affected = {item.line_id for item in diagnostics if item.line_id and item.code in {
+        "CONTENT_OUTSIDE_FRAME", "CONTENT_OUTSIDE_PAGE", "BLOCK_OVERLAP",
+    }}
+    if not affected:
+        return None
+    width, height = canvas_dimensions(layout)
+    regions = {region.region_id: region for region in layout.regions}
+    updates = {}
+    for item in fidelity_items(layout, width, height):
+        line = item.line
+        if line.line_id not in affected or item.is_number or item.token not in measurements:
+            continue
+        measured = measurements[item.token]
+        box = measured_item_bbox(item, measured)
+        limit = max(1.0, line_font_size(layout, line) * .35)
+        region = regions[line.block_id]
+        frame = region.bbox or layout.body_frame or (0., 0., 1., 1.)
+        left, _, right, _ = normalized_bbox_to_bp(frame, width, height)
+        dx = 0.0
+        if item.alignment == "left" and measured.natural_width_bp <= right - left:
+            dx = min(max(box[0], left), right - measured.natural_width_bp) - box[0]
+        lower = line.bbox[1] * height + measured.height_bp
+        upper = line.bbox[3] * height - measured.depth_bp
+        dy = min(max(item.baseline_bp, lower), upper) - item.baseline_bp if lower <= upper else 0.0
+        if abs(dx) > limit or abs(dy) > limit:
+            continue
+        x0, y0, x1, y1 = line.bbox
+        if not 0 <= x0 + dx / width < x1 + dx / width <= 1:
+            continue
+        if abs(dx) > .05 or abs(dy) > .05:
+            updates[line.line_id] = line.model_copy(update={
+                "bbox": (x0 + dx / width, y0, x1 + dx / width, y1),
+                "baseline": line.baseline + dy / height, "basis": "local_measurement",
+            })
+    if not updates:
+        return None
+    return layout.model_copy(update={"lines": [updates.get(line.line_id, line) for line in layout.lines]})
 
 
 def diagnostics_quality_status(diagnostics: list[RenderDiagnostic], *, output_checks_complete: bool) -> QualityStatus:

@@ -1,6 +1,6 @@
 # 原书版式与 PDF 修复验收报告
 
-日期：2026-10-04（Asia/Singapore）。验收结论：G1—G7 全部满足，W00—W11 verified。Goal 完成登记见执行进度。
+日期：2026-10-04（Asia/Singapore）。原书渲染验收结论：G1—G7 全部满足，W00—W11 verified。Goal 完成登记见执行进度；随后用户报告的真实识别 HTTP 400 已补错误详情并静态修正 Schema 引用，按用户要求未运行验证，不包含在固定响应与隔离渲染通过结论中。
 
 11 个校准源页经应用实际上传、保存布局、编译、合并及 PNG 接口输出 11 张。主代理逐页核对文字、原行、公式组、编号、上下标和页脚，未发现裁字、异常续页或无依据的块重叠。所有冻结的几何指标通过。样本 API 质量仍为 `needs_review`，保留 27 条自然盒版心警告和 1 条文字映射提示；独立墨迹测量和人工验收通过不改变应用质量状态。
 
@@ -162,7 +162,7 @@ XeTeX 0.999998 / TeX Live 2026、ICU 78.2、HarfBuzz 12.3.2、PyMuPDF 1.28.2；�
 
 ## 数据保护与剩余限制
 
-原库只以 SQLite URI `mode=ro` 读取必要 11 页字段及来源信息，未调用原库 Storage 初始化、未复制/读取凭据或 settings 表。原 11 页字段和 PNG SHA256 与基线一致。初始未提交修改及 `backend/emphasis.py`、`backend/latex_layout.py` 已有删除保留，没有 reset/clean、覆盖稿件、提交、推送或发布。
+原书渲染验收阶段，原库只以 SQLite URI `mode=ro` 读取必要 11 页字段及来源信息，未调用原库 Storage 初始化、未复制/读取凭据或 settings 表。原 11 页字段和 PNG SHA256 与基线一致。初始未提交修改及 `backend/emphasis.py`、`backend/latex_layout.py` 已有删除保留，没有 reset/clean、覆盖稿件、提交、推送或发布。后续识别 HTTP 400 跟进仅另行只读查询指定非秘密配置字段，见下文。
 
 隔离服务仅监听 127.0.0.1，前端 5187、后端 8000，数据在 `runs/ui-r3/isolated-data`；启动/替换前核对自己的进程，未停止用户 OCR 作业。最终对照留在浏览器，进程和日志位置记录于 `processes.json`。用于原书的附件与快照均为本地忽略文件，公开代码夹具采用原创内容。
 
@@ -171,3 +171,15 @@ XeTeX 0.999998 / TeX Live 2026、ICU 78.2、HarfBuzz 12.3.2、PyMuPDF 1.28.2；�
 浏览器 LaTeX 下载请求实际返回 200，但 IAB 下载事件超时，未拿到保存文件路径；后端 ZIP 实际校验通过与浏览器文件保存分别记录。两个第三方测试弃用警告仍存在。最终样本 needs_review 的自然盒与文字映射提示仍存在，已解释并可在界面定位；没有过滤警告或把未覆盖内容伪装为 passed。
 
 验收后的版本整合：用户在2026-10-04追加“合并”指令，授权将已验收源码、测试和文档整合为本地main提交。前述“没有提交”仅描述验收时点；本次提交记录以本地Git日志为准，私有书稿、数据库和验证产物仍保留在忽略目录。
+
+## 验收后跟进：识别 HTTP 400
+
+用户确认 OpenAI Responses、手动连接测试成功但开始识别失败。主代理只读查询保存的协议、服务主机、模型、推理、续接及接口路径，未读取 credentials：当前为 `api.deepseek.com` / `deepseek-flash` / `/responses`、`high`、续接关闭。[DeepSeek 官方 Responses 参考](https://api-docs.deepseek.com/api/create-response/)支持该协议及 flash 图片输入；连接测试仅发送文本，不包含识别所用图片与布局 Schema，不能证明页面请求会被接受。最初未取得具体拒绝原因，随后用户提供了下述 Schema 错误。
+
+两名 `gpt-6.1-sol / xhigh` 子代理仅静态审查与编码，主代理静态审查接受错误详情补丁。`responses_client.py` 的页面请求和模型列表错误现在保留 HTTP 状态与有效 `error.message/param/code`，限制组合长度并脱敏当前密钥；无效或过大响应仍只显示状态码。请求协议、Schema、推理、400 不重试、上下文和用量回调保持。新增 9 项 MockTransport 回归代码，包括错误详情经流水线保存及旧正文、布局、人工修订保护。
+
+主代理曾启动隔离后端回归；用户随即要求“不要测试了，改完就结束”，已中断会话（退出 1，无测试结果）并停止验证。本补丁仅静态接受，未验证运行效果，也未确认真实 HTTP 400 根因；原书渲染的 97 项历史通过结果不能替代这次补丁验证。未调用真实模型、重启用户服务、写入原库、推送或发布；补丁及更新文档保留在工作区。
+
+用户随后返回 `Invalid json schema: field anyOf: missing field type`，`code=invalid_request_error`。当前 wire Schema 的 `layout` 和公式编号等 `anyOf` 分支使用只有 `$ref` 的对象，与服务端要求显式 `type` 的错误吻合。Schema 子代理在 `prompts.py` 展开模型的全部本地引用，外层 `layout` 改为内嵌完整对象：`anyOf` 对象分支有 `type:object`，空值分支保留 `type:null`，wire Schema 不再含 `$ref/$defs`。必填字段、禁止额外字段、nullable/enum、长度与范围、本地 Pydantic 校验、100 条模型复核原因上限及 v1 语义保持；既有断言仅更新访问路径。
+
+主代理已静态审查接受该最小修复。遵照用户不测试的要求，本阶段没有运行测试、构建、类型检查、lint、试编译、脚本、computer use 或真实模型请求。修改已完成，实际服务对更新后 Schema 的接受情况仍未验证，不宣称真实 OCR 验收通过。

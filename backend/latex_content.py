@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import PurePosixPath, PureWindowsPath
 
 
 _ESCAPES = {
@@ -35,3 +36,19 @@ def is_latex_document(source: str) -> bool:
     precede it. This format check neither validates TeX nor expands macros.
     """
     return _DOCUMENT_START.match(source) is not None
+
+
+def source_resource_name(name: str) -> str:
+    """Keep source resources relative to the book and its exported source tree."""
+    normalized = name.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (path.is_absolute() or PureWindowsPath(name).drive or ".." in path.parts
+            or not path.parts or any(character in normalized for character in "{}\r\n")):
+        raise ValueError("源区域资源必须是书目录内的相对路径")
+    return path.as_posix()
+
+
+def latex_image_resources(source: str) -> tuple[str, ...]:
+    """Collect explicit relative image references without rewriting custom source."""
+    names = re.findall(r"\\includegraphics\s*(?:\[[^\]]*\])?\s*\{([^{}]+)\}", source)
+    return tuple(dict.fromkeys(source_resource_name(name.strip()) for name in names))

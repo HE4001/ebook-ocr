@@ -11,15 +11,22 @@ import httpx
 from pydantic import ValidationError
 
 from .models import StructuredPageResult
-from .prompts import PAGE_RESPONSE_VERSION, page_response_schema
+from .prompts import PAGE_REPAIR_SCHEMA, PAGE_RESPONSE_VERSION, PAGE_REVIEW_SCHEMA, page_response_schema
 from .responses_client import (
+    AttemptEnd,
+    AttemptStart,
     MAX_OUTPUT_CHARS,
     MAX_RESPONSE_BYTES,
-    TRANSIENT_STATUS,
     ModelServiceError,
+    ProviderResponse,
     UsageTuple,
     _endpoint_url,
+    _http_error_message,
+    _response_json,
+    _send_json,
+    _workflow_request,
 )
+from .workflow_model_contract import PageReview, RepairProposal
 
 
 async def fetch_gemini_models(
@@ -46,7 +53,7 @@ async def fetch_gemini_models(
             if 300 <= response.status_code < 400:
                 raise ModelServiceError("模型服务返回重定向，已拒绝转发密钥")
             if not response.is_success:
-                raise ModelServiceError(f"模型服务 HTTP {response.status_code}")
+                raise ModelServiceError(_http_error_message(response.status_code, _response_json(response), api_key))
             if len(response.content) > MAX_RESPONSE_BYTES:
                 raise ModelServiceError("模型列表响应过大")
             try:
@@ -106,13 +113,16 @@ class GeminiClient:
         elif re.fullmatch(r"[+-]?[0-9]+", effort) and int(effort) >= -1:
             thinking = {"thinkingBudget": int(effort)}
         else:
-            raise ModelServiceError("Gemini 推理程度须为 minimal、low、medium、high 或不小于 -1 的整数")
+            raise ModelServiceError(
+                "Gemini 推理程度须为 minimal、low、medium、high 或不小于 -1 的整数",
+                configuration_error=True,
+            )
         return {"thinkingConfig": thinking}
 
     def _page_payload(
         self, input_value: list[dict[str, Any]], schema: dict[str, Any],
     ) -> dict[str, Any]:
-        # pipeline 固定提供一条系统指令和一条含文本、PNG 的用户消息。
+        # Every workflow call contains a fresh system instruction and one user message.
         system_parts = [{"text": part["text"]} for part in input_value[0]["content"]]
         user_parts: list[dict[str, Any]] = []
         for part in input_value[1]["content"]:
@@ -134,6 +144,43 @@ class GeminiClient:
             "contents": [user_content],
             "generationConfig": generation_config,
         }
+
+    async def recognize_page(
+        self, model: str, input_value: list[dict[str, Any]], *,
+        on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, retry: bool = False,
+    ) -> StructuredPageResult:
+        payload = self._page_payload(input_value, page_response_schema(2))
+        return await _workflow_request(
+            lambda: self._send(model, payload),
+            lambda data: StructuredPageResult.from_model_response(json.loads(self.extract_output_text(data)), 2),
+            on_attempt_start=on_attempt_start, on_attempt_end=on_attempt_end, retry=retry,
+            invalid_message="模型返回的页面结构无效",
+        )
+
+    async def review_page(
+        self, model: str, input_value: list[dict[str, Any]], *,
+        on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, retry: bool = False,
+    ) -> PageReview:
+        # Recognition contents/thought signatures are never added to a review.
+        payload = self._page_payload(input_value, PAGE_REVIEW_SCHEMA)
+        return await _workflow_request(
+            lambda: self._send(model, payload),
+            lambda data: PageReview.model_validate(json.loads(self.extract_output_text(data))),
+            on_attempt_start=on_attempt_start, on_attempt_end=on_attempt_end, retry=retry,
+            invalid_message="模型返回的页面审查结构无效",
+        )
+
+    async def propose_repair(
+        self, model: str, input_value: list[dict[str, Any]], *,
+        on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, retry: bool = False,
+    ) -> RepairProposal:
+        payload = self._page_payload(input_value, PAGE_REPAIR_SCHEMA)
+        return await _workflow_request(
+            lambda: self._send(model, payload),
+            lambda data: RepairProposal.model_validate(json.loads(self.extract_output_text(data))),
+            on_attempt_start=on_attempt_start, on_attempt_end=on_attempt_end, retry=retry,
+            invalid_message="模型返回的局部修复提案无效",
+        )
 
     async def request_page(
         self,
@@ -183,66 +230,40 @@ class GeminiClient:
         output = candidates + thoughts if candidates is not None and thoughts is not None else None
         return valid("promptTokenCount"), output, valid("totalTokenCount")
 
+    async def _send(self, model: str, payload: dict[str, Any]) -> ProviderResponse:
+        model_id = model.strip().removeprefix("models/")
+        if not model_id.strip():
+            raise ModelServiceError("Gemini 模型名称不能为空", configuration_error=True)
+        collection = _endpoint_url(self.config.base_url, self.config.models_path).rstrip("/")
+        endpoint = f"{collection}/{quote(model_id, safe='')}:generateContent"
+        return await _send_json(
+            endpoint=endpoint,
+            headers={"x-goog-api-key": self.config.api_key, "Content-Type": "application/json"},
+            payload=payload, timeout_seconds=self.config.timeout_seconds,
+            api_key=self.config.api_key, usage_reader=self.response_usage,
+        )
+
     async def _post(
         self, model: str, payload: dict[str, Any],
         on_attempt_start: Callable[[], int] | None = None,
         on_attempt_end: Callable[[int, UsageTuple, bool], None] | None = None,
     ) -> dict[str, Any]:
-        model_id = model.strip().removeprefix("models/")
-        if not model_id.strip():
-            raise ModelServiceError("Gemini 模型名称不能为空")
-        collection = _endpoint_url(self.config.base_url, self.config.models_path).rstrip("/")
-        endpoint = f"{collection}/{quote(model_id, safe='')}:generateContent"
-        headers = {
-            "x-goog-api-key": self.config.api_key,
-            "Content-Type": "application/json",
-        }
-        last_message = "模型服务请求失败"
-        async with httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=httpx.Timeout(self.config.timeout_seconds),
-        ) as client:
-            for attempt in range(3):
-                attempt_id = on_attempt_start() if on_attempt_start else None
-                try:
-                    response = await client.post(endpoint, headers=headers, json=payload)
-                except httpx.TimeoutException:
-                    if attempt_id is not None and on_attempt_end:
-                        on_attempt_end(attempt_id, (None, None, None), False)
-                    last_message = "模型服务请求超时"
-                    retry = True
-                except httpx.RequestError:
-                    if attempt_id is not None and on_attempt_end:
-                        on_attempt_end(attempt_id, (None, None, None), False)
-                    last_message = "无法连接模型服务"
-                    retry = True
-                else:
-                    data: dict[str, Any] | None = None
-                    if len(response.content) <= MAX_RESPONSE_BYTES:
-                        try:
-                            parsed = response.json()
-                            data = parsed if isinstance(parsed, dict) else None
-                        except ValueError:
-                            pass
-                    if attempt_id is not None and on_attempt_end:
-                        on_attempt_end(attempt_id, self.response_usage(data), True)
-                    retry = response.status_code in TRANSIENT_STATUS
-                    if 300 <= response.status_code < 400:
-                        raise ModelServiceError("模型服务返回重定向，已拒绝转发密钥")
-                    if not response.is_success:
-                        last_message = f"模型服务 HTTP {response.status_code}"
-                        if not retry:
-                            raise ModelServiceError(last_message)
-                    elif len(response.content) > MAX_RESPONSE_BYTES:
-                        raise ModelServiceError("模型响应过大")
-                    elif data is None:
-                        raise ModelServiceError("模型服务响应格式无效")
-                    else:
-                        return data
-                if not retry or attempt == 2:
-                    raise ModelServiceError(last_message)
-                await asyncio.sleep(2**attempt)
-        raise ModelServiceError(last_message)
+        attempt_id = on_attempt_start() if on_attempt_start else None
+        try:
+            packet = await self._send(model, payload)
+        except ModelServiceError as exc:
+            if attempt_id is not None and on_attempt_end:
+                usage = exc.usage
+                values = (usage.input_tokens, usage.output_tokens, usage.total_tokens) if usage else (None, None, None)
+                on_attempt_end(attempt_id, values, exc.received)
+            raise
+        except asyncio.CancelledError:
+            if attempt_id is not None and on_attempt_end:
+                on_attempt_end(attempt_id, (None, None, None), False)
+            raise
+        if attempt_id is not None and on_attempt_end:
+            on_attempt_end(attempt_id, self.response_usage(packet.data), True)
+        return packet.data
 
     @staticmethod
     def extract_output_text(data: dict[str, Any]) -> str:

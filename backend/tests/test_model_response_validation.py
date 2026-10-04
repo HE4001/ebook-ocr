@@ -184,8 +184,8 @@ class ModelResponseValidationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(client.contents if protocol == "gemini" else client.previous_response_id, context)
 
     def test_wire_schema_reserves_program_review_slots(self):
-        self.assertEqual(PAGE_RESPONSE_SCHEMA["$defs"]["LayoutObservation"]["properties"]
-                         ["review_reasons"]["maxItems"], 100)
+        self.assertEqual(PAGE_RESPONSE_SCHEMA["properties"]["layout"]["anyOf"][0]
+                         ["properties"]["review_reasons"]["maxItems"], 100)
 
 
 if __name__ == "__main__":

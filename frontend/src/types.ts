@@ -62,10 +62,17 @@ export type Book = {
   content_format: 'latex'
   render_strategy: RenderStrategy
   layout: LayoutSettings
+  arrangement_revision: number
+  output_settings_version: number
 }
 
 export type Page = {
   number: number
+  page_id: string
+  source_version: number
+  current_revision_id: string | null
+  result_status: ResultStatus | null
+  manual_protected: boolean
   source_id: string
   source_filename: string
   source_page: number
@@ -167,8 +174,11 @@ export type PdfSourceGeometry = {
 export type PageSourceMetadata = {
   book_id: string
   page_number: number
+  page_id: string
   source_id: string
+  source_file_id: string
   source_page: number
+  source_version: number
   source_kind: 'pdf' | 'image'
   source_file_fingerprint: string
   image_fingerprint: string
@@ -193,6 +203,9 @@ export type SourceFidelityLayout = LayoutObservation & {
   body_font_size_bp: number | null
   body_font_family: FontFamily | null
   body_font_basis: EvidenceBasis | null
+  source_assets: SourceRegionAsset[]
+  source_disposition: SourceDisposition
+  disposition_reason: string | null
 }
 
 export type LayoutCalibrationUpdate = {
@@ -278,3 +291,182 @@ export type PdfCompileResult = {
 }
 export type Arrangement = { book: Book; files: SourceFile[]; pages: Page[]; order: number[] }
 export type Notice = { kind: 'success' | 'error' | 'info'; text: string } | null
+
+export type SourceDisposition = 'transcribed' | 'regions_preserved' | 'source_page_preserved'
+export type SourceRegionAsset = {
+  asset_id: string
+  region_id: string | null
+  bbox: BBox
+  image_name: string
+  purpose: 'figure' | 'uncertain_content' | 'source_page'
+  reason: string
+}
+export type WorkflowStage = 'prepare' | 'recognize' | 'layout' | 'render' | 'verify' | 'repair' | 'finalize'
+export type ExecutionStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
+export type RunStatus = 'queued' | 'running' | 'pausing' | 'paused' | 'succeeded' | 'failed' | 'interrupted'
+export type ResultStatus = 'auto_passed' | 'completed_with_issues' | 'failed'
+export type CheckStatus = 'passed' | 'uncertain' | 'unverified' | 'failed'
+export type RunPolicy = { replace_page_ids: string[] }
+export type RunCreate = {
+  page_ids?: string[]
+  pages?: number[]
+  expected_arrangement_revision: number
+  policy?: RunPolicy
+  request_limit?: number
+  client_request_id: string
+}
+export type PageTask = {
+  run_id: string
+  page_id: string
+  page_number: number
+  source_version: number
+  position: number
+  base_revision_id: string | null
+  base_content_revision: number
+  base_layout_revision: number
+  stage: WorkflowStage
+  state: ExecutionStatus
+  completed_stages: WorkflowStage[]
+  candidate_revision_id: string | null
+  stage_data: Record<string, unknown>
+  result_status: ResultStatus | null
+  error: string | null
+  request_count: number
+  retry_count: number
+  recognize_count: number
+  review_count: number
+  repair_count: number
+  compile_count: number
+}
+export type RunCounts = {
+  total: number
+  completed: number
+  auto_passed: number
+  completed_with_issues: number
+  failed: number
+}
+export type Run = {
+  run_id: string
+  book_id: string
+  arrangement_revision: number
+  page_ids: string[]
+  settings_snapshot: Record<string, unknown>
+  policy: RunPolicy
+  status: RunStatus
+  request_limit: number
+  request_count: number
+  generator_version: string
+  created_at: string
+  updated_at: string
+  error: string | null
+  usage: Usage
+  counts: RunCounts
+  tasks: PageTask[]
+  export_manifest_id: string | null
+}
+export type Revision = {
+  revision_id: string
+  parent_revision_id: string | null
+  book_id: string
+  page_id: string
+  page_number: number
+  source_version: number
+  content_revision: number
+  layout_revision: number
+  origin: 'legacy' | 'manual' | 'automatic'
+  run_id: string | null
+  text: string
+  render_strategy: RenderStrategy
+  layout_source: SourceFidelityLayout | null
+  source_metadata: PageSourceMetadata | null
+  page_kind: PageKind
+  page_side: PageSide
+  cover_fields: CoverField[]
+  header_segments: MarginSegment[]
+  footer_segments: MarginSegment[]
+  generated_content_revision: number | null
+  generator_version: string | null
+  created_at: string
+}
+export type Issue = {
+  issue_id: string
+  run_id: string
+  page_id: string
+  revision_id: string
+  category: string
+  severity: 'error' | 'warning' | 'info'
+  region_id: string | null
+  line_id: string | null
+  source_bbox: BBox | null
+  reason: string
+  disposition: string
+}
+export type Assessment = {
+  assessment_id: string
+  revision_id: string
+  run_id: string
+  page_id: string
+  content: CheckStatus
+  layout: CheckStatus
+  coverage: CheckStatus
+  rule_version: string
+  issues: Issue[]
+  created_at: string
+}
+export type Attempt = {
+  attempt_id: string
+  run_id: string
+  page_id: string
+  stage: WorkflowStage
+  ordinal: number
+  retry: boolean
+  state: 'reserved' | 'succeeded' | 'failed' | 'unknown'
+  usage: Usage
+  provider_request_id: string | null
+  error: string | null
+  created_at: string
+  finished_at: string | null
+}
+export type ExportManifestPage = {
+  page_id: string
+  page_number: number
+  position: number
+  revision_id: string
+  source_file_id: string
+  source_page: number
+  source_version: number
+  source_filename: string
+  image_name: string
+  result_status: ResultStatus | null
+  assessment: Assessment | null
+}
+export type ExportManifest = {
+  manifest_id: string
+  book_id: string
+  run_id: string | null
+  arrangement_revision: number
+  output_settings_version: number
+  settings_snapshot: Record<string, unknown>
+  generator_version: string
+  pages: ExportManifestPage[]
+  complete: boolean
+  issues: Issue[]
+  created_at: string
+  outputs: Record<string, string>
+}
+export type ExportManifestCreate = {
+  expected_arrangement_revision: number
+  page_ids?: string[]
+  run_id?: string
+}
+export type PageResult = {
+  page_id: string
+  page_number: number
+  current_revision_id: string | null
+  result_status: ResultStatus | null
+  content: CheckStatus
+  layout: CheckStatus
+  coverage: CheckStatus
+  source_disposition: SourceDisposition | null
+  issues: Issue[]
+}

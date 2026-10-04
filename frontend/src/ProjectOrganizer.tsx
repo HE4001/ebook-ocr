@@ -8,7 +8,7 @@ import './organizer.css'
 
 type Props = {
   bookId: string
-  onConfirmed: (detail: BookDetail) => void
+  onSaved: (detail: BookDetail) => void
   onNotice: (notice: Notice) => void
   onDirtyChange?: (dirty: boolean) => void
   onBusyChange?: (busy: boolean) => void
@@ -38,7 +38,7 @@ function PreviewImage({ bookId, page, eager = false }: { bookId: string; page: P
     loading={eager ? 'eager' : 'lazy'} decoding="async" onError={() => setFailed(true)} />
 }
 
-export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirtyChange, onBusyChange, disabled = false }: Props) {
+export default function ProjectOrganizer({ bookId, onSaved, onNotice, onDirtyChange, onBusyChange, disabled = false }: Props) {
   const [arrangement, setArrangement] = useState<Arrangement | null>(null)
   const [loadError, setLoadError] = useState('')
   const [loadAttempt, setLoadAttempt] = useState(0)
@@ -373,8 +373,8 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
       const detail = await api.saveArrangement(bookId, { file_order: fileOrder, file_parents: parents, page_order: order })
       setSavedSignature(signature(fileOrder, parents, order))
       onDirtyChange?.(false)
-      onConfirmed(detail)
-      onNotice({ kind: 'success', text: `已确认 ${order.length} 页的成书顺序，可以开始逐页校对。` })
+      onSaved(detail)
+      onNotice({ kind: 'success', text: `已保存 ${order.length} 页的编排。可在任务总览开始自动处理。` })
     } catch (error) {
       onNotice({ kind: 'error', text: error instanceof Error ? error.message : '编排保存失败，请重试' })
     } finally {
@@ -389,7 +389,7 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
 
   return <section ref={motionRef} className="organizer" aria-label="项目页面编排">
     <header className="organizer-heading">
-      <div><h2>把页面排成一本书</h2><p>新上传页面默认全部勾选；只有勾选页会按当前顺序进入校对。图片与 PDF 可以混排和嵌入。</p></div>
+      <div><h2>调整页面编排（可选）</h2><p>新上传页面默认全部勾选；保存后的页序用于下次任务。图片与 PDF 可以混排和嵌入。</p></div>
       <div className="organizer-count"><strong>{order.length}</strong><span>页已勾选 / 共 {arrangement.pages.length} 页</span></div>
     </header>
     <fieldset className="organizer-body" disabled={busy}>
@@ -445,7 +445,7 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
           <h3>{view === 'source' ? source?.filename : '成书顺序'}</h3>
           <p>{view === 'source'
             ? parents[sourceId] ? `拖动页面调整先后。${CHILD_FILE_HELP}` : '当前文件与嵌入文件的页面一起显示。拖动页面调整先后，或把左侧文件拖到页面之间。'
-            : '这里实时显示逐页校对和整书预览的顺序。拖动页面，或使用“插入…”精确穿插。'}</p>
+            : '这里显示下一次自动任务的默认页序。拖动页面，或使用“插入…”精确穿插。'}</p>
         </div>
         <div className="organizer-source-toolbar">
           {view === 'source' && source && <button type="button" disabled={busy || !!parents[sourceId] || !fileOrder.some((id) => id !== sourceId && !fileSubtree(id, fileOrder, parents).has(sourceId))} title={parents[sourceId] ? CHILD_FILE_HELP : undefined} onClick={() => openFileInsert(sourceId)}>插入文件…</button>}
@@ -472,7 +472,7 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
           <button type="button" disabled={busy || !selectedIds.length} onClick={() => movePagesToEnd(selectedIds)}>移至末尾</button>
           <button type="button" disabled={busy || !selectedIds.length} onClick={() => openInsert(selectedIds)}>插入到…</button>
           {selectedIds.length > 0 && <button type="button" className="organizer-quiet" onClick={() => removePages(selectedIds)}>取消当前视图勾选</button>}
-          <p className="organizer-batch-note organizer-help">勾选页将进入校对。批量移动和取消勾选作用于当前视图，包含其他屏；取消后可在文件视图重新勾选。</p>
+          <p className="organizer-batch-note organizer-help">勾选页加入本书编排。批量移动和取消勾选作用于当前视图，包含其他屏；取消后可在文件视图重新勾选。</p>
         </div>
         {!visibleIds.length ? <div className="organizer-empty"><h3>{view === 'sequence' ? '成书中暂无页面' : '当前文件暂无页面'}</h3>
           <p>{view === 'sequence' ? '返回文件视图，勾选页面即可重新加入，或使用页面的“插入…”指定位置。' : '在左侧选择有页面的文件继续编排。'}</p>
@@ -486,7 +486,7 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
                 className={`organizer-page-card${included.has(id) ? ' is-marked' : ''}${view === 'source' && page.source_id !== sourceId ? ' is-inserted' : ''}${dragClasses(`page:${id}`)}`}
                 draggable={!busy} onDragStart={(event) => startDrag(event, { kind: 'page', id })} onDragEnd={endDrag}
                 onDragOver={(event) => dragOverPage(event, id)} onDrop={(event) => dropPage(event, id)}>
-                <div className="organizer-card-top"><label className="organizer-checkbox"><input type="checkbox" checked={included.has(id)} onChange={() => toggleIncluded(id)} aria-label={`将 ${page.source_filename} 源第 ${page.source_page} 页编入校对`} />
+                <div className="organizer-card-top"><label className="organizer-checkbox"><input type="checkbox" checked={included.has(id)} onChange={() => toggleIncluded(id)} aria-label={`将 ${page.source_filename} 源第 ${page.source_page} 页加入编排`} />
                   <span>{view === 'sequence' ? <><b>{String(listIndex + 1).padStart(2, '0')}</b> 成书页</> : `文件内第 ${listIndex + 1} 位`}</span></label></div>
                 <div className="organizer-thumb"><PreviewImage key={id} bookId={bookId} page={page} />
                   <button type="button" className="organizer-preview-trigger" onClick={() => openPreview(id)} aria-label={`放大预览 ${page.source_filename} 源第 ${page.source_page} 页`}><span>放大预览</span></button>
@@ -524,8 +524,8 @@ export default function ProjectOrganizer({ bookId, onConfirmed, onNotice, onDirt
       </div>
     </fieldset>
     <footer className="organizer-save-bar">
-      <div><strong>{order.length} 页将按当前顺序进入校对</strong><span>{!order.length ? '请至少勾选一页后确认编排。' : dirty ? '选页或顺序已更改，确认后保存到项目。' : '确认后保存当前勾选与顺序，进入逐页校对。'}</span></div>
-      <button type="button" className="primary" disabled={busy || !order.length} onClick={() => void save()}>{saving ? '正在保存编排…' : '确认编排，进入校对'}</button>
+      <div><strong>{order.length} 页将按当前顺序保存</strong><span>{!order.length ? '请至少勾选一页后保存。' : dirty ? '保存调整后，回任务总览开始处理。' : '可保存并返回；开始任务时再一次确认处理范围与设置。'}</span></div>
+      <button type="button" className="primary" disabled={busy || !order.length} onClick={() => void save()}>{saving ? '正在保存编排…' : '保存编排，回任务总览'}</button>
     </footer>
     <dialog ref={previewDialog} className="organizer-dialog organizer-preview-dialog" aria-labelledby="organizer-preview-title" onClick={(event) => { if (event.target === event.currentTarget) previewDialog.current?.close() }}>
       <div className="organizer-dialog-heading"><div><h3 id="organizer-preview-title">{previewPage?.source_filename}</h3><p>源第 {previewPage?.source_page} 页{previewId !== null && positions.has(previewId) ? ` · 成书第 ${positions.get(previewId)} 页` : ' · 未编入'}</p></div>

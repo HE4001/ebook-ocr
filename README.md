@@ -1,18 +1,19 @@
 # 纸页重排 · 电子书 OCR
 
-将 PDF、PNG、JPEG 交给视觉模型逐页转录为 LaTeX，人工校对后重新排版，导出 LaTeX 源文件、PDF 和 JSON。适合个人整理扫描书籍、讲义及含公式的资料。
+将 PDF、PNG、JPEG 交给视觉模型，启动一次任务后自动识别、恢复布局、编译、独立复核并进行有限修复，自动形成 PDF、LaTeX 资源包和 JSON。无法可靠转录的区域或页面保留源图并说明问题，任务不等待逐页校对。适合个人整理扫描书籍、讲义及含公式的资料。
 
 这是 **Windows 优先的本地单用户应用**，由 Python / FastAPI 后端和 React / TypeScript 前端组成。识别使用你自行配置的 OpenAI Responses 或 Google Gemini 原生 API；首次安装依赖和调用模型需要网络。当前源码版本为 `0.1.0`。
 
 ## 主要功能
 
-- 一个项目导入多个 PDF 或图片，按文件或单页排序、筛选和穿插编排；新页面默认全部勾选，只有勾选页进入识别、校对与导出。
+- 一个项目导入多个 PDF 或图片，上传页默认全部选中，可直接开始任务；按文件或单页排序、筛选和穿插编排是可选操作。
 - 普通内容页保存 LaTeX 正文、公式和表格；页眉页脚与封面封底书目保持结构化纯文本。
-- 默认每个项目并发识别 10 页，支持暂停、失败保留旧结果及单页重新识别；可选实验性上下文复用。
-- 识别过程中可校对其他页面；保存的人工结果受到保护。
+- 默认每个项目并发处理 10 页，任务冻结页序、模型与输出设置；暂停等待已发送请求结算，恢复沿用同一任务和已完成阶段。
+- 默认物理请求额度为所选页数的三倍；正常页一次识别加一次独立审查，最多一轮局部修复和复审，所有失败请求与暂时错误重试均计入额度。
+- 已有人工稿默认受到保护，开始前可明确指定替换范围；运行中仍可主动保存高级编辑，旧后台候选使用修订比较阻止覆盖新稿。
 - 支持 A4、A5、A6、B5、B6 和 6 × 9 英寸纸型，可保存字体、字号、行距、首行缩进、段距和页边距；有足够页侧信息时可选择镜像装订边。
-- 单页可预览未保存草稿，整书按已保存内容生成实际 PDF；下载 LaTeX、PDF 或 JSON。PDF 由本机 XeLaTeX 编译。
-- 原书还原保存原行、区域、基线和公式组；提供原图与输出同页对照、布局校准及结构化质量诊断。旧项目保持现有模板，自由源码实际修改后由自定义源码控制。
+- 运行结束自动生成统一修订清单下的 PDF、LaTeX/资源 ZIP 与 JSON，源区域资源随包导出；缺失页、技术失败与带问题完成分别说明。PDF 由本机 XeLaTeX 编译。
+- 自动估计几何和字体，保存原行、区域、基线和公式组；仍提供原图对照、布局校准、自由 LaTeX 及完整文档作为可选高级工具。旧项目保留现有模板和历史稿件。
 
 ## 快速开始（Windows）
 
@@ -29,14 +30,16 @@
 1. 将源码解压到电脑的本地文件夹。
 2. 双击根目录 **`ocr.bat`**，按回车启动。启动器先准备 Python、前端及 LaTeX 依赖，全部成功后才启动服务；首次准备可能需要联网下载。
 3. 健康检查通过后，浏览器打开 `http://127.0.0.1:5173`。
-4. 在“设置”中选择协议，填写 API 地址、模型和密钥并保存；“测试连接”会调用模型，可能产生用量。
-5. 新建项目 → 上传并确认文件 → 勾选所需页、调整页序并确认编排 → 识别未完成页 → 校对保存 → 保存整书排版 → 生成/更新 PDF 与导出。
+4. 在“设置”中选择协议，填写 API 地址、模型和密钥并保存；“检查已保存配置”只做本地检查，不请求模型。
+5. 新建项目 → 上传文件 → 可选调整页序、范围及纸型 → 在任务面板确认本轮范围与调用额度并开始 → 查看自动结果和问题说明 → 下载同一清单的产物。
+
+上传不调用模型，也无需分别确认上传或编排才能开始。开始后不要求逐页批准、填写坐标或解决问题列表；普通内容不确定时其他页面继续，系统有限修复后自动保留源区域或源页。自动通过、带问题完成和技术失败分开显示，能下载 PDF 不等于内容已准确识别。
 
 真正启动服务前，启动器检查依赖指纹和可用模块：`backend/requirements.txt` 变化或后端模块缺失（含旧数据迁移所需 `mistune`）时，仅在项目 `.venv` 中安装 Python 依赖；`frontend/package.json`、`pnpm-lock.yaml` 变化或 Vite 缺失时，执行非交互的 `pnpm install --frozen-lockfile`。成功后在 `.cache/launcher/` 记录依赖指纹，依赖齐全且指纹未变时直接复用，无需联网。Python、Node.js 和 pnpm 仍需预先准备，启动器不会安装这些运行时。已有服务正常运行时直接打开页面，不改动其依赖；需要更新时使用 `ocr.bat Restart`。
 
 LaTeX 准备先使用有效的 `EBOOK_OCR_XELATEX`，未配置或配置路径失效时依次查 PATH 和 Windows 常规 TinyTeX 目录；缺少编译器才下载并校验官方 TinyTeX 包，缺少模板宏包或 Fandol 字体时使用 TeX Live 的 `tlmgr` 补齐。所选目录和变量只在启动进程中设置并由后端继承，不修改系统 PATH 或用户级配置。显式编译器配置无效时警告并继续自动查找；下载失败或无法补齐依赖时停止启动并显示错误。完整查找顺序、自定义发行版与缓存行为见 [LaTeX 排版说明](docs/LATEX_LAYOUT.md#编译环境)。
 
-直接运行后端只负责查找编译器，不下载 TeX 或宏包；缺少 XeLaTeX 时仍可识别、校对并导出 LaTeX 和 JSON，PDF 操作会显示依赖错误。启动器的历史安装与检查记录见 [LaTeX 排版说明](docs/LATEX_LAYOUT.md#旧数据迁移与实现状态)，当前渲染验收另行记录。
+直接运行后端只负责查找编译器，不下载 TeX 或宏包；缺少 XeLaTeX 时重排候选会报告依赖错误，若源内容仍可读取，系统可生成保留源页的 PDF 并标为带问题完成；源也无法形成输出时才报告技术失败。已有稿件、源文件和可形成的源码/JSON 结果仍保留。启动器的历史安装与检查记录见 [LaTeX 排版说明](docs/LATEX_LAYOUT.md#旧数据迁移与实现状态)。
 
 启动菜单支持启动、停止、重启和刷新状态。关闭菜单窗口不会停止服务；停止或重启会中断正在识别的任务。命令行用法：
 
@@ -68,28 +71,21 @@ pnpm install --frozen-lockfile
 pnpm run dev
 ```
 
-开发检查命令如下（前端测试需要 Node.js 22.18+）。运行服务或验收工具前，以 `EBOOK_OCR_DATA_DIR` 指定独立数据目录，避免使用个人书库。当前修复的实际命令、结果和验收结论见 [修复验收报告](docs/RENDERING_REPAIR_VERIFICATION.md)；以下命令本身不代表通过记录。
-
-```powershell
-# 在项目根目录
-.\.venv\Scripts\python.exe -m pip install -r backend\requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest backend/tests -q
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-launcher.ps1
-
-cd frontend
-pnpm test
-pnpm run build
-```
-
-`pnpm run build` 输出到 `frontend/dist/`。当前启动入口使用本地 Vite 服务；仓库没有提供互联网服务器部署或打包为独立 EXE 的方案。
+本轮无人值守重构只进行了编码与静态审查：**未测试、未运行验证**。没有执行测试、构建、试编译、服务启动、模型调用或迁移试跑。仓库中旧测试及 [历史修复报告](docs/RENDERING_REPAIR_VERIFICATION.md) 保留作参考，不代表新版流程已验证。上述启动命令是用户使用说明，不是本轮执行记录。当前启动入口使用本地 Vite 服务；仓库没有提供互联网服务器部署或打包为独立 EXE 的方案。
 
 ## 数据保存与迁移
 
 默认数据目录为 `backend/data/`，包含 SQLite 数据库、源文件、页面缓存和识别结果。可以用 `EBOOK_OCR_DATA_DIR` 指定其他目录。API 密钥以明文保存在数据库的独立凭据表中；**完整项目备份可能包含密钥和个人书籍，不要把完整备份当作公开发布包。**
 
-从旧版升级后，下一次后端启动会将已有 Markdown 正文一次性转为 LaTeX。迁移写入前保存同目录的 `app-before-latex.db`，原文留在数据库内部 `pages.legacy_markdown` 供恢复；不对 API 或导出公开。迁移在事务中完成，不重新识别，保留校对结果、用量、状态和页序。备份同样可能含凭据，不能放入公开源码包。旧数据转换后的公式、表格和脚注仍需人工校对。
+从旧版升级后，下一次后端启动会将已有 Markdown 正文一次性转为 LaTeX。迁移写入前保存同目录的 `app-before-latex.db`，原文留在数据库内部 `pages.legacy_markdown` 供恢复；不对 API 或导出公开。迁移在事务中完成，不重新识别，保留旧稿、用量、状态和页序。备份同样可能含凭据，不能放入公开源码包。旧转换结果没有因此取得自动质量通过状态。
 
 布局升级写入前另保存 `app-before-layout.db`，已有迁移备份不覆盖。新项目默认 `source_fidelity`，旧项目保持 `legacy_template`；自由源码实际修改后转为 `custom_latex`，原布局和稿件归档保留。自动结果按内容修订检查，校准按内容/布局双修订保存，旧页可直接校准。当前没有一键历史恢复界面，数据库回退应停止服务、保留现库并在独立目录核对备份，见[迁移说明](docs/LATEX_LAYOUT.md#旧数据迁移与实现状态)。
+
+无人值守升级在首次写入前保存 `app-before-workflow.db`，增量增加永久页面身份、不可变修订、运行/阶段/请求记录、质量问题和导出清单。既有源文件及历史修订保留；旧 `ready` 只表示旧执行结果，不会迁为质量已通过。旧人工稿默认保护，新任务明确授权的范围才可自动替换。迁移代码未在本轮运行。
+
+新运行 API 为 `POST /api/books/{id}/runs`，接受范围、`expected_arrangement_revision`、可选替换策略与请求额度、`client_request_id`；重复请求返回同一运行。运行列表及详情、`pause`/`resume`、分页 `results`/`issues` 和 `export-manifests` 均可读取。恢复不变更原快照，不静默重发已发送但结果未知的请求；恢复时当前 API 地址和协议必须与原接入一致，新接入密钥不会发往旧运行地址。导出清单以 UUID 下载 `pdf`、`partial_pdf`、`latex`、`json`，四种产物采用同一页序与已采用修订；元数据说明完整性、质量、错误及缺失页。旧 process/pause、编辑、校准、编译与导出路径作为兼容入口保留。
+
+识别、独立审查和局部修复使用所选协议的 JSON Schema，不自动换模型、改供应商或回退 Chat Completions。HTTP 错误保留状态码和限长的 `message`、`param`、`code`，已知密钥脱敏，不公开原始响应；400、认证及 Schema 配置错误集中停止无效调用。首次正常页面请求发现服务能力问题，不另发付费预检。
 
 后端依赖新增 `mistune`，仅用于旧数据转换。启动器在真实启动前按依赖指纹及缺失模块判断是否安装 `backend/requirements.txt`。此前依赖补全已在项目 `.venv` 安装 `mistune 3.3.4`，其余后端依赖均满足，前端按锁文件同步并移除旧 Markdown 依赖，本机 TinyTeX 及模板宏包、字体已安装，详情见 [LaTeX 排版说明](docs/LATEX_LAYOUT.md#旧数据迁移与实现状态)；该次依赖补全未启动或重启服务，未执行数据库迁移或实际 PDF 编译。以上是历史记录，不代表本轮已执行一键依赖准备。
 
@@ -101,7 +97,7 @@ U 盘副本建议先复制到新电脑本地磁盘后使用。它包含项目文
 
 ```text
 backend/                API、模型客户端、页面处理、存储及测试
-frontend/               React 界面、LaTeX 校对与 PDF 展示及测试
+frontend/               React 自动任务总览、结果、可选编辑及 PDF 展示
 scripts/                Windows 启停管理、启动前依赖准备及启动器测试
 docs/                   使用、配置、架构及验收说明
 examples/               历史导出格式示例
@@ -109,11 +105,13 @@ ocr.bat                 Windows 统一入口
 ```
 
 - [操作说明与故障处理](docs/usage.md)
-- [详细功能与配置参考](docs/REFERENCE.md)
-- [当前模块与接口说明](docs/module-architecture.md)
+- [旧功能与配置参考](docs/REFERENCE.md)
+- [旧模块与接口参考](docs/module-architecture.md)
 - [LaTeX 正文、PDF 编译与整书排版](docs/LATEX_LAYOUT.md)
+- [全流程重构：Goal 执行入口](docs/WORKFLOW_REDESIGN_GOAL.md) · [产品与流程规格](docs/WORKFLOW_REDESIGN_PLAN.md)
+- [重构编码计划与子代理指南](docs/WORKFLOW_REDESIGN_IMPLEMENTATION.md) · [交付条件与静态审查](docs/WORKFLOW_REDESIGN_ACCEPTANCE.md) · [重构进度](docs/WORKFLOW_REDESIGN_PROGRESS.md)
 - [原书版式还原与 PDF 渲染修复规格](docs/RENDERING_REPAIR_PLAN.md) · [修复验收报告](docs/RENDERING_REPAIR_VERIFICATION.md)
-- [Goal 执行入口与完成条件](docs/RENDERING_REPAIR_GOAL.md) · [执行进度](docs/RENDERING_REPAIR_PROGRESS.md)
+- [历史渲染 Goal 执行入口](docs/RENDERING_REPAIR_GOAL.md) · [历史执行进度](docs/RENDERING_REPAIR_PROGRESS.md)
 - [页侧识别与打印装订版](docs/PRINT_LAYOUT.md)
 - [历史页面代理设计](docs/PAGE_AGENT_DESIGN.md)
 - [验收清单及历史记录](docs/acceptance.md)
@@ -122,12 +120,12 @@ ocr.bat                 Windows 统一入口
 ## 当前限制
 
 - 仅支持 PDF、PNG、JPEG；单个上传文件上限 100 MB，不支持 EPUB/MOBI 原生导入。
-- OCR 质量取决于模型与原图，公式、复杂表格和跨页内容需要人工校对。还原布局中的页眉页脚原行可校准，兼容语段没有独立编辑表单。
-- 原书还原依赖正确的原行和布局观察；未知位置需要人工校准，复杂图形尚不能证明完整复刻。还原与现有模板均检查单源页是否意外续页；完整自定义文档可对应多张输出页。
+- OCR 质量取决于模型与原图；自动复核和有限修复不能保证准确率，无法确定的区域或页面自动保留源图并标为带问题结果。复杂图形的保留不等于文字化或完整复刻。
+- 自动几何和字体使用有来源说明的估计；无法充分恢复时保留源内容。高级工具可主动调整布局及源码，兼容语段没有独立编辑表单。还原与现有模板检查单源页是否意外续页，完整自定义文档可对应多张输出页。
 - 不包含账户体系、多用户权限或公网服务安全配置，按本地单用户用途运行。
-- 11 页隔离参考的最终几何与人工核对结论、G1—G7 完成状态见[修复验收报告](docs/RENDERING_REPAIR_VERIFICATION.md)和[执行进度](docs/RENDERING_REPAIR_PROGRESS.md)。没有发起真实付费 OCR，固定响应和校准样本不证明上游识别精度。
+- 历史 11 页隔离参考的几何与人工核对结论、G1—G7 状态见[旧修复验收报告](docs/RENDERING_REPAIR_VERIFICATION.md)和[旧执行进度](docs/RENDERING_REPAIR_PROGRESS.md)。该次没有真实付费 OCR，固定响应和校准样本不证明新版识别精度。
 
-截至 2026-10-04，后端 97 项测试及 223 个子测试、前端 35 项测试和构建通过；真实兼容验收通过混合 4 源页 / 5 输出页、自定义 200 × 280 bp 双页、空白页、源码 ZIP、缓存及纸型装订。浏览器已检查对照、校准和诊断导航；下载事件记录超时，API 导出与 ZIP 校验通过不等同于浏览器文件保存已验证。范围见 [验收清单](docs/acceptance.md) 与 [修复验收报告](docs/RENDERING_REPAIR_VERIFICATION.md)。
+本轮无人值守版本未测试、未运行验证；不提供实测准确率、通过率或速度结论。[验收清单](docs/acceptance.md) 与 [修复验收报告](docs/RENDERING_REPAIR_VERIFICATION.md) 中的测试、编译和浏览器记录属于旧流程历史。
 
 ## 发布与许可
 

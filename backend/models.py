@@ -58,6 +58,8 @@ class Book(BaseModel):
     error: str | None
     created_at: str
     usage: Usage
+    arrangement_revision: int = Field(default=0, ge=0)
+    output_settings_version: int = Field(default=0, ge=0)
 
 
 class MarginSegment(BaseModel):
@@ -79,6 +81,11 @@ class CoverField(BaseModel):
 
 class Page(BaseModel):
     number: int
+    page_id: str = ""
+    source_version: int = Field(default=1, ge=1)
+    current_revision_id: str | None = None
+    result_status: Literal["auto_passed", "completed_with_issues", "failed"] | None = None
+    manual_protected: bool = False
     source_id: str = "legacy"
     source_filename: str = ""
     source_page: int = 1
@@ -467,3 +474,205 @@ class StructuredPageResult(BaseModel):
         if self.page_kind != "content" or not any(segment.text.strip() for segment in self.footer_segments):
             self.page_side = "unknown"
         return self
+
+
+WorkflowStage = Literal["prepare", "recognize", "layout", "render", "verify", "repair", "finalize"]
+ExecutionStatus = Literal["queued", "running", "succeeded", "failed", "interrupted"]
+RunStatus = Literal["queued", "running", "pausing", "paused", "succeeded", "failed", "interrupted"]
+ResultStatus = Literal["auto_passed", "completed_with_issues", "failed"]
+CheckStatus = Literal["passed", "uncertain", "unverified", "failed"]
+
+
+class RunPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    replace_page_ids: list[str] = Field(default_factory=list)
+
+
+class RunCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_ids: list[str] | None = Field(default=None, min_length=1)
+    pages: list[StrictInt] | None = Field(default=None, min_length=1)
+    expected_arrangement_revision: int = Field(ge=0)
+    policy: RunPolicy = Field(default_factory=RunPolicy)
+    request_limit: int | None = Field(default=None, ge=0)
+    client_request_id: str = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "RunCreate":
+        if self.page_ids is not None and self.pages is not None:
+            raise ValueError("page_ids 与 pages 只能提供一种")
+        return self
+
+
+class PageTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    page_id: str
+    page_number: int
+    source_version: int
+    position: int
+    base_revision_id: str | None
+    base_content_revision: int
+    base_layout_revision: int
+    stage: WorkflowStage = "prepare"
+    state: ExecutionStatus = "queued"
+    completed_stages: list[WorkflowStage] = Field(default_factory=list)
+    candidate_revision_id: str | None = None
+    stage_data: dict = Field(default_factory=dict)
+    result_status: ResultStatus | None = None
+    error: str | None = None
+    request_count: int = 0
+    retry_count: int = 0
+    recognize_count: int = 0
+    review_count: int = 0
+    repair_count: int = 0
+    compile_count: int = 0
+
+
+class RunCounts(BaseModel):
+    total: int = 0
+    completed: int = 0
+    auto_passed: int = 0
+    completed_with_issues: int = 0
+    failed: int = 0
+
+
+class Run(BaseModel):
+    run_id: str
+    book_id: str
+    arrangement_revision: int
+    page_ids: list[str]
+    settings_snapshot: dict
+    policy: RunPolicy
+    status: RunStatus
+    request_limit: int
+    request_count: int = 0
+    generator_version: str
+    created_at: str
+    updated_at: str
+    error: str | None = None
+    usage: Usage
+    counts: RunCounts = Field(default_factory=RunCounts)
+    tasks: list[PageTask] = Field(default_factory=list)
+    export_manifest_id: str | None = None
+
+
+class Revision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    revision_id: str
+    parent_revision_id: str | None
+    book_id: str
+    page_id: str
+    page_number: int
+    source_version: int
+    content_revision: int
+    layout_revision: int
+    origin: Literal["legacy", "manual", "automatic"]
+    run_id: str | None
+    text: str
+    render_strategy: RenderStrategy
+    layout_source: SourceFidelityLayout | None = None
+    source_metadata: PageSourceMetadata | None = None
+    page_kind: PageKind = "content"
+    page_side: PageSide = "unknown"
+    cover_fields: list[CoverField] = Field(default_factory=list)
+    header_segments: list[MarginSegment] = Field(default_factory=list)
+    footer_segments: list[MarginSegment] = Field(default_factory=list)
+    generated_content_revision: int | None = None
+    generator_version: str | None = None
+    created_at: str
+
+
+class Issue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    issue_id: str
+    run_id: str
+    page_id: str
+    revision_id: str
+    category: str
+    severity: Literal["error", "warning", "info"]
+    region_id: str | None = None
+    line_id: str | None = None
+    source_bbox: BBox | None = None
+    reason: str
+    disposition: str
+
+
+class Assessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    assessment_id: str
+    revision_id: str
+    run_id: str
+    page_id: str
+    content: CheckStatus = "unverified"
+    layout: CheckStatus = "unverified"
+    coverage: CheckStatus = "unverified"
+    rule_version: str
+    issues: list[Issue] = Field(default_factory=list)
+    created_at: str
+
+
+class Attempt(BaseModel):
+    attempt_id: str
+    run_id: str
+    page_id: str
+    stage: WorkflowStage
+    ordinal: int
+    retry: bool = False
+    state: Literal["reserved", "succeeded", "failed", "unknown"] = "reserved"
+    usage: Usage = Field(default_factory=lambda: Usage(
+        input_tokens=None, output_tokens=None, total_tokens=None, complete=False,
+    ))
+    provider_request_id: str | None = None
+    error: str | None = None
+    created_at: str
+    finished_at: str | None = None
+
+
+class ExportManifestPage(BaseModel):
+    page_id: str
+    page_number: int
+    position: int
+    revision_id: str
+    source_file_id: str
+    source_page: int
+    source_version: int
+    source_filename: str
+    image_name: str
+    result_status: ResultStatus | None
+    assessment: Assessment | None = None
+
+
+class ExportManifest(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    manifest_id: str
+    book_id: str
+    run_id: str | None = None
+    arrangement_revision: int
+    output_settings_version: int
+    settings_snapshot: dict
+    generator_version: str
+    pages: list[ExportManifestPage]
+    complete: bool
+    issues: list[Issue] = Field(default_factory=list)
+    created_at: str
+    outputs: dict[str, str] = Field(default_factory=dict)
+
+
+class ExportManifestCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_arrangement_revision: int = Field(ge=0)
+    page_ids: list[str] | None = Field(default=None, min_length=1)
+    run_id: str | None = None
+
+
+class PageResult(BaseModel):
+    page_id: str
+    page_number: int
+    current_revision_id: str | None
+    result_status: ResultStatus | None
+    content: CheckStatus = "unverified"
+    layout: CheckStatus = "unverified"
+    coverage: CheckStatus = "unverified"
+    source_disposition: Literal["transcribed", "regions_preserved", "source_page_preserved"] | None = None
+    issues: list[Issue] = Field(default_factory=list)
