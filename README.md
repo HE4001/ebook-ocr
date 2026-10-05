@@ -9,6 +9,7 @@
 - 一个项目导入多个 PDF 或图片，上传页默认全部选中，可直接开始任务；按文件或单页排序、筛选和穿插编排是可选操作。
 - 普通内容页保存 LaTeX 正文、公式和表格；页眉页脚与封面封底书目保持结构化纯文本。
 - 默认每个项目并发处理 10 页，任务冻结页序、模型与输出设置；暂停等待已发送请求结算，恢复沿用同一任务和已完成阶段。
+- 每次识别、复核、修复和重试均使用独立上下文，只发送当前页及本次任务所需资料；实验性跨页上下文复用已移除。
 - 默认物理请求额度为所选页数的三倍；正常页一次识别加一次独立审查，最多一轮局部修复和复审，所有失败请求与暂时错误重试均计入额度。
 - 已有人工稿默认受到保护，开始前可明确指定替换范围；运行中仍可主动保存高级编辑，旧后台候选使用修订比较阻止覆盖新稿。
 - 支持 A4、A5、A6、B5、B6 和 6 × 9 英寸纸型，可保存字体、字号、行距、首行缩进、段距和页边距；有足够页侧信息时可选择镜像装订边。
@@ -108,8 +109,10 @@ ocr.bat                 Windows 统一入口
 - [旧功能与配置参考](docs/REFERENCE.md)
 - [旧模块与接口参考](docs/module-architecture.md)
 - [LaTeX 正文、PDF 编译与整书排版](docs/LATEX_LAYOUT.md)
-- [全流程重构：Goal 执行入口](docs/WORKFLOW_REDESIGN_GOAL.md) · [产品与流程规格](docs/WORKFLOW_REDESIGN_PLAN.md)
-- [重构编码计划与子代理指南](docs/WORKFLOW_REDESIGN_IMPLEMENTATION.md) · [交付条件与静态审查](docs/WORKFLOW_REDESIGN_ACCEPTANCE.md) · [重构进度](docs/WORKFLOW_REDESIGN_PROGRESS.md)
+- [最新：第二轮 OCR 重构 Goal（待实施）](docs/OCR_V2_GOAL.md) · [当前问题与新流程设计](docs/OCR_V2_PLAN.md)
+- [第二轮编码计划与代理指南](docs/OCR_V2_IMPLEMENTATION.md) · [第二轮进度](docs/OCR_V2_PROGRESS.md)
+- [历史：第一轮无人值守重构 Goal](docs/WORKFLOW_REDESIGN_GOAL.md) · [历史产品规格](docs/WORKFLOW_REDESIGN_PLAN.md)
+- [历史编码计划](docs/WORKFLOW_REDESIGN_IMPLEMENTATION.md) · [历史静态审查条件](docs/WORKFLOW_REDESIGN_ACCEPTANCE.md) · [历史进度](docs/WORKFLOW_REDESIGN_PROGRESS.md)
 - [原书版式还原与 PDF 渲染修复规格](docs/RENDERING_REPAIR_PLAN.md) · [修复验收报告](docs/RENDERING_REPAIR_VERIFICATION.md)
 - [历史渲染 Goal 执行入口](docs/RENDERING_REPAIR_GOAL.md) · [历史执行进度](docs/RENDERING_REPAIR_PROGRESS.md)
 - [页侧识别与打印装订版](docs/PRINT_LAYOUT.md)

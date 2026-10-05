@@ -31,9 +31,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "structured_output": False,  # 兼容旧设置；页面代理固定请求结构化结果。
     "timeout_seconds": 120,
     "processing_concurrency": 10,
-    "context_reuse_enabled": False,
-    "context_reuse_max_pages": 10,
 }
+
+
+def _without_retired_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    # 读取旧设置和运行快照时忽略已移除的功能配置，无需迁移数据库。
+    return {key: value for key, value in settings.items()
+            if key not in {"max_output_tokens", "context_reuse_enabled", "context_reuse_max_pages"}}
 
 
 class RevisionConflict(ValueError):
@@ -398,8 +402,7 @@ class Storage:
         with self._connect() as connection:
             row = connection.execute("SELECT value FROM settings WHERE id = 1").fetchone()
         stored = json.loads(row["value"]) if row else {}
-        stored.pop("max_output_tokens", None)  # 忽略旧版本保存的输出额度。
-        return {**DEFAULT_SETTINGS, **stored}
+        return {**DEFAULT_SETTINGS, **_without_retired_settings(stored)}
 
     def get_api_key(self) -> str | None:
         """Return the locally persisted API key, if one has been saved."""
@@ -1252,7 +1255,7 @@ class Storage:
         return Run(
             run_id=row["run_id"], book_id=row["book_id"],
             arrangement_revision=snapshot["arrangement_revision"], page_ids=snapshot["page_ids"],
-            settings_snapshot=snapshot["settings"], policy=snapshot["policy"], status=row["status"],
+            settings_snapshot=_without_retired_settings(snapshot["settings"]), policy=snapshot["policy"], status=row["status"],
             request_limit=row["request_limit"], request_count=row["request_count"],
             generator_version=snapshot["generator_version"], created_at=row["created_at"],
             updated_at=row["updated_at"], error=row["error"], tasks=tasks,
@@ -1438,7 +1441,7 @@ class Storage:
             data.update(snapshot["sources"][page_id])
             data.update(book_id=row["book_id"], content_revision=task.base_content_revision,
                         layout_revision=task.base_layout_revision, current_revision_id=task.base_revision_id,
-                        settings_snapshot=snapshot["settings"])
+                        settings_snapshot=_without_retired_settings(snapshot["settings"]))
             base = self._revision(connection, task.base_revision_id)
             if base is not None:
                 data.update(text=base.text, render_strategy=base.render_strategy, page_kind=base.page_kind, page_side=base.page_side,

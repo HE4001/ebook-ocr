@@ -224,7 +224,7 @@ input:disabled,textarea:disabled { background: #f1f0eb; color: #777; }
 .model-discovery label { display: block; }
 .model-discovery select { min-width: 0; text-overflow: ellipsis; }
 .model-discovery select:disabled { background: #f1f0eb; color: var(--muted); }
-.number-field input,.number-field select { max-width: 220px; }
+.number-field input { max-width: 220px; }
 .settings-card .field-error { color: var(--danger); }
 .field-title { display: flex !important; align-items: center; gap: .5rem; }
 .key-state { display: inline-flex; align-items: center; margin: 0; border-radius: 99px; padding: .12rem .45rem; font-size: .7rem; font-weight: 650; }

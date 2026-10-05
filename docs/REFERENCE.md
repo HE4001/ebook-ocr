@@ -82,7 +82,7 @@ LaTeX 升级新增的 `mistune>=3,<4` 只用于旧数据迁移，启动器会按
 
 `reasoning_effort` 留空使用服务默认。OpenAI 非空值按 `reasoning: {"effort": value}` 传递；Gemini 的 `minimal/low/medium/high` 映射到 Gemini 3 的 `thinkingLevel`，整数且不小于 `-1` 映射到 Gemini 2.5 的 `thinkingBudget`（`-1` 动态、`0` 关闭，具体支持取决于模型）。应用不根据模型名猜测参数。识别与连接测试均不设置最大输出 token（省略 OpenAI `max_output_tokens` 和 Gemini `maxOutputTokens`）；旧保存值不生效，额度遵循服务默认及模型限制。应用数据保存在 `backend/data/`，可通过 `EBOOK_OCR_DATA_DIR` 更改。
 
-设置中的 `processing_concurrency` 默认 10，只接受正整数且无固定上限，各项目实际并发不超过该值。`context_reuse_enabled` 默认 `false`；开启后按本次待处理页的最终编排顺序连续分组，组内串行、组间并行，`context_reuse_max_pages` 为 1–10 的整数，默认 10，包含首张。保存设置不联网，修改从下次任务生效。默认每页独立上下文。OpenAI 页面代理默认发送 `store:false`；实验性复用使用 `store:true` 和 `previous_response_id`，需要服务支持保存与续接，缺少响应 ID 时报错，不静默降级。Gemini 复用在每组客户端本地保留完整 `contents`（含图片和原始模型 `thoughtSignature`）并随下一页重新发送，不是服务端 `cachedContent`。历史只供字形与符号参考，不能改变本页行序或断行，仍占用上下文与用量，不保证节省费用；失败后下一页重置对话，新任务不继承历史。内容页、空白页和封面封底使用同一代理、统一提示词及组上下文设置，不会创建 Codex 任务。
+设置中的 `processing_concurrency` 默认 10，只接受正整数且无固定上限，各项目实际并发不超过该值。保存设置不联网，修改从下次任务生效。实验性跨页上下文复用及其设置已移除，旧保存值不再生效。每次识别、复核、修复及重试均使用独立上下文，OpenAI 发送 `store:false`，Gemini `contents` 仅包含当前页及本次请求所需资料，不累计历史图像、模型响应或思考签名。内容页、空白页和封面封底遵循相同的独立上下文要求，只输出当前页，不补写跨页内容；失败保留旧结果。应用内页面代理不会创建 Codex 任务。
 
 页面代理默认按严格 v2 Schema 返回八个必填字段：`response_version:2`、`page_kind`、`page_side`、`header_segments`、`body_latex`、`footer_segments`、`cover_fields`、`layout`；v1 六字段仅显式选择兼容。内容页返回原行布局，空白内容页有空布局观察，封面封底 `layout:null` 并返回可见书目、未知页侧及空正文/页眉页脚。正常识别仍为一次请求，原行、字族、字重和倾斜按原图记录，未知属性为 `null`。失败和重新识别累计用量与次数，旧响应按修订检查不得覆盖人工保存。旧页可直接补齐校准，或主动重新识别，不从旧正文猜原行。片段与完整文档语法见 [LaTeX 说明](LATEX_LAYOUT.md#latex-语法与完整文档)。
 
@@ -103,7 +103,7 @@ API 密钥只写入本机 SQLite 的独立凭据表，使用明文存储；它�
 - 仅支持 PDF、PNG、JPEG 导入；EPUB/MOBI 是后续工作。
 - PDF 固定 500 页上限已取消；上传文件仍限制为 100 MB，图片与 PDF 渲染仍保留像素限制。旧书已有的单页 PDF 和 PNG 会复用。
 - 导出包括 LaTeX、PDF 和 JSON。每源页为独立源码单元，单份 `.tex`，多份 ZIP 含编号 `.tex` 及编排映射；PDF 按编排合并。单页缓存不含编排位置，合并缓存包含顺序；来源、内容/布局修订、策略、设置及生成器/诊断/编译环境参与身份，复用时核对 PDF 指纹。当前没有 Markdown 或 HTML 下载。LaTeX、JSON 导出不调用编译器，还原缺布局时源码导出会要求先校准或显式切策略。
-- 默认每个项目最多并发处理 10 页，可配置任意正整数；多个项目分别限制，完成可能乱序，呈现与导出仍按编排顺序。默认每页独立上下文，可开启实验性的分组上下文复用；不自动合并跨页段落。原书页眉、页脚和其中的页码单独保存为结构化语段，脚注留在正文中。
+- 默认每个项目最多并发处理 10 页，可配置任意正整数；多个项目分别限制，完成可能乱序，呈现与导出仍按编排顺序。每次请求使用独立上下文，不自动合并跨页段落。原书页眉、页脚和其中的页码单独保存为结构化语段，脚注留在正文中。
 - 可从书库单独删除一本书；删除会移除该书记录、页面记录、请求用量记录以及源文件和页面文件。正在处理的书籍返回冲突并由界面禁用删除操作；删除不会影响其他书籍、全局设置或 API 密钥。
 - 按显式选择的协议发送非流式请求。OpenAI 使用 base64 PNG `input_image` 和 `text.format` JSON Schema（`strict: true`）；Gemini 使用原生 `systemInstruction`、`contents`/`inlineData` 和 `generationConfig`（`responseMimeType: application/json`、`responseJsonSchema`），不混入 OpenAI 参数。Gemini 仅支持 API Key 开发者 API，不包含 Vertex OAuth、多账户或 Chat Completions 回退。若输出被截断，应检查模型限制或降低推理程度；已返回用量仍会计入。Gemini 输入用量取 `promptTokenCount`，输出取 `candidatesTokenCount + thoughtsTokenCount`（缺失 thoughts 按 0，缺失 candidates 则输出未知），总量取 `totalTokenCount`。
 - 公式在 LaTeX 数学模式中保存，模板使用 `ctexbook` 与 Fandol。源码不设命令或环境白名单，可包含导言区、宏包、自定义宏和完整文档；完整文档按开头的显式 `\documentclass` 识别，可先有空白、注释及 `\RequirePackage` / `\PassOptionsToPackage` / `\PassOptionsToClass`。实际语法、缺包、字体、资源或非 XeLaTeX 引擎依赖由编译器报告；不自动安装任意依赖或上传资源。编译禁用 shell-escape，设有超时并显示失败信息。

@@ -1,5 +1,7 @@
 # 无人值守重构：交付条件与静态审查
 
+> 2026-10-05：本文件 C1—C10 是第一轮历史条件。新一轮执行 [OCR V2 的 A1—A12](OCR_V2_IMPLEMENTATION.md)，必须重新阅读实际新实现后判断；不能继承这里的接受结论。
+
 日期：2026-10-04。本文件保留原路径，内容已取代旧运行验收要求。
 
 关联：[Goal](WORKFLOW_REDESIGN_GOAL.md)、[流程规格](WORKFLOW_REDESIGN_PLAN.md)、[编码指南](WORKFLOW_REDESIGN_IMPLEMENTATION.md)。

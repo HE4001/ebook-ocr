@@ -230,7 +230,6 @@ class ResponsesConfig:
     structured_output: bool  # 兼容旧设置；页面请求固定使用 JSON Schema。
     timeout_seconds: int
     reasoning_effort: str = ""
-    context_reuse_enabled: bool = False
 
     @property
     def endpoint(self) -> str:
@@ -240,15 +239,10 @@ class ResponsesConfig:
 class ResponsesClient:
     def __init__(self, config: ResponsesConfig):
         self.config = config
-        self.previous_response_id: str | None = None
-
-    def reset_context(self) -> None:
-        self.previous_response_id = None
 
     def _page_payload(
         self, model: str, input_value: list[dict[str, Any]],
         schema_name: str, schema: dict[str, Any],
-        *, reuse_context: bool = False,
     ) -> dict[str, Any]:
         output_format: dict[str, Any] = {
             "type": "json_schema",
@@ -259,11 +253,9 @@ class ResponsesClient:
         payload: dict[str, Any] = {
             "model": model,
             "input": input_value,
-            "store": reuse_context and self.config.context_reuse_enabled,
+            "store": False,
             "text": {"format": output_format},
         }
-        if reuse_context and self.config.context_reuse_enabled and self.previous_response_id is not None:
-            payload["previous_response_id"] = self.previous_response_id
         if self.config.reasoning_effort:
             payload["reasoning"] = {"effort": self.config.reasoning_effort}
         return payload
@@ -286,7 +278,6 @@ class ResponsesClient:
         self, model: str, input_value: list[dict[str, Any]], *,
         on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, retry: bool = False,
     ) -> PageReview:
-        # Never inherit recognition/history, even when a legacy caller enabled reuse.
         payload = self._page_payload(model, input_value, "page_review_v1", PAGE_REVIEW_SCHEMA)
         return await _workflow_request(
             lambda: self._send(payload),
@@ -317,7 +308,7 @@ class ResponsesClient:
     ) -> StructuredPageResult:
         payload = self._page_payload(
             model, input_value, f"page_transcription_v{response_version}",
-            page_response_schema(response_version), reuse_context=True,
+            page_response_schema(response_version),
         )
         data = await self._post(payload, on_attempt_start, on_attempt_end)
         response_text = self.extract_output_text(data)
@@ -325,11 +316,6 @@ class ResponsesClient:
             result = StructuredPageResult.from_model_response(json.loads(response_text), response_version)
         except (ValueError, ValidationError) as exc:
             raise ModelServiceError("模型返回的页面结构无效") from exc
-        if self.config.context_reuse_enabled:
-            response_id = data.get("id")
-            if not isinstance(response_id, str) or not response_id.strip():
-                raise ModelServiceError("模型接口未返回有效 response id，不支持实验性上下文续接")
-            self.previous_response_id = response_id
         return result
 
     async def test_connection(self, model: str) -> None:

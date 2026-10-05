@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from .layout_contract import (
     AffineTransform, BBox, BoxBp, EquationGroup, EquationNumber, FontFamily,
@@ -214,8 +214,6 @@ class SettingsOut(BaseModel):
     structured_output: bool
     timeout_seconds: int
     processing_concurrency: StrictInt = Field(default=10, ge=1)
-    context_reuse_enabled: StrictBool = False
-    context_reuse_max_pages: StrictInt = Field(default=10, ge=1, le=10)
 
 
 class SettingsUpdate(BaseModel):
@@ -233,8 +231,6 @@ class SettingsUpdate(BaseModel):
     structured_output: bool | None = None
     timeout_seconds: int | None = Field(default=None, ge=5, le=600)
     processing_concurrency: StrictInt | None = Field(default=None, ge=1)
-    context_reuse_enabled: StrictBool | None = None
-    context_reuse_max_pages: StrictInt | None = Field(default=None, ge=1, le=10)
 
     @field_validator("base_url")
     @classmethod

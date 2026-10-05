@@ -6,11 +6,7 @@ from .gemini_client import GeminiClient, GeminiConfig
 from .responses_client import ModelServiceError, ResponsesClient, ResponsesConfig
 
 
-def create_model_client(
-    settings: dict[str, Any], api_key: str, *, context_reuse_enabled: bool | None = None,
-) -> ResponsesClient | GeminiClient:
-    if context_reuse_enabled is None:
-        context_reuse_enabled = settings.get("context_reuse_enabled", False)
+def create_model_client(settings: dict[str, Any], api_key: str) -> ResponsesClient | GeminiClient:
     protocol = settings.get("api_protocol", "openai_responses")
     if protocol not in {"openai_responses", "gemini"}:
         raise ModelServiceError("不支持的模型服务协议", configuration_error=True)
@@ -21,7 +17,6 @@ def create_model_client(
             api_key=api_key,
             timeout_seconds=settings["timeout_seconds"],
             reasoning_effort=settings["reasoning_effort"],
-            context_reuse_enabled=context_reuse_enabled,
         ))
     return ResponsesClient(ResponsesConfig(
         base_url=settings["base_url"],
@@ -30,5 +25,4 @@ def create_model_client(
         structured_output=settings["structured_output"],
         timeout_seconds=settings["timeout_seconds"],
         reasoning_effort=settings["reasoning_effort"],
-        context_reuse_enabled=context_reuse_enabled,
     ))

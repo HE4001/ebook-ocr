@@ -134,7 +134,7 @@ class BookProcessor:
                     self._checkpoint(context)
                     page_id = pending.pop(0)
                     if client is None:
-                        client = create_model_client(run.settings_snapshot, api_key, context_reuse_enabled=False)
+                        client = create_model_client(run.settings_snapshot, api_key)
                     await self._process_page(context, page_id, client)
             except (_Paused, _ConfigurationStopped):
                 return

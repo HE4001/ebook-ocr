@@ -1,5 +1,7 @@
 # 无人值守流程重构：编码计划与代理指南
 
+> 2026-10-05：本文件为第一轮历史编码记录。新一轮采用 [OCR V2 编码与代理指南](OCR_V2_IMPLEMENTATION.md) 和 [新 Goal](OCR_V2_GOAL.md)，原 D/W 完成状态不代表新一轮完成。
+
 日期：2026-10-04。按用户最新要求修订。入口：[Goal](WORKFLOW_REDESIGN_GOAL.md)，需求：[流程规格](WORKFLOW_REDESIGN_PLAN.md)，交付：[静态完成条件](WORKFLOW_REDESIGN_ACCEPTANCE.md)。
 
 执行结果：D1—D7 已编码并静态接受，W00—W09 已完成；详见[交付说明](WORKFLOW_REDESIGN_DELIVERY.md)。未测试、未运行验证。

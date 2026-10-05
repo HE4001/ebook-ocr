@@ -20,8 +20,6 @@ export type Settings = {
   structured_output: boolean
   timeout_seconds: number
   processing_concurrency: number
-  context_reuse_enabled: boolean
-  context_reuse_max_pages: number
 }
 
 export type Status = 'uploaded' | 'processing' | 'pausing' | 'paused' | 'ready' | 'failed' | 'interrupted'

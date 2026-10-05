@@ -28,7 +28,7 @@ Windows 双击根目录 `ocr.bat` 打开服务管理菜单，回车启动并打�
 
 主动“获取模型”使用当前设置草稿读取供应商模型列表，不发推理请求，不保存草稿或密钥。没有列表接口时可直接填模型 ID。列表成功不代表视觉或 Schema 可用。“检查已保存配置”只检查本地模型和密钥是否存在，不请求模型，也不表示连接或推理成功。实际图片及 JSON Schema 能力由正常首页面请求确认，任务不额外发付费预检。
 
-OpenAI 非空推理参数作为 `reasoning.effort` 发送；Gemini 的 `minimal/low/medium/high` 作为 `thinkingLevel`，不小于 -1 的整数作为 `thinkingBudget`。应用不按模型名猜支持能力。识别、审查和修复使用协议各自的结构化输出参数：OpenAI 为 `text.format/json_schema`，Gemini 为 `responseMimeType/responseJsonSchema`。旧 `structured_output`、分类模型和实验性上下文复用设置保留兼容，新自动审查使用独立上下文，不依赖整本历史。不发送 OpenAI `max_output_tokens` 或 Gemini `maxOutputTokens`。
+OpenAI 非空推理参数作为 `reasoning.effort` 发送；Gemini 的 `minimal/low/medium/high` 作为 `thinkingLevel`，不小于 -1 的整数作为 `thinkingBudget`。应用不按模型名猜支持能力。识别、审查和修复使用协议各自的结构化输出参数：OpenAI 为 `text.format/json_schema`，Gemini 为 `responseMimeType/responseJsonSchema`。旧 `structured_output` 和分类模型保留兼容；实验性上下文复用及其设置已移除，旧保存值不再生效。每次识别、审查、修复及重试均使用独立上下文，OpenAI 发送 `store:false`，Gemini `contents` 仅包含当前页及本次请求所需资料，不累计其他请求的图像、响应或思考签名。不发送 OpenAI `max_output_tokens` 或 Gemini `maxOutputTokens`。
 
 HTTP 错误显示状态码及限长的供应商 `message`、`param`、`code`，已知密钥脱敏，不公开完整原始响应。400、认证、Schema 等配置错误集中停止无效调用，并保留已产生结果及用量；只有明确暂时错误可重试。
 

@@ -93,16 +93,11 @@ class GeminiConfig:
     api_key: str
     timeout_seconds: int
     reasoning_effort: str = ""
-    context_reuse_enabled: bool = False
 
 
 class GeminiClient:
     def __init__(self, config: GeminiConfig):
         self.config = config
-        self.contents: list[dict[str, Any]] = []
-
-    def reset_context(self) -> None:
-        self.contents.clear()
 
     def _generation_config(self) -> dict[str, Any]:
         effort = self.config.reasoning_effort.strip()
@@ -161,7 +156,6 @@ class GeminiClient:
         self, model: str, input_value: list[dict[str, Any]], *,
         on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, retry: bool = False,
     ) -> PageReview:
-        # Recognition contents/thought signatures are never added to a review.
         payload = self._page_payload(input_value, PAGE_REVIEW_SCHEMA)
         return await _workflow_request(
             lambda: self._send(model, payload),
@@ -191,18 +185,12 @@ class GeminiClient:
         *, response_version: Literal[1, 2] = PAGE_RESPONSE_VERSION,
     ) -> StructuredPageResult:
         payload = self._page_payload(input_value, page_response_schema(response_version))
-        user_content = payload["contents"][0]
-        if self.config.context_reuse_enabled:
-            payload["contents"] = [*self.contents, user_content]
         data = await self._post(model, payload, on_attempt_start, on_attempt_end)
         response_text = self.extract_output_text(data)
         try:
             result = StructuredPageResult.from_model_response(json.loads(response_text), response_version)
         except (ValueError, ValidationError) as exc:
             raise ModelServiceError("模型返回的页面结构无效") from exc
-        if self.config.context_reuse_enabled:
-            # 保留完整模型内容，包括 thoughtSignature，供后续轮次原样回传。
-            self.contents.extend([user_content, data["candidates"][0]["content"]])
         return result
 
     async def test_connection(self, model: str) -> None:

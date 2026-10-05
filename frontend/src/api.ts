@@ -150,8 +150,6 @@ export const api = {
         structured_output: false,
         timeout_seconds: settings.timeout_seconds,
         processing_concurrency: settings.processing_concurrency,
-        context_reuse_enabled: settings.context_reuse_enabled,
-        context_reuse_max_pages: settings.context_reuse_max_pages,
         clear_api_key: clearApiKey,
       }),
     }),

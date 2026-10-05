@@ -1,5 +1,7 @@
 # 电子书 OCR 全流程重构：无人值守识别规格
 
+> 2026-10-05：本文件保留为第一轮历史规格。新的全项目方案见 [第二轮问题分析与设计](OCR_V2_PLAN.md)，执行见 [新 Goal](OCR_V2_GOAL.md)；当前用户要求与新计划优先，不能沿用旧任务总览、选页可选及布局前置的方案。
+
 日期：2026-10-04。状态：实现与静态审查已交付，详见[交付说明](WORKFLOW_REDESIGN_DELIVERY.md)。未测试、未运行验证。本版按用户最新要求修订，取代此前“人工处理剩余疑点”和“代理执行测试”的安排。
 
 执行入口：[Goal](WORKFLOW_REDESIGN_GOAL.md)。配套：[编码指南](WORKFLOW_REDESIGN_IMPLEMENTATION.md)、[交付条件](WORKFLOW_REDESIGN_ACCEPTANCE.md)、[进度](WORKFLOW_REDESIGN_PROGRESS.md)。

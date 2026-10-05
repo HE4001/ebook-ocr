@@ -37,8 +37,6 @@ const EMPTY_SETTINGS: Settings = {
   structured_output: false,
   timeout_seconds: 120,
   processing_concurrency: 10,
-  context_reuse_enabled: false,
-  context_reuse_max_pages: 10,
 }
 
 function errorText(error: unknown): string {
@@ -67,8 +65,6 @@ function sameSavedSettings(current: Settings, saved: Settings): boolean {
     && current.reasoning_effort === saved.reasoning_effort
     && current.timeout_seconds === saved.timeout_seconds
     && current.processing_concurrency === saved.processing_concurrency
-    && current.context_reuse_enabled === saved.context_reuse_enabled
-    && current.context_reuse_max_pages === saved.context_reuse_max_pages
 }
 
 function geminiGenerationEndpoint(settings: Settings): string {
@@ -121,8 +117,6 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
           models_path: value.models_path ?? '/models',
           reasoning_effort: value.reasoning_effort ?? '',
           processing_concurrency: value.processing_concurrency ?? 10,
-          context_reuse_enabled: value.context_reuse_enabled ?? false,
-          context_reuse_max_pages: value.context_reuse_max_pages ?? 10,
           api_key: '',
         }
         setSettings(loaded)
@@ -219,8 +213,6 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
         models_path: saved.models_path ?? '/models',
         reasoning_effort: saved.reasoning_effort ?? '',
         processing_concurrency: saved.processing_concurrency ?? 10,
-        context_reuse_enabled: saved.context_reuse_enabled ?? false,
-        context_reuse_max_pages: saved.context_reuse_max_pages ?? 10,
         api_key: '',
       }
       setSettings(loaded)
@@ -302,17 +294,6 @@ function SettingsView({ onNotice }: { onNotice: (notice: Notice) => void }) {
           <small id="processing-concurrency-help">每个项目同时识别的最多页数，默认 10。请输入正整数，无固定上限。</small>
           {concurrencyError && <small id="processing-concurrency-error" className="field-error" role="alert">{concurrencyError}</small>}
         </label>
-        <label className="check-row">
-          <input type="checkbox" checked={settings.context_reuse_enabled} onChange={(event) => update('context_reuse_enabled', event.target.checked)} disabled={saving} aria-describedby="context-reuse-help" />
-          <span>上下文复用（实验性）<small id="context-reuse-help">{isGemini ? '本机会保留同组页面的识别历史，每次请求重传完整历史和图片；历史内容仍占用上下文和用量。' : '让相邻页面共享识别上下文。需要模型服务支持保存并续接对话，历史内容仍占用上下文和用量。'}</small></span>
-        </label>
-        {settings.context_reuse_enabled && <label className="number-field">
-          <span>每条对话最多识别页数</span>
-          <select value={settings.context_reuse_max_pages} onChange={(event) => update('context_reuse_max_pages', Number(event.target.value))} disabled={saving} aria-describedby="context-reuse-pages-help">
-            {Array.from({ length: 10 }, (_, index) => index + 1).map((count) => <option key={count} value={count}>{count} 页</option>)}
-          </select>
-          <small id="context-reuse-pages-help">含首张页面。按编排顺序连续分组，组间并行、组内依次识别，最终页序不变；每次开始处理都会建立新对话。</small>
-        </label>}
         {testResult && <div className={testResult.ok ? 'inline-result success-box' : 'inline-result error-box'}>配置检查：{testResult.message}</div>}
         <div className="button-row"><button className="primary" onClick={save} disabled={saving || modelsLoading || needsNewKey}>{saving ? '请稍候…' : '保存设置'}</button><button onClick={test} disabled={saving || modelsLoading || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存当前改动' : undefined}>检查已保存配置</button></div>
         {hasUnsavedChanges && <p className="settings-warning">有未保存改动。请先保存，再检查已保存配置。</p>}
