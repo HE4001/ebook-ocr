@@ -8,8 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 from .layout_contract import (
     AffineTransform, BBox, BoxBp, EquationGroup, EquationNumber, FontFamily,
     LayoutLine, LayoutObservation, LayoutRegion, LineStyle,
-    PageSourceMetadata, RenderStrategy, SourceFidelityLayout,
+    PageLayout, PageSourceMetadata, RenderStrategy, SourceFidelityLayout,
 )
+from .content_contract import ContentConclusion, LayoutConclusion, PageContent, RecoveryReason
 
 PageStatus = Literal["uploaded", "processing", "ready", "failed", "interrupted"]
 BookStatus = PageStatus | Literal["pausing", "paused"]
@@ -116,6 +117,17 @@ class SourceFile(BaseModel):
     parent_id: str | None = None
 
 
+class SourcePageSummary(BaseModel):
+    page_id: str
+    source_version: int
+    number: int
+    source_id: str
+    source_page: int
+    source_filename: str
+    width: int
+    height: int
+
+
 class BookDetail(BaseModel):
     book: Book
     files: list[SourceFile] = Field(default_factory=list)
@@ -213,7 +225,7 @@ class SettingsOut(BaseModel):
     has_api_key: bool
     structured_output: bool
     timeout_seconds: int
-    processing_concurrency: StrictInt = Field(default=10, ge=1)
+    processing_concurrency: StrictInt = Field(default=2, ge=1)
 
 
 class SettingsUpdate(BaseModel):
@@ -472,23 +484,140 @@ class StructuredPageResult(BaseModel):
         return self
 
 
-WorkflowStage = Literal["prepare", "recognize", "layout", "render", "verify", "repair", "finalize"]
-ExecutionStatus = Literal["queued", "running", "succeeded", "failed", "interrupted"]
-RunStatus = Literal["queued", "running", "pausing", "paused", "succeeded", "failed", "interrupted"]
+WorkflowStage = Literal["prepare", "recognize", "review", "recover", "layout", "render", "export", "verify", "repair", "finalize"]
+ExecutionStatus = Literal["queued", "running", "succeeded", "failed", "interrupted", "finished"]
+RunStatus = Literal["queued", "running", "pausing", "paused", "succeeded", "failed", "interrupted", "finished"]
 ResultStatus = Literal["auto_passed", "completed_with_issues", "failed"]
 CheckStatus = Literal["passed", "uncertain", "unverified", "failed"]
+
+
+class SelectionDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    book_id: str
+    selection_revision: int = Field(ge=0)
+    page_ids: list[str] = Field(default_factory=list)
+    source_versions: dict[str, int] = Field(default_factory=dict)
+    valid: bool = True
+
+
+class SelectionUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_ids: list[str]
+    expected_selection_revision: int = Field(ge=0)
+    source_versions: dict[str, int]
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "SelectionUpdate":
+        if len(set(self.page_ids)) != len(self.page_ids) or set(self.page_ids) != set(self.source_versions):
+            raise ValueError("选择必须提供不重复的有序 page_id 和对应来源版本")
+        if any(version < 1 for version in self.source_versions.values()):
+            raise ValueError("来源版本必须大于零")
+        return self
+
+
+class WorkflowError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    stage: WorkflowStage
+    category: RecoveryReason
+    message: str = Field(min_length=1, max_length=2_000)
+    field_path: str | None = Field(default=None, max_length=300)
+    attempt_id: str | None = None
+    block_id: str | None = None
+    source_bbox: BBox | None = None
+    phase: Literal["initial", "recovery", "output"] = "initial"
+
+
+class PageOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_id: str
+    source_version: int = Field(ge=1)
+    content: ContentConclusion = "unverified"
+    layout: LayoutConclusion = "unverified"
+    source_disposition: Literal["transcribed", "regions_preserved", "page_preserved"] = "transcribed"
+    content_revision_id: str | None = None
+    layout_revision_id: str | None = None
+    adopted_revision_id: str | None = None
+    source_readable: bool = True
+    protected_existing: bool = False
+    errors: list[WorkflowError] = Field(default_factory=list)
+
+
+class RecognitionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    attempt_id: str
+    run_id: str
+    page_id: str
+    body_asset: str | None = None
+    body_storage: Literal["saved", "failed"]
+    body_bytes: int = Field(default=0, ge=0)
+    body_truncated: bool = False
+    completion_status: Literal["complete", "truncated", "incomplete", "unknown"]
+    usage: Usage
+    provider_request_id: str | None = None
+    parse_errors: list[WorkflowError] = Field(default_factory=list)
+    storage_error: str | None = Field(default=None, max_length=1_000)
+    created_at: str
+
+
+class OutputFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["pending", "generating", "available", "failed"] = "pending"
+    asset: str | None = None
+    error: str | None = None
+
+
+class OutputSnapshotPage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_id: str
+    position: int
+    source_version: int
+    source_file_id: str
+    source_page: int
+    source_filename: str
+    image_name: str
+    source_metadata: PageSourceMetadata | None = None
+    revision_id: str | None = None
+    content_revision_id: str | None = None
+    layout_revision_id: str | None = None
+    outcome: PageOutcome
+
+
+class OutputSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    workflow_version: Literal[2] = 2
+    output_snapshot_id: str
+    book_id: str
+    run_id: str
+    selection_revision: int
+    page_ids: list[str]
+    output_settings_version: int
+    settings_snapshot: dict
+    generator_version: str
+    pages: list[OutputSnapshotPage]
+    formats: dict[Literal["json", "pdf", "latex"], OutputFormat] = Field(default_factory=lambda: {
+        name: OutputFormat() for name in ("json", "pdf", "latex")
+    })
+    created_at: str
 
 
 class RunPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
     replace_page_ids: list[str] = Field(default_factory=list)
+    requests_per_page: int = Field(default=6, ge=0, le=100)
+    page_request_limit: int = Field(default=12, ge=1, le=100)
+    temporary_retry_limit: int = Field(default=2, ge=0, le=10)
+    local_recovery_limit: int = Field(default=2, ge=0, le=10)
+    compile_limit: int = Field(default=3, ge=1, le=10)
+    response_body_limit_bytes: int = Field(default=4_000_000, ge=1_024, le=16_000_000)
 
 
 class RunCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     page_ids: list[str] | None = Field(default=None, min_length=1)
     pages: list[StrictInt] | None = Field(default=None, min_length=1)
-    expected_arrangement_revision: int = Field(ge=0)
+    expected_arrangement_revision: int | None = Field(default=None, ge=0)
+    selection_revision: int | None = Field(default=None, ge=0)
+    continuation_run_id: str | None = None
     policy: RunPolicy = Field(default_factory=RunPolicy)
     request_limit: int | None = Field(default=None, ge=0)
     client_request_id: str = Field(min_length=1, max_length=200)
@@ -497,6 +626,12 @@ class RunCreate(BaseModel):
     def validate_scope(self) -> "RunCreate":
         if self.page_ids is not None and self.pages is not None:
             raise ValueError("page_ids 与 pages 只能提供一种")
+        if self.selection_revision is not None and (self.page_ids is not None or self.pages is not None):
+            raise ValueError("新版任务范围只来自已保存选择，不重复传页码或 page_id")
+        if self.selection_revision is None and self.expected_arrangement_revision is None:
+            raise ValueError("启动必须提供选择修订；旧版入口必须提供编排修订")
+        if self.continuation_run_id is not None and self.selection_revision is None:
+            raise ValueError("补做运行必须使用新版选择修订")
         return self
 
 
@@ -523,6 +658,9 @@ class PageTask(BaseModel):
     review_count: int = 0
     repair_count: int = 0
     compile_count: int = 0
+    recovery_round_count: int = 0
+    outcome: PageOutcome | None = None
+    errors: list[WorkflowError] = Field(default_factory=list)
 
 
 class RunCounts(BaseModel):
@@ -531,9 +669,15 @@ class RunCounts(BaseModel):
     auto_passed: int = 0
     completed_with_issues: int = 0
     failed: int = 0
+    editable: int = 0
+    regions_preserved: int = 0
+    page_preserved: int = 0
+    no_result: int = 0
+    protected_existing: int = 0
 
 
 class Run(BaseModel):
+    workflow_version: Literal[1, 2] = 1
     run_id: str
     book_id: str
     arrangement_revision: int
@@ -551,6 +695,38 @@ class Run(BaseModel):
     counts: RunCounts = Field(default_factory=RunCounts)
     tasks: list[PageTask] = Field(default_factory=list)
     export_manifest_id: str | None = None
+    selection_revision: int | None = None
+    continuation_run_id: str | None = None
+    output_snapshot_id: str | None = None
+    continuation_outputs_needed: bool = False
+
+
+class RunSummary(BaseModel):
+    workflow_version: Literal[1, 2]
+    run_id: str
+    book_id: str
+    selection_revision: int | None
+    status: RunStatus
+    counts: RunCounts
+    active_stages: dict[str, int] = Field(default_factory=dict)
+    updated_at: str
+    error: str | None = None
+    recent_errors: list[WorkflowError] = Field(default_factory=list)
+    output_snapshot_id: str | None = None
+    formats: dict[str, OutputFormat] = Field(default_factory=dict)
+    request_limit: int
+    request_count: int
+    usage: Usage
+    model_wait_started_at: str | None = None
+
+
+class PageOutcomeSummary(BaseModel):
+    page_id: str
+    page_number: int
+    position: int
+    stage: WorkflowStage
+    state: ExecutionStatus
+    outcome: PageOutcome | None = None
 
 
 class Revision(BaseModel):
@@ -577,6 +753,9 @@ class Revision(BaseModel):
     generated_content_revision: int | None = None
     generator_version: str | None = None
     created_at: str
+    workflow_version: Literal[1, 2] = 1
+    page_content: PageContent | None = None
+    page_layout: PageLayout | None = None
 
 
 class Issue(BaseModel):
@@ -615,7 +794,7 @@ class Attempt(BaseModel):
     stage: WorkflowStage
     ordinal: int
     retry: bool = False
-    state: Literal["reserved", "succeeded", "failed", "unknown"] = "reserved"
+    state: Literal["reserved", "succeeded", "failed", "unknown", "cancelled"] = "reserved"
     usage: Usage = Field(default_factory=lambda: Usage(
         input_tokens=None, output_tokens=None, total_tokens=None, complete=False,
     ))
@@ -623,6 +802,14 @@ class Attempt(BaseModel):
     error: str | None = None
     created_at: str
     finished_at: str | None = None
+    purpose: Literal["basic_recognition", "basic_review", "local_recognition", "recovery", "recovery_review", "retry"] | None = None
+    reservation_key: str | None = None
+    recovery_round: int | None = None
+    block_ids: list[str] = Field(default_factory=list)
+    sent_at: str | None = None
+    retryable: bool = False
+    settled_at: str | None = None
+    retry_of_attempt_id: str | None = None
 
 
 class ExportManifestPage(BaseModel):

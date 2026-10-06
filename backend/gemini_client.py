@@ -15,10 +15,12 @@ from .prompts import PAGE_REPAIR_SCHEMA, PAGE_RESPONSE_VERSION, PAGE_REVIEW_SCHE
 from .responses_client import (
     AttemptEnd,
     AttemptStart,
+    ContentClientV2,
     MAX_OUTPUT_CHARS,
     MAX_RESPONSE_BYTES,
     ModelServiceError,
     ProviderResponse,
+    ProviderText,
     UsageTuple,
     _endpoint_url,
     _http_error_message,
@@ -95,7 +97,7 @@ class GeminiConfig:
     reasoning_effort: str = ""
 
 
-class GeminiClient:
+class GeminiClient(ContentClientV2):
     def __init__(self, config: GeminiConfig):
         self.config = config
 
@@ -124,9 +126,13 @@ class GeminiClient:
             if part["type"] == "input_text":
                 user_parts.append({"text": part["text"]})
             elif part["type"] == "input_image":
+                match = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,(.+)", part["image_url"])
+                if match is None:
+                    raise ModelServiceError("Gemini 图片输入格式无效", configuration_error=True,
+                                            field_path="input.image_url")
                 user_parts.append({"inlineData": {
-                    "mimeType": "image/png",
-                    "data": part["image_url"].removeprefix("data:image/png;base64,"),
+                    "mimeType": match.group(1),
+                    "data": match.group(2),
                 }})
         user_content = {"role": "user", "parts": user_parts}
         generation_config = self._generation_config()
@@ -140,10 +146,51 @@ class GeminiClient:
             "generationConfig": generation_config,
         }
 
+    def _v2_payload(self, model: str, input_value: list[dict[str, Any]],
+                    name: str, schema: dict[str, Any]) -> dict[str, Any]:
+        if not model.strip().removeprefix("models/").strip():
+            raise ModelServiceError("Gemini 模型名称不能为空", configuration_error=True,
+                                    reason_category="service_configuration", field_path="model")
+        payload = self._page_payload(input_value, schema)
+        payload["generationConfig"]["candidateCount"] = 1
+        return payload
+
+    async def _v2_send(self, model: str, payload: dict[str, Any]) -> ProviderResponse:
+        return await self._send(model, payload)
+
+    def _v2_text(self, packet: ProviderResponse) -> ProviderText:
+        data = packet.data
+        feedback = data.get("promptFeedback")
+        if isinstance(feedback, dict) and feedback.get("blockReason"):
+            return ProviderText(packet.raw_body, "incomplete", "unreadable_source",
+                                "模型拒绝处理本次内容；已保存响应", "promptFeedback.blockReason")
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+            return ProviderText(packet.raw_body, "incomplete", "invalid_structure",
+                                "模型响应没有内容候选；已保存服务响应信封", "candidates")
+        candidate = candidates[0]
+        content = candidate.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        texts = [part["text"] for part in parts if isinstance(part, dict) and not part.get("thought")
+                 and isinstance(part.get("text"), str)] if isinstance(parts, list) else []
+        body = "".join(texts).strip()
+        finish = candidate.get("finishReason")
+        if finish == "MAX_TOKENS":
+            return ProviderText(body or packet.raw_body, "truncated", "truncated_response",
+                                "模型输出达到服务端上限；已保存收到的正文", "candidates[0].finishReason")
+        if finish != "STOP":
+            return ProviderText(body or packet.raw_body, "incomplete", "invalid_structure",
+                                "模型响应未成功完成或被内容过滤器中断；已保存响应", "candidates[0].finishReason")
+        if not body:
+            return ProviderText(packet.raw_body, "incomplete", "invalid_structure",
+                                "模型响应没有内容正文；已保存服务响应信封", "candidates[0].content.parts")
+        return ProviderText(body, "complete")
+
     async def recognize_page(
         self, model: str, input_value: list[dict[str, Any]], *,
         on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, retry: bool = False,
     ) -> StructuredPageResult:
+        """Explicit compatibility for the layout-based V1 workflow."""
         payload = self._page_payload(input_value, page_response_schema(2))
         return await _workflow_request(
             lambda: self._send(model, payload),
@@ -156,6 +203,7 @@ class GeminiClient:
         self, model: str, input_value: list[dict[str, Any]], *,
         on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, retry: bool = False,
     ) -> PageReview:
+        """Explicit compatibility for the layout-based V1 workflow."""
         payload = self._page_payload(input_value, PAGE_REVIEW_SCHEMA)
         return await _workflow_request(
             lambda: self._send(model, payload),
@@ -168,6 +216,7 @@ class GeminiClient:
         self, model: str, input_value: list[dict[str, Any]], *,
         on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, retry: bool = False,
     ) -> RepairProposal:
+        """Explicit compatibility for the layout-based V1 workflow."""
         payload = self._page_payload(input_value, PAGE_REPAIR_SCHEMA)
         return await _workflow_request(
             lambda: self._send(model, payload),

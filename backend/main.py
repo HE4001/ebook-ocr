@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -17,6 +18,8 @@ from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from .content_contract import PageContent
 from .compile_service import (
     compile_documents, failed_result, generate_manifest_outputs, render_output_page, same_source_identity,
 )
@@ -40,7 +43,9 @@ from .models import (
     LayoutUpdate,
     ModelsRequest,
     ModelsResult,
+    OutputSnapshot,
     Page,
+    PageOutcomeSummary,
     PageUpdate,
     PageResult,
     PdfCompileResult,
@@ -51,8 +56,12 @@ from .models import (
     ProjectCreate,
     Run,
     RunCreate,
+    RunSummary,
+    SelectionDraft,
+    SelectionUpdate,
     SettingsOut,
     SettingsUpdate,
+    SourcePageSummary,
 )
 from .pipeline import WorkflowProcessor
 from .gemini_client import fetch_gemini_models
@@ -70,6 +79,38 @@ logger = logging.getLogger(__name__)
 
 class RuntimeSecrets:
     api_key: str = ""
+
+
+class ImportErrorDetail(BaseModel):
+    filename: str
+    reason: str = Field(max_length=1_000)
+
+
+class UploadOutcome(Arrangement):
+    import_errors: list[ImportErrorDetail] = Field(default_factory=list)
+
+
+class SourcePageList(BaseModel):
+    items: list[SourcePageSummary]
+    total: int
+    offset: int
+    limit: int
+
+
+class OutputPageError(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    page_id: str
+    position: int = Field(ge=0)
+    source_filename: str
+    source_page: int = Field(ge=1)
+    source_version: int = Field(ge=1)
+    revision_id: str | None
+    reason: str = Field(min_length=1, max_length=1_000)
+
+
+class OutputErrors(BaseModel):
+    pdf: list[OutputPageError] = Field(default_factory=list)
+    latex: list[OutputPageError] = Field(default_factory=list)
 
 
 def _valid_book_id(value: str) -> str:
@@ -174,6 +215,46 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         if manifest is None:
             raise HTTPException(status_code=404, detail="导出清单不存在")
         return manifest
+
+    def ensure_snapshot(book_id: str, snapshot_id: str) -> OutputSnapshot:
+        ensure_book(book_id)
+        try:
+            UUID(snapshot_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="输出快照不存在") from exc
+        snapshot = storage.get_output_snapshot(book_id, snapshot_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="输出快照不存在")
+        return snapshot
+
+    def snapshot_errors(snapshot: OutputSnapshot, format_name: str) -> list[OutputPageError]:
+        book_dir = (storage.books_root / snapshot.book_id).resolve()
+        path = (book_dir / "exports" / snapshot.output_snapshot_id / f"{format_name}-errors.json").resolve()
+        if not path.is_relative_to(book_dir):
+            raise HTTPException(status_code=409, detail="输出错误记录路径无效")
+        if not path.is_file():
+            return []
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(body, dict) or set(body) != {"output_snapshot_id", "issues"}
+                    or body["output_snapshot_id"] != snapshot.output_snapshot_id
+                    or not isinstance(body["issues"], list)):
+                raise ValueError("snapshot errors")
+            pages = {entry.page_id: entry for entry in snapshot.pages}
+            issues = []
+            for value in body["issues"]:
+                issue = OutputPageError.model_validate(value)
+                entry = pages.get(issue.page_id)
+                if entry is None or (issue.position, issue.source_filename, issue.source_page,
+                                     issue.source_version, issue.revision_id) != (
+                        entry.position, entry.source_filename, entry.source_page,
+                        entry.source_version, entry.revision_id):
+                    raise ValueError("snapshot page")
+                issues.append(issue)
+            return issues
+        except (OSError, UnicodeError, ValueError, ValidationError) as exc:
+            # Never expose malformed sidecar data or model response bodies.
+            raise HTTPException(status_code=409, detail="输出错误记录无法读取或与冻结快照不一致") from exc
 
     def ensure_run_available(book_id: str, run_id: str) -> None:
         if book_id in uploading:
@@ -447,8 +528,8 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     async def get_arrangement(book_id: str) -> Arrangement:
         return arrangement(book_id)
 
-    @app.post("/api/books/{book_id}/files", response_model=Arrangement)
-    async def upload_files(book_id: str, files: list[UploadFile] = File(...)) -> Arrangement:
+    @app.post("/api/books/{book_id}/files", response_model=UploadOutcome)
+    async def upload_files(book_id: str, files: list[UploadFile] = File(...)) -> UploadOutcome:
         ensure_book(book_id)
         ensure_idle(book_id)
         if not files:
@@ -456,37 +537,40 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         uploading.add(book_id)
         book_dir = storage.books_root / book_id
         staging = book_dir / f".upload-{uuid4()}"
-        moved: list[Path] = []
+        import_errors: list[ImportErrorDetail] = []
         try:
             staging.mkdir(parents=True)
-            imported = []
+            (book_dir / "sources").mkdir(exist_ok=True)
             for file in files:
-                filename, data = await read_upload(file)
                 source_id = str(uuid4())
                 directory = staging / source_id
-                directory.mkdir()
-                pages = await asyncio.to_thread(import_document, data, filename, directory)
-                imported.append({
-                    "id": source_id, "filename": filename,
-                    "kind": "pdf" if filename.lower().endswith(".pdf") else "image",
-                    "directory": f"sources/{source_id}", "pages": pages,
-                })
-            (book_dir / "sources").mkdir(exist_ok=True)
-            for source in imported:
-                target = book_dir / source["directory"]
-                (staging / source["id"]).rename(target)
-                moved.append(target)
-            storage.append_files(book_id, imported)
-        except BaseException as exc:
-            for directory in moved:
-                shutil.rmtree(directory)
-            if isinstance(exc, ImportFailure):
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            raise
+                target = book_dir / "sources" / source_id
+                filename = Path(file.filename or "").name[:255] or "未命名文件"
+                moved = False
+                try:
+                    filename, data = await read_upload(file)
+                    directory.mkdir()
+                    pages = await asyncio.to_thread(import_document, data, filename, directory)
+                    directory.rename(target)
+                    moved = True
+                    storage.append_files(book_id, [{
+                        "id": source_id, "filename": filename,
+                        "kind": "pdf" if filename.lower().endswith(".pdf") else "image",
+                        "directory": f"sources/{source_id}", "pages": pages,
+                    }])
+                except Exception as exc:
+                    # Only this unregistered source is removed; earlier successes stay saved.
+                    if moved:
+                        shutil.rmtree(target, ignore_errors=True)
+                    reason = (str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                              if isinstance(exc, ImportFailure) else "文件导入发生技术错误，其他成功文件已保留")
+                    import_errors.append(ImportErrorDetail(filename=filename, reason=reason[:1_000]))
+                    if not isinstance(exc, (HTTPException, ImportFailure)):
+                        logger.error("Import failed (%s)", type(exc).__name__)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
             uploading.discard(book_id)
-        return arrangement(book_id)
+        return UploadOutcome(**arrangement(book_id).model_dump(), import_errors=import_errors)
 
     @app.post("/api/books/{book_id}/confirm-upload", response_model=Arrangement)
     async def confirm_upload(book_id: str) -> Arrangement:
@@ -579,6 +663,75 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     async def get_book(book_id: str) -> BookDetail:
         return book_detail(book_id)
 
+    @app.get("/api/books/{book_id}/overview", response_model=BookDetail)
+    async def get_overview(book_id: str) -> BookDetail:
+        return BookDetail(book=ensure_book(book_id), files=storage.get_files(book_id), pages=[])
+
+    @app.get("/api/books/{book_id}/selection", response_model=SelectionDraft)
+    async def get_selection(book_id: str) -> SelectionDraft:
+        ensure_book(book_id)
+        return storage.get_selection(book_id)
+
+    @app.put("/api/books/{book_id}/selection", response_model=SelectionDraft)
+    async def save_selection(book_id: str, update: SelectionUpdate) -> SelectionDraft:
+        ensure_book(book_id)
+        if book_id in uploading:
+            raise HTTPException(status_code=409, detail="项目正在上传，请稍后保存选页")
+        try:
+            # The run already owns its frozen selection; this writes only the next draft.
+            return storage.save_selection(book_id, update)
+        except RevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/books/{book_id}/source-pages", response_model=SourcePageList)
+    async def list_source_pages(
+        book_id: str, offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=500), source_id: str | None = None,
+    ) -> SourcePageList:
+        ensure_book(book_id)
+        if source_id is not None and source_id not in {source.id for source in storage.get_files(book_id)}:
+            raise HTTPException(status_code=404, detail="源文件不存在")
+        return SourcePageList(items=storage.list_source_pages(book_id, offset, limit, source_id),
+                              total=storage.count_source_pages(book_id, source_id), offset=offset, limit=limit)
+
+    @app.get("/api/books/{book_id}/source-pages/{page_id}/preview")
+    async def preview_source_page(
+        book_id: str, page_id: str, run_id: str | None = None,
+        source_version: int | None = Query(default=None, ge=1),
+    ) -> FileResponse:
+        ensure_book(book_id)
+        if run_id is not None:
+            run = ensure_run(book_id, run_id)
+            if page_id not in run.page_ids:
+                raise HTTPException(status_code=404, detail="源页面不属于该任务")
+            try:
+                record = storage.get_run_page_record(run_id, page_id)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail="任务冻结源页面不存在") from exc
+            task = storage.get_task(run_id, page_id)
+            if task is None or record["source_version"] != task.source_version:
+                raise HTTPException(status_code=409, detail="任务源页面版本与冻结范围不一致")
+        else:
+            record = storage.get_source_page_record(book_id, page_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="源页面不存在")
+        if (record["book_id"], record["page_id"]) != (book_id, page_id):
+            raise HTTPException(status_code=409, detail="源页面不属于该项目")
+        if source_version is not None and source_version != record["source_version"]:
+            raise HTTPException(status_code=409, detail="源页面版本与请求不一致，请重新加载来源")
+        book_dir = (storage.books_root / book_id).resolve()
+        try:
+            async with preview_lock:
+                path = await asyncio.to_thread(prepare_source_preview, book_dir, record)
+        except ImportFailure as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        path = path.resolve()
+        if not path.is_relative_to(book_dir) or not path.is_file():
+            raise HTTPException(status_code=404, detail="源页预览不存在")
+        return FileResponse(path, media_type="image/png")
+
     @app.put("/api/books/{book_id}/layout", response_model=Book)
     async def put_layout(book_id: str, request: LayoutUpdate) -> Book:
         ensure_book(book_id)
@@ -611,9 +764,53 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         ensure_book(book_id)
         return storage.list_runs(book_id)
 
+    @app.get("/api/books/{book_id}/runs/summaries", response_model=list[RunSummary])
+    async def list_run_summaries(book_id: str) -> list[RunSummary]:
+        ensure_book(book_id)
+        summaries = []
+        for run in storage.list_runs(book_id):
+            summary = storage.get_run_summary(book_id, run.run_id)
+            if summary is not None:
+                summaries.append(summary)
+        return summaries
+
     @app.get("/api/books/{book_id}/runs/{run_id}", response_model=Run)
     async def get_run(book_id: str, run_id: str) -> Run:
         return ensure_run(book_id, run_id)
+
+    @app.get("/api/books/{book_id}/runs/{run_id}/summary", response_model=RunSummary)
+    async def get_run_summary(book_id: str, run_id: str) -> RunSummary:
+        ensure_run(book_id, run_id)
+        summary = storage.get_run_summary(book_id, run_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return summary
+
+    @app.get("/api/books/{book_id}/runs/{run_id}/outcomes", response_model=list[PageOutcomeSummary])
+    async def get_run_outcomes(
+        book_id: str, run_id: str, offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[PageOutcomeSummary]:
+        ensure_run(book_id, run_id)
+        return storage.get_run_outcomes(run_id, offset, limit)
+
+    @app.get("/api/books/{book_id}/runs/{run_id}/pages/{page_id}/content", response_model=PageContent | None)
+    async def get_run_content(book_id: str, run_id: str, page_id: str) -> PageContent | None:
+        run = ensure_run(book_id, run_id)
+        if page_id not in run.page_ids:
+            raise HTTPException(status_code=404, detail="页面不属于该任务")
+        task = storage.get_task(run_id, page_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="任务页面不存在")
+        if task.candidate_revision_id is None:
+            return None
+        revision = storage.get_revision(task.candidate_revision_id)
+        if revision is None or (revision.book_id, revision.page_id, revision.source_version) != (
+                book_id, page_id, task.source_version):
+            raise HTTPException(status_code=409, detail="任务内容修订与冻结来源不一致")
+        if revision.workflow_version == 2 and revision.run_id != run_id:
+            raise HTTPException(status_code=409, detail="任务内容修订不属于该运行")
+        return revision.page_content
 
     @app.post("/api/books/{book_id}/runs/{run_id}/pause", response_model=Run)
     async def pause_run(book_id: str, run_id: str) -> Run:
@@ -653,12 +850,46 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         ensure_book(book_id)
         return storage.list_issues(book_id, offset, limit)
 
+    @app.get("/api/books/{book_id}/output-snapshots/{snapshot_id}", response_model=OutputSnapshot)
+    async def get_output_snapshot(book_id: str, snapshot_id: str) -> OutputSnapshot:
+        return ensure_snapshot(book_id, snapshot_id)
+
+    @app.get("/api/books/{book_id}/output-snapshots/{snapshot_id}/errors", response_model=OutputErrors)
+    async def get_output_errors(book_id: str, snapshot_id: str) -> OutputErrors:
+        snapshot = ensure_snapshot(book_id, snapshot_id)
+        return OutputErrors(pdf=snapshot_errors(snapshot, "pdf"), latex=snapshot_errors(snapshot, "latex"))
+
+    @app.get("/api/books/{book_id}/output-snapshots/{snapshot_id}/{format_name}")
+    async def download_snapshot(
+        book_id: str, snapshot_id: str, format_name: str, inline: bool = False,
+    ) -> FileResponse:
+        snapshot = ensure_snapshot(book_id, snapshot_id)
+        if format_name not in {"json", "pdf", "latex"}:
+            raise HTTPException(status_code=404, detail="输出格式不存在")
+        output = snapshot.formats[format_name]
+        if output.status != "available" or not output.asset:
+            raise HTTPException(status_code=409, detail="该格式尚不可用，请查看输出状态和原因")
+        book_dir = (storage.books_root / book_id).resolve()
+        # A continuation may inherit an older snapshot's immutable PDF asset.
+        path = (book_dir / output.asset).resolve()
+        if not path.is_relative_to(book_dir) or not path.is_file():
+            raise HTTPException(status_code=404, detail="冻结输出文件不存在")
+        extension, media_type = {
+            "json": ("json", "application/json"), "pdf": ("pdf", "application/pdf"),
+            "latex": ("zip", "application/zip"),
+        }[format_name]
+        return FileResponse(path, media_type=media_type,
+                            filename=f"book-{book_id}-{snapshot_id}.{extension}",
+                            content_disposition_type="inline" if format_name == "pdf" and inline else "attachment")
+
     @app.post("/api/books/{book_id}/export-manifests", response_model=ExportManifest, status_code=201)
     async def create_manifest(book_id: str, request: ExportManifestCreate) -> ExportManifest:
         ensure_book(book_id)
         full_manifest_id = None
         if request.run_id is not None:
             run = ensure_run(book_id, request.run_id)
+            if run.workflow_version == 2:
+                raise HTTPException(status_code=409, detail="新版运行请读取其自动生成的输出快照")
             if run.status not in {"succeeded", "failed"} or any(task.result_status is None for task in run.tasks):
                 raise HTTPException(status_code=409, detail="任务尚未形成最终结果，请等待结束或导出当前已保存稿")
             if request.expected_arrangement_revision != run.arrangement_revision:
@@ -718,7 +949,8 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         book = ensure_book(book_id)
         if not storage.get_pages(book_id):
             return ProcessResult(started=False)
-        paused = next((run for run in storage.list_runs(book_id) if run.status == "paused"), None)
+        paused = next((run for run in storage.list_runs(book_id)
+                       if run.workflow_version == 1 and run.status == "paused"), None)
         if paused is not None:
             requested = set(request.pages) if request is not None and request.pages is not None else None
             if requested is not None and requested != {task.page_number for task in paused.tasks}:

@@ -11,13 +11,18 @@ from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
+from uuid import uuid4
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
 from .fidelity_rendering import GENERATOR_VERSION
-from .latex_content import is_latex_document
+from .content_contract import EquationBlock, FigureBlock, MathSpan, PageContent, TableBlock, TextBlock
+from .latex_content import escape_latex, is_latex_document
 from .latex_export import PAPER_SIZES
-from .layout_contract import BBox, LayoutLine, PageSourceMetadata, SourceFidelityLayout, equation_alignment_index, tex_pt_to_bp
+from .layout_contract import (
+    BBox, EquationGroup, EquationNumber, LayoutLine, LayoutRegion, LineStyle, PageLayout,
+    PageLinePlacement, PageSourceMetadata, SourceFidelityLayout, equation_alignment_index, tex_pt_to_bp,
+)
 from .models import Book, StructuredPageResult
 from .source_analysis import InkBand, PdfTextLine, SourceAnalysis, analyze_source, persist_source_region
 
@@ -34,6 +39,10 @@ def _pdf_match(line: LayoutLine, evidence: list[PdfTextLine]) -> PdfTextLine | N
         return None
     candidates = []
     for item in evidence:
+        if not item.visible_ink:
+            continue
+        if line.bbox is not None and _band_score(line.bbox, InkBand(item.bbox, item.baseline, 0., 0)) < .3:
+            continue
         source_text = _plain_text(item.text)
         if abs(len(text) - len(source_text)) > max(2, len(text) * .12):
             continue
@@ -298,8 +307,9 @@ def _shared_styles(
 def solve_layout(
     result: StructuredPageResult, metadata: PageSourceMetadata, book: Book,
     content_revision: int, layout_revision: int, *, image_path: Path, book_dir: Path,
+    analysis: SourceAnalysis | None = None,
 ) -> SourceFidelityLayout:
-    """Recover a candidate; unresolved evidence is handled by automatic review."""
+    """Explicit V1 compatibility; V2 uses derive_layout with existing analysis."""
     if result.layout is None:
         raise ValueError("页面响应没有可用于自动布局的原行观察")
     observation = result.layout.model_copy(deep=True)
@@ -317,7 +327,8 @@ def solve_layout(
         generated_content_revision=None if is_latex_document(result.body_latex) else content_revision,
         generator_version=GENERATOR_VERSION, canvas_width_bp=width, canvas_height_bp=height, canvas_basis=canvas_basis,
     )
-    analysis = analyze_source(image_path, metadata)
+    analysis = analysis if analysis is not None else analyze_source(image_path, metadata, book_dir=book_dir, max_crops=0)
+    analysis.require_source(metadata)
     pdf_matches = {line.line_id: evidence for line in layout.lines
                    if (evidence := _pdf_match(line, analysis.pdf_text_lines)) is not None}
     lines = {line.line_id: line for line in layout.lines}
@@ -374,6 +385,325 @@ def solve_layout(
     # The wire contract reserves three program reasons beyond its model limit.
     layout.review_reasons = layout.review_reasons[:100] + program_reasons[:3]
     return layout
+
+
+def _text_line_latex(line) -> str:
+    pieces = []
+    for span in line.spans:
+        if isinstance(span, MathSpan):
+            pieces.append(r"\(" + span.text + r"\)")
+            continue
+        value = escape_latex(span.text)
+        if span.bold:
+            value = r"\textbf{" + value + "}"
+        if span.italic:
+            value = r"\textit{" + value + "}"
+        if span.font_family:
+            command = {"songti": r"\songti", "heiti": r"\heiti", "kaiti": r"\kaishu"}[span.font_family]
+            value = "{" + command + " " + value + "}"
+        pieces.append(value)
+    return "".join(pieces)
+
+
+def _content_lines(content: PageContent) -> list[LayoutLine]:
+    """Render projection only; every string is derived from saved content."""
+    lines = []
+    for block in content.blocks:
+        if isinstance(block, FigureBlock):
+            continue
+        source_lines = block.lines if isinstance(block, (TextBlock, EquationBlock)) else [
+            line for cell in block.cells for line in cell.lines
+        ]
+        for source_line in source_lines:
+            if not source_line.line_id:
+                raise ValueError("已保存内容原行缺少程序 ID，布局不能自行更改内容身份")
+            if isinstance(block, EquationBlock):
+                try:
+                    equation_alignment_index(source_line.latex)
+                    kind, latex = "equation", source_line.latex
+                except ValueError:
+                    # The readable fragment remains content. An unsupported
+                    # outer environment is preserved as a bounded source region
+                    # rather than silently rewritten into a different formula.
+                    kind, latex = "text", r"\(\displaystyle " + source_line.latex + r"\)"
+            else:
+                kind = "table" if isinstance(block, TableBlock) else block.role if block.role in {
+                    "header", "footer", "page_number", "footnote", "caption"
+                } else "text"
+                latex = _text_line_latex(source_line)
+            lines.append(LayoutLine(line_id=source_line.line_id, block_id=block.block_id, order=len(lines),
+                                    kind=kind, latex=latex, bbox=source_line.bbox,
+                                    basis="model_estimate" if source_line.bbox else None))
+    return lines
+
+
+def _block_box(block) -> BBox | None:
+    boxes = [block.bbox] if block.bbox is not None else []
+    boxes.extend(line.bbox for line in getattr(block, "lines", []) if line.bbox is not None)
+    boxes.extend(cell.bbox for cell in getattr(block, "cells", []) if cell.bbox is not None)
+    if not boxes:
+        return None
+    return min(box[0] for box in boxes), min(box[1] for box in boxes), max(box[2] for box in boxes), max(box[3] for box in boxes)
+
+
+def _canvas(metadata: PageSourceMetadata, book: Book) -> tuple[float, float, str]:
+    if metadata.pdf_geometry is not None:
+        a, b, c, d, _, _ = metadata.canonical_to_source_affine
+        return (math.hypot(a, b) * metadata.canonical_width_px,
+                math.hypot(c, d) * metadata.canonical_height_px, "file_metadata")
+    width = PAPER_SIZES[book.paper_size][0] * 72 / 25.4
+    return width, width * metadata.canonical_height_px / metadata.canonical_width_px, "project"
+
+
+def derive_layout(
+    content: PageContent, metadata: PageSourceMetadata, analysis: SourceAnalysis, book: Book, *,
+    image_path: Path, book_dir: Path, layout_revision_id: str | None = None,
+) -> PageLayout:
+    """Derive geometry after content is saved, reusing exactly its source analysis."""
+    analysis.require_source(metadata)
+    if (content.book_id, content.page_id, content.source_version) != (metadata.book_id, metadata.page_id, metadata.source_version):
+        raise ValueError("内容、来源与布局输入版本不一致")
+    width, height, canvas_basis = _canvas(metadata, book)
+    lines = _content_lines(content)
+    by_block: dict[str, list[LayoutLine]] = defaultdict(list)
+    for line in lines:
+        by_block[line.block_id].append(line)
+    regions = []
+    for order, block in enumerate(content.blocks):
+        box = _block_box(block)
+        basis = "model_estimate" if box else None
+        if box is None:
+            candidates = [region for region in analysis.regions if region.region_id == block.source_region_id]
+            if not candidates and block.role in {"header", "footer", "title", "footnote"}:
+                candidates = [region for region in analysis.regions if region.kind == block.role]
+            if len(candidates) == 1:
+                box, basis = candidates[0].bbox, "local_measurement"
+        kind = block.type if block.type != "text" else block.role if block.role in {
+            "header", "footer", "footnote"
+        } else "paragraph"
+        regions.append(LayoutRegion(region_id=block.block_id, kind=kind, order=order, bbox=box, basis=basis))
+    groups = []
+    line_map = {line.line_id: line for line in lines}
+    for block in content.blocks:
+        if not isinstance(block, EquationBlock):
+            continue
+        for source_line in block.lines:
+            line = line_map[source_line.line_id]
+            if line.kind != "equation":
+                continue
+            groups.append(EquationGroup(group_id=f"equation-{source_line.line_id}", line_ids=[source_line.line_id],
+                                        bbox=source_line.bbox or _block_box(block),
+                                        number=EquationNumber(latex=escape_latex(source_line.number), line_id=source_line.line_id)
+                                        if source_line.number else None, basis="model_estimate"))
+    candidate = SourceFidelityLayout(source=metadata, content_revision=0, layout_revision=0,
+                                    generated_content_revision=0, generator_version=GENERATOR_VERSION,
+                                    canvas_width_bp=width, canvas_height_bp=height, canvas_basis=canvas_basis,
+                                    regions=regions, lines=lines, equation_groups=groups)
+    pdf_matches = {line.line_id: evidence for line in lines
+                   if (evidence := _pdf_match(line, analysis.pdf_text_lines)) is not None}
+    for region in regions:
+        block_lines = by_block[region.region_id]
+        evidence = [pdf_matches[line.line_id] for line in block_lines if line.line_id in pdf_matches]
+        if region.bbox is None and block_lines and len(evidence) == len(block_lines):
+            region.bbox = (min(item.bbox[0] for item in evidence), min(item.bbox[1] for item in evidence),
+                           max(item.bbox[2] for item in evidence), max(item.bbox[3] for item in evidence))
+            region.basis = "file_metadata"
+    measurements: dict[str, InkBand] = {}
+    reasons = []
+    # Plain pages without model boxes still get a source-based attempt. Equal
+    # visual-row counts establish only geometry, never content correctness.
+    if content.blocks and all(isinstance(block, TextBlock) for block in content.blocks) and all(line.bbox is None for line in lines):
+        bands = analysis.region_bands((0., 0., 1., 1.))
+        if len(bands) == len(lines):
+            for line, band in zip(lines, bands):
+                measurements[line.line_id] = band
+                _set_geometry(line, band, analysis)
+            for region in regions:
+                boxes = [line.bbox for line in by_block[region.region_id]]
+                region.bbox = (min(box[0] for box in boxes), min(box[1] for box in boxes),
+                               max(box[2] for box in boxes), max(box[3] for box in boxes))
+                region.basis = "local_measurement"
+            reasons.append("原行与完整源图行带按顺序等数对应；这仅恢复位置，文字结论仍取决于独立内容复核")
+    unresolved = []
+    preservation: dict[str, tuple[BBox, str, str]] = {}
+    for block, region in zip(content.blocks, regions):
+        block_lines = by_block[block.block_id]
+        if isinstance(block, FigureBlock):
+            if region.bbox is not None:
+                preservation[block.block_id] = (region.bbox, "figure", "可见图形以对应源区域保留")
+            else:
+                reasons.append(f"图形 {block.block_id} 的源位置未知")
+            continue
+        if isinstance(block, TableBlock):
+            for cell in block.cells:
+                cell_lines = [line_map[line.line_id] for line in cell.lines]
+                if cell_lines and cell.bbox is not None:
+                    unresolved.extend(_match_region(cell_lines, cell.bbox, analysis, pdf_matches, measurements))
+                elif cell_lines:
+                    unresolved.extend(line.line_id for line in cell_lines)
+            if region.bbox is not None:
+                preservation[block.block_id] = (region.bbox, "uncertain_content", "缺少表格网格与合并边界的来源测量，保留完整可定位表格及表头；单元格内容仍保存在 JSON")
+                reasons.append(f"表格 {block.block_id} 网格及合并几何未知，按完整源区域保留，布局为 approximate")
+            else:
+                reasons.append(f"表格 {block.block_id} 完整源位置未知；不伪造整页表格框，布局不可用")
+        elif block_lines and not all(line.line_id in measurements for line in block_lines):
+            if isinstance(block, EquationBlock) and len(block_lines) == 1 and block_lines[0].bbox is None:
+                block_lines[0].bbox = region.bbox
+            if region.bbox is not None:
+                unresolved.extend(_match_region(block_lines, region.bbox, analysis, pdf_matches, measurements))
+            else:
+                unresolved.extend(line.line_id for line in block_lines)
+        if isinstance(block, EquationBlock):
+            unsupported = any(line.kind != "equation" for line in block_lines)
+            need_anchor = any(line.kind == "equation" and equation_alignment_index(line.latex) is not None for line in block_lines)
+            if unsupported or need_anchor:
+                reason = "公式外层环境不能直接派生原行布局" if unsupported else "公式对齐锚点尚无源图测量依据"
+                reasons.append(f"{block.block_id}：{reason}；原数学内容保持不变")
+                if region.bbox is not None:
+                    preservation[block.block_id] = (region.bbox, "uncertain_content", reason + "，保留完整公式组与编号")
+            for group in (item for item in groups if item.line_ids[0] in {line.line_id for line in block_lines}):
+                line = line_map[group.line_ids[0]]
+                group.bbox = line.bbox or region.bbox
+                if group.number is not None:
+                    # Native PDF numbering can corroborate geometry only when
+                    # its visible position belongs to this exact formula region.
+                    matches = [item for item in analysis.pdf_text_lines if item.visible_ink and group.bbox is not None
+                               and _plain_text(item.text) == _plain_text(group.number.latex)
+                               and item.bbox[1] < group.bbox[3] and item.bbox[3] > group.bbox[1]
+                               and region.bbox is not None and item.bbox[0] >= region.bbox[0]
+                               and item.bbox[2] <= region.bbox[2]]
+                    if len(matches) == 1:
+                        group.number.bbox = matches[0].bbox
+                        group.number.anchor_x = matches[0].bbox[2]
+                    elif region.bbox is not None:
+                        preservation[block.block_id] = (region.bbox, "uncertain_content", "公式编号无法唯一定位，保留完整公式组及编号")
+                        reasons.append(f"公式编号 {group.number.line_id} 位置未知")
+        if block.review_status in {"uncertain", "unavailable"} or block.recognition_status == "unavailable":
+            if region.bbox is not None and block.block_id not in preservation:
+                preservation[block.block_id] = (region.bbox, "uncertain_content", "内容复核未能可靠文字化此区域，保留源内容及已识别 JSON")
+        if any(line.baseline is None for line in block_lines):
+            if region.bbox is not None and block.block_id not in preservation:
+                preservation[block.block_id] = (region.bbox, "uncertain_content", "此块原行未能唯一恢复源位置，保留必要源区域")
+            reasons.append(f"块 {block.block_id} 部分原行位置或基线未知")
+    # Expand a preserved region to cover any other item it intersects. This
+    # avoids clipping a line in half or drawing the source and text twice.
+    for block_id, (box, purpose, reason) in list(preservation.items()):
+        owned = [line.bbox for line in by_block[block_id] if line.bbox is not None]
+        owned.extend(group.number.bbox for group in groups if group.number is not None and group.number.bbox is not None
+                     and line_map[group.number.line_id].block_id == block_id)
+        if owned:
+            box = (min([box[0], *(other[0] for other in owned)]), min([box[1], *(other[1] for other in owned)]),
+                   max([box[2], *(other[2] for other in owned)]), max([box[3], *(other[3] for other in owned)]))
+        if purpose == "uncertain_content":
+            # Complete visible rows retain peripheral numbering and strokes;
+            # this is independent of the much larger context used by OCR crops.
+            bands = analysis.region_bands((0., 0., 1., 1.))
+            for _ in range(3):
+                crossing = [band.bbox for band in bands if max(box[0], band.bbox[0]) < min(box[2], band.bbox[2])
+                            and max(box[1], band.bbox[1]) < min(box[3], band.bbox[3])]
+                new_box = (min([box[0], *(other[0] for other in crossing)]), min([box[1], *(other[1] for other in crossing)]),
+                           max([box[2], *(other[2] for other in crossing)]), max([box[3], *(other[3] for other in crossing)]))
+                if new_box == box:
+                    break
+                box = new_box
+        for _ in range(len(regions) + 1):
+            crossing = [region.bbox for region in regions if region.bbox is not None
+                        and max(box[0], region.bbox[0]) < min(box[2], region.bbox[2])
+                        and max(box[1], region.bbox[1]) < min(box[3], region.bbox[3])]
+            crossing.extend(line.bbox for line in lines if line.bbox is not None
+                            and max(box[0], line.bbox[0]) < min(box[2], line.bbox[2])
+                            and max(box[1], line.bbox[1]) < min(box[3], line.bbox[3]))
+            new_box = (min([box[0], *(other[0] for other in crossing)]), min([box[1], *(other[1] for other in crossing)]),
+                       max([box[2], *(other[2] for other in crossing)]), max([box[3], *(other[3] for other in crossing)]))
+            if new_box == box:
+                break
+            box = new_box
+        if any(asset.region_id == block_id and asset.purpose == purpose and asset.bbox[0] <= box[0] and asset.bbox[1] <= box[1] and asset.bbox[2] >= box[2] and asset.bbox[3] >= box[3]
+               for asset in candidate.source_assets):
+            continue
+        try:
+            candidate.source_assets.append(persist_source_region(book_dir, image_path, metadata, box, block_id, reason, purpose=purpose))
+        except (OSError, RuntimeError, ValueError) as error:
+            reasons.append(f"源区域 {block_id} 保存失败：{str(error)[:250]}")
+    pdf_matches = {line_id: evidence for line_id, evidence in pdf_matches.items()
+                   if line_id in measurements and _band_score(evidence.bbox, measurements[line_id]) > .45}
+    _shared_styles(candidate, analysis, measurements, pdf_matches, book)
+    if canvas_basis == "project":
+        reasons.append("图片缺少可信物理尺寸；采用项目纸宽及原图比例，字号与画布尺寸仍为估计")
+    if any(line.style.basis == "project" for line in lines):
+        reasons.append("部分字体族或字号采用项目设置，未把估计标为测量真值")
+    uncovered = analysis.uncovered_content(content)
+    if uncovered:
+        reasons.append(f"完整源页另有 {len(uncovered)} 个可能遗漏区域；墨迹只作复核线索，不宣称文字已覆盖")
+    unresolved_unknown = any(line.baseline is None and not any(asset.region_id == line.block_id for asset in candidate.source_assets)
+                             for line in lines)
+    figures_unknown = any(isinstance(block, FigureBlock) and _block_box(block) is None
+                          and not any(asset.region_id == block.block_id for asset in candidate.source_assets) for block in content.blocks)
+    tables_unknown = any(isinstance(block, TableBlock) and not any(asset.region_id == block.block_id and asset.purpose == "uncertain_content"
+                                                                 for asset in candidate.source_assets) for block in content.blocks)
+    preservation_failed = any(not any(asset.region_id == block_id for asset in candidate.source_assets) for block_id in preservation)
+    conclusion = "unavailable" if unresolved_unknown or figures_unknown or tables_unknown or preservation_failed or (not content.blank and not content.blocks) else (
+        "approximate" if reasons or candidate.source_assets else "faithful")
+    body_boxes = [region.bbox for region in regions if region.bbox is not None and region.kind not in {"header", "footer"}]
+    body_frame = ((min(box[0] for box in body_boxes), min(box[1] for box in body_boxes),
+                   max(box[2] for box in body_boxes), max(box[3] for box in body_boxes)) if body_boxes else None)
+    return PageLayout(layout_revision_id=layout_revision_id or str(uuid4()), content_revision_id=content.content_revision_id,
+                      page_id=content.page_id, source_version=content.source_version, source=metadata,
+                      canvas_width_bp=width, canvas_height_bp=height, canvas_basis=canvas_basis, body_frame=body_frame,
+                      regions=regions, lines=[PageLinePlacement(**line.model_dump(exclude={"kind", "latex"})) for line in lines],
+                      equation_groups=groups, source_assets=candidate.source_assets, conclusion=conclusion,
+                      body_font_size_bp=candidate.body_font_size_bp, body_font_family=candidate.body_font_family,
+                      body_font_basis=candidate.body_font_basis, review_reasons=list(dict.fromkeys(reasons))[:500])
+
+
+def to_source_fidelity_layout(
+    content: PageContent, layout: PageLayout, *, content_revision: int = 0, layout_revision: int = 0,
+) -> SourceFidelityLayout:
+    """Explicit renderer adapter; layout can never provide authoritative text."""
+    if (layout.content_revision_id, layout.source.book_id, layout.page_id, layout.source_version) != (
+        content.content_revision_id, content.book_id, content.page_id, content.source_version
+    ):
+        raise ValueError("输出布局必须引用当前内容修订及来源版本")
+    lines = _content_lines(content)
+    line_map = {line.line_id: line for line in lines}
+    placements = {line.line_id: line for line in layout.lines}
+    if set(placements) != set(line_map):
+        raise ValueError("布局原行引用与内容原行不一致")
+    for line in lines:
+        placement = placements[line.line_id]
+        if placement.block_id != line.block_id:
+            raise ValueError("布局原行不能改换内容块归属")
+        line.order, line.bbox, line.baseline = placement.order, placement.bbox, placement.baseline
+        line.style, line.basis = placement.style.model_copy(deep=True), placement.basis
+    content_numbers = {line.line_id: line.number for block in content.blocks if isinstance(block, EquationBlock) for line in block.lines}
+    groups = [group.model_copy(deep=True) for group in layout.equation_groups]
+    for group in groups:
+        if any(line_id not in line_map or line_map[line_id].kind != "equation" for line_id in group.line_ids):
+            raise ValueError("布局公式组必须引用真实内容公式行")
+        if len({line_map[line_id].block_id for line_id in group.line_ids}) != 1:
+            raise ValueError("布局公式组不能跨越内容公式块")
+        if group.number is not None:
+            if group.number.line_id not in group.line_ids or not content_numbers.get(group.number.line_id):
+                raise ValueError("布局公式编号必须归属有编号的内容公式行")
+            group.number.latex = escape_latex(content_numbers[group.number.line_id])
+    grouped_numbers = {group.number.line_id for group in groups if group.number is not None}
+    if any(number and line_id not in grouped_numbers for line_id, number in content_numbers.items() if line_map[line_id].kind == "equation"):
+        raise ValueError("布局遗漏已保存的公式编号")
+    whole_page = any(asset.purpose == "source_page" or (asset.purpose == "uncertain_content" and asset.bbox == (0., 0., 1., 1.))
+                     for asset in layout.source_assets)
+    disposition = "source_page_preserved" if whole_page else "regions_preserved" if any(
+        asset.purpose == "uncertain_content" for asset in layout.source_assets
+    ) else "transcribed"
+    return SourceFidelityLayout(source=layout.source, content_revision=content_revision, layout_revision=layout_revision,
+                                generated_content_revision=content_revision, generator_version=GENERATOR_VERSION,
+                                canvas_width_bp=layout.canvas_width_bp, canvas_height_bp=layout.canvas_height_bp,
+                                canvas_basis=layout.canvas_basis, body_frame=layout.body_frame, regions=layout.regions,
+                                lines=lines, equation_groups=groups, source_assets=layout.source_assets,
+                                body_font_size_bp=layout.body_font_size_bp, body_font_family=layout.body_font_family,
+                                body_font_basis=layout.body_font_basis, review_reasons=layout.review_reasons[:103],
+                                source_disposition=disposition,
+                                disposition_reason="整页源内容保留；已识别内容仍在 JSON" if whole_page else
+                                "部分区域缺少可靠内容或布局依据，按对应源框保留" if disposition == "regions_preserved" else None)
 
 
 def summarize_book_styles(layouts: list[SourceFidelityLayout]) -> dict:

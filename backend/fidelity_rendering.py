@@ -88,6 +88,7 @@ def source_preserved_line_ids(layout: SourceFidelityLayout) -> set[str]:
         return {line.line_id for line in layout.lines}
     assets = [asset for asset in layout.source_assets if asset.purpose == "uncertain_content"]
     regions = {region.region_id: region for region in layout.regions}
+    lines = {line.line_id: line for line in layout.lines}
     preserved = set()
     for line in layout.lines:
         if line.bbox is None:
@@ -105,6 +106,13 @@ def source_preserved_line_ids(layout: SourceFidelityLayout) -> set[str]:
     for group in layout.equation_groups:
         if group.number is not None and group.number.line_id in preserved:
             bbox = group.number.bbox
+            region = regions[lines[group.line_ids[0]].block_id]
+            complete_group = group.bbox or region.bbox
+            if bbox is None and complete_group is not None and any(
+                _contains(asset.bbox, complete_group) for asset in assets
+            ):
+                preserved.update(group.line_ids)
+                continue
             if bbox is None or not any(_contains(asset.bbox, bbox) for asset in assets):
                 raise FidelityLayoutError(f"保留公式区域未完整覆盖编号 {group.number.line_id}", group.number.line_id)
     return preserved

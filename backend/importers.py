@@ -4,12 +4,15 @@ import io
 import math
 import threading
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pymupdf as fitz
 from PIL import Image, ImageOps
 
 from .layout_contract import PageSourceMetadata, PdfSourceGeometry
+
+if TYPE_CHECKING:
+    from .source_analysis import SourceAnalysis
 
 
 MAX_IMAGE_PIXELS = 40_000_000
@@ -197,6 +200,49 @@ def prepare_page(
             book_dir, {**record, "width": width, "height": height, "image_name": image_name},
         )
     return width, height, image_name, metadata
+
+
+def prepare_analyzed_page(
+    book_dir: Path, record: dict[str, Any], *, max_crops: int = 3,
+) -> tuple[int, int, str, PageSourceMetadata, "SourceAnalysis"]:
+    """Prepare and analyze once; callers pass this analysis to later stages."""
+    # Local import keeps source evidence dependent on importers, not vice versa.
+    from .source_analysis import analyze_source
+
+    width, height, image_name, metadata = prepare_page(book_dir, record)
+    analysis = analyze_source(book_dir / image_name, metadata, book_dir=book_dir, max_crops=max_crops)
+    return width, height, image_name, metadata, analysis
+
+
+def original_source_image(image_path: Path, metadata: PageSourceMetadata) -> Image.Image:
+    """Return an owned, oriented image from the original asset, never an enlargement.
+
+    PDFs are freshly rasterized from the immutable PDF at up to 288 dpi. The
+    full-page render retains the PDF's crop and rotation before any local crop;
+    normalized canonical coordinates therefore address the same visible page.
+    """
+    directory = image_path.parent
+    if metadata.source_kind == "pdf":
+        with IMAGE_LOCK, fitz.open(directory / "source.pdf") as document:
+            page = document[metadata.source_page - 1]
+            area = page.rect.width * page.rect.height
+            if area <= 0:
+                raise ImportFailure("PDF 页面尺寸无效")
+            scale = min(4., math.sqrt(MAX_RENDER_PIXELS / area))
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False)
+            return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    path = next((directory / name for name in ("source.png", "source.jpg", "source.jpeg")
+                 if (directory / name).is_file()), None)
+    if path is None:
+        raise ImportFailure("局部高清输入缺少原始图片资产")
+    with Image.open(path) as original:
+        oriented = ImageOps.exif_transpose(original)
+        if oriented.mode in {"RGBA", "LA"} or "transparency" in oriented.info:
+            rgba = oriented.convert("RGBA")
+            image = Image.new("RGB", rgba.size, "white")
+            image.paste(rgba, mask=rgba.getchannel("A"))
+            return image
+        return oriented.convert("RGB")
 
 
 def read_page_source_metadata(book_dir: Path, record: dict[str, Any]) -> PageSourceMetadata:

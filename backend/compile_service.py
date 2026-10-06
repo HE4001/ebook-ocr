@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import zipfile
@@ -12,6 +13,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pymupdf as fitz
 from PIL import Image
@@ -25,16 +27,20 @@ from .latex_diagnostics import (
 )
 from .latex_export import (
     LatexCompileError, LatexDocument, _xelatex_executable, build_latex_documents,
-    compile_pdf, copy_document_resources,
+    build_v2_latex_document, compile_pdf, preserved_source_document,
+    source_page_geometry,
 )
-from .layout_contract import PageSourceMetadata, SourceFidelityLayout
+from .layout_contract import PageSourceMetadata, SourceFidelityLayout, SourceRegionAsset
 from .models import (
     Book, BookDetail, ExportManifest, LayoutSettings, Page, PageMapEntry,
-    PdfCompileResult, RenderDiagnostic, Revision, Usage,
+    OutputSnapshot, OutputSnapshotPage, PdfCompileResult, RenderDiagnostic, Revision, Usage,
 )
 from .importers import IMAGE_LOCK, prepare_page
 from .latex_content import source_resource_name
 from .source_analysis import persist_source_region
+
+if TYPE_CHECKING:
+    from .storage import Storage
 
 
 OUTPUT_CHECKS_VERSION = "pdf-glyph-ranges-v2"
@@ -75,7 +81,8 @@ def _revision_page(revision: Revision) -> Page:
         source_page=metadata.source_page if metadata else 1, status="ready", error=None, text=revision.text,
         render_strategy=revision.render_strategy, content_revision=revision.content_revision,
         layout_revision=revision.layout_revision, generated_content_revision=revision.generated_content_revision,
-        layout_source=revision.layout_source, source_metadata=metadata, page_kind=revision.page_kind,
+        layout_source=revision.layout_source, source_metadata=metadata,
+        page_kind="content" if revision.workflow_version == 2 else revision.page_kind,
         page_side=revision.page_side, cover_fields=revision.cover_fields,
         header_segments=revision.header_segments, footer_segments=revision.footer_segments,
         usage=Usage(input_tokens=None, output_tokens=None, total_tokens=None, complete=False), attempts=0,
@@ -89,6 +96,13 @@ def _safe_segment(value: str) -> str:
 
 
 def _candidate_directory(book: Book, revision: Revision, book_dir: Path) -> Path:
+    # An immutable revision already identifies its source, page and content/layout versions.
+    return (book_dir / "render" / _safe_segment(revision.revision_id)
+            / f"s{book.output_settings_version}")
+
+
+def _legacy_candidate_directory(book: Book, revision: Revision, book_dir: Path) -> Path:
+    """Read-only location for candidates written before the short cache layout."""
     source = revision.source_metadata or (revision.layout_source.source if revision.layout_source else None)
     asset_id = source.source_file_id or source.source_id if source else "legacy"
     return (book_dir / "workflow-render" / _safe_segment(asset_id) / _safe_segment(revision.page_id)
@@ -98,16 +112,26 @@ def _candidate_directory(book: Book, revision: Revision, book_dir: Path) -> Path
 
 def _candidate_identity(book: Book, revision: Revision) -> dict:
     source = revision.source_metadata or (revision.layout_source.source if revision.layout_source else None)
-    return {
+    identity = {
         "source": source.model_dump(mode="json", exclude={"source_file_fingerprint", "image_fingerprint"}) if source else None,
         "source_version": revision.source_version, "revision_id": revision.revision_id,
         "assets": [asset.model_dump(mode="json") for asset in revision.layout_source.source_assets] if revision.layout_source else [],
         "output_settings_version": book.output_settings_version, "generator_version": GENERATOR_VERSION,
     }
+    if revision.workflow_version == 2:
+        identity.update(workflow_version=2,
+                        content_revision_id=revision.page_content.content_revision_id if revision.page_content else None,
+                        layout_revision_id=revision.page_layout.layout_revision_id if revision.page_layout else None)
+    return identity
 
 
-def _cached_candidate(book: Book, revision: Revision, book_dir: Path) -> CandidateRenderResult | None:
-    directory = _candidate_directory(book, revision, book_dir)
+def _revision_document(book: Book, revision: Revision) -> LatexDocument:
+    if revision.workflow_version == 2:
+        return build_v2_latex_document(book, revision)
+    return build_latex_documents(BookDetail(book=book, pages=[_revision_page(revision)]))[0]
+
+
+def _read_cached_candidate(book: Book, revision: Revision, directory: Path) -> CandidateRenderResult | None:
     path = directory / "result.json"
     if not path.is_file():
         return None
@@ -116,8 +140,17 @@ def _cached_candidate(book: Book, revision: Revision, book_dir: Path) -> Candida
         return None
     pdf = directory / "document.pdf" if record.get("pdf") else None
     png = directory / "page-0001.png" if record.get("png") else None
-    if (pdf is not None and not pdf.is_file()) or (png is not None and not png.is_file()):
+    if pdf is not None and not pdf.is_file():
         return None
+    if png is not None:
+        try:
+            preview_exists = png.is_file()
+        except OSError:
+            preview_exists = False
+        if not preview_exists:
+            if pdf is None:
+                return None
+            png = None
     document = record.get("document")
     if document is not None:
         document["resource_names"] = tuple(document.get("resource_names", ()))
@@ -127,6 +160,51 @@ def _cached_candidate(book: Book, revision: Revision, book_dir: Path) -> Candida
         document=LatexDocument(**document) if document else None, layout=revision.layout_source,
         source_disposition=record["source_disposition"], error=record.get("error"),
     )
+
+
+def _cached_candidate(book: Book, revision: Revision, book_dir: Path) -> CandidateRenderResult | None:
+    cached = _read_cached_candidate(book, revision, _candidate_directory(book, revision, book_dir))
+    if cached is not None and (cached.pdf_path is not None or "[WinError 206]" not in (cached.error or "")):
+        return cached
+    try:
+        cached = _read_cached_candidate(book, revision, _legacy_candidate_directory(book, revision, book_dir))
+    except OSError as error:
+        if getattr(error, "winerror", None) != 206:
+            raise
+        # An inaccessible old long path is a cache miss, never a failed new render.
+        return None
+    # Do not rebind a settled long-path failure into the new cache and suppress its first render.
+    if cached is not None and cached.pdf_path is None and "[WinError 206]" in (cached.error or ""):
+        return None
+    return cached
+
+
+def _render_source(document: LatexDocument, book_dir: Path, directory: Path) -> str:
+    """Copy render assets under short names; preserve the authoritative document."""
+    directory.mkdir(parents=True, exist_ok=True)
+    root = book_dir.resolve()
+    resources = {}
+    for name in document.resource_names:
+        relative = source_resource_name(name)
+        if relative in resources:
+            continue
+        source = (root / relative).resolve()
+        if not source.is_relative_to(root) or not source.is_file():
+            raise LatexCompileError(f"缺少源区域资源：{relative}", code="SOURCE_RESOURCE_MISSING")
+        local = f"a/{len(resources)}{source.suffix}"
+        target = directory / local
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        resources[relative] = local
+
+    def resource_reference(match: re.Match) -> str:
+        relative = source_resource_name((match[2] or match[3]).strip())
+        local = resources.get(relative)
+        return match[0] if local is None else match[1] + rf"\detokenize{{{local}}}" + match[4]
+
+    return re.sub(r"(\\includegraphics\s*(?:\[[^\]]*\])?\s*\{)"
+                  r"(?:\\detokenize\{([^{}]+)\}|([^{}]+))(\})",
+                  resource_reference, document.source)
 
 
 def load_candidate_render(book: Book, revision: Revision, book_dir: Path) -> CandidateRenderResult | None:
@@ -141,19 +219,34 @@ async def cache_candidate_render(
     if result.pdf_path is None:
         _record_candidate(book, revision, book_dir, result)
         return result
-    document = build_latex_documents(BookDetail(book=book, pages=[_revision_page(revision)]))[0]
-    if result.document is None or document.source != result.document.source:
+    if result.source_disposition == "source_page_preserved":
+        document = result.document
+    else:
+        document = _revision_document(book, revision)
+    if result.source_disposition != "source_page_preserved" and (
+        document is None or result.document is None or document.source != result.document.source
+    ):
         raise ValueError("新修订的输出内容已变化，不能复用旧候选 PDF")
     directory = _candidate_directory(book, revision, book_dir)
     directory.mkdir(parents=True, exist_ok=True)
     pdf = directory / "document.pdf"
     if result.pdf_path.resolve() != pdf.resolve():
         shutil.copyfile(result.pdf_path, pdf)
-    png = directory / "page-0001.png" if result.png_path else None
-    if png is not None and result.png_path.resolve() != png.resolve():
-        shutil.copyfile(result.png_path, png)
-    copy_document_resources(document, book_dir, directory)
-    (directory / "document.tex").write_text(document.source, encoding="utf-8", newline="")
+    if not pdf.is_file():
+        raise FileNotFoundError("已有候选 PDF 不存在，不能绑定新修订")
+    png = None
+    if result.png_path is not None:
+        try:
+            preview = directory / "page-0001.png"
+            if result.png_path.resolve() != preview.resolve():
+                shutil.copyfile(result.png_path, preview)
+            if preview.is_file():
+                png = preview
+        except OSError:
+            # An unavailable preview must not prevent binding the existing PDF.
+            png = None
+    # Rebinding an existing PDF needs only its render assets and identity record.
+    # LaTeX packaging reads source resources independently from the book directory.
     cached = replace(result, pdf_path=pdf, png_path=png, document=document, layout=revision.layout_source)
     _record_candidate(book, revision, book_dir, cached)
     return cached
@@ -186,8 +279,9 @@ def _candidate_failure(book: Book, revision: Revision, error: Exception, *, code
 async def render_candidate(
     book: Book, revision: Revision, book_dir: Path, *, run_id: str, page_id: str, compile_index: int,
 ) -> CandidateRenderResult:
-    """Render one saved revision after the workflow reserves one of four compilations."""
-    if page_id != revision.page_id or revision.book_id != book.id or not 1 <= compile_index <= 4:
+    """Render one saved revision after the coordinator reserves its compilation."""
+    limit = 3 if revision.workflow_version == 2 else 4
+    if page_id != revision.page_id or revision.book_id != book.id or not 1 <= compile_index <= limit:
         raise ValueError("候选渲染身份或编译序号不符合运行快照")
     cached = _cached_candidate(book, revision, book_dir)
     if cached is not None:
@@ -195,10 +289,10 @@ async def render_candidate(
     directory = _candidate_directory(book, revision, book_dir)
     page = _revision_page(revision)
     try:
-        document = build_latex_documents(BookDetail(book=book, pages=[page]))[0]
-        copy_document_resources(document, book_dir, directory)
+        document = _revision_document(book, revision)
+        source = _render_source(document, book_dir, directory)
         (directory / "page-0001.png").unlink(missing_ok=True)
-        pdf = await compile_pdf(document.source, directory)
+        pdf = await compile_pdf(source, directory)
         diagnostics, sizes = await asyncio.to_thread(inspect_pdf, pdf, page, document, book.id)
         diagnostics.extend(diagnose_document(document, page, directory, book_id=book.id,
                                             arrangement_position=1, output_page_start=1, output_page_end=len(sizes)))
@@ -299,11 +393,11 @@ async def preserve_source_regions(
     directory = _candidate_directory(book, revision, book_dir)
     page = _revision_page(revision)
     try:
-        document = build_latex_documents(BookDetail(book=book, pages=[page]))[0]
+        document = _revision_document(book, revision)
         if best_candidate.document is None or document.source_to_output_affine != best_candidate.document.source_to_output_affine:
             raise ValueError("源区域保留与最佳候选的输出画布不一致")
-        copy_document_resources(document, book_dir, directory)
-        (directory / "document.tex").write_text(document.source, encoding="utf-8", newline="")
+        source = _render_source(document, book_dir, directory)
+        (directory / "document.tex").write_text(source, encoding="utf-8", newline="")
         pdf = directory / "document.pdf"
         clear_boxes = _region_clear_boxes(layout, best_candidate)
         await asyncio.to_thread(_write_preserved_pdf, document, layout, book_dir, pdf, best_candidate.pdf_path, clear_boxes)
@@ -332,44 +426,81 @@ def _preservation_diagnostics(book: Book, page: Page, layout: SourceFidelityLayo
     ) for asset in layout.source_assets if asset.purpose != "figure"]
 
 
+def _write_source_page_pdf(
+    book: Book, image_path: Path, metadata: PageSourceMetadata, target: Path,
+) -> None:
+    """Retain a readable source directly; no content document or compiler is used."""
+    width, height, output_width, output_height, scale, x, y = source_page_geometry(metadata, book)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pending = target.with_suffix(".pending.pdf")
+    original_pdf = image_path.parent / "source.pdf"
+    with IMAGE_LOCK, fitz.open() as output:
+        if metadata.source_kind == "pdf" and original_pdf.is_file() and book.layout.source_fidelity_paper == "source":
+            with fitz.open(original_pdf) as source:
+                if not 1 <= metadata.source_page <= len(source):
+                    raise ValueError("冻结源 PDF 页不存在")
+                page = source[metadata.source_page - 1]
+                geometry = metadata.pdf_geometry
+                if (tuple(page.cropbox) != geometry.crop_box_bp or page.rotation != geometry.rotation):
+                    raise ValueError("原始 PDF 几何与冻结源页不一致")
+                output.insert_pdf(source, from_page=metadata.source_page - 1, to_page=metadata.source_page - 1)
+        else:
+            with Image.open(image_path) as source_image:
+                source_image.load()
+                if source_image.size != (metadata.canonical_width_px, metadata.canonical_height_px):
+                    raise ValueError("原页图像尺寸与冻结来源不一致")
+            page = output.new_page(width=output_width, height=output_height)
+            page.insert_image(fitz.Rect(x, y, x + width * scale, y + height * scale),
+                              filename=str(image_path), keep_proportion=False)
+        if len(output) != 1:
+            raise ValueError("原页保留未形成一张完整输出页")
+        output.save(pending)
+    pending.replace(target)
+
+
 async def _preserve_source_page_in_directory(
     book: Book, revision: Revision, book_dir: Path, *, image_path: Path, metadata: PageSourceMetadata,
     reason: str, directory: Path,
 ) -> CandidateRenderResult:
-    """Form a derived source-page output without changing the immutable revision cache."""
+    """Direct source-page PDF; source packaging cannot block the available PDF."""
     try:
-        # Reading the source image is required; an unreadable original yields an explicit failure.
-        with IMAGE_LOCK, Image.open(image_path) as image:
-            image.load()
+        image_name = source_resource_name(image_path.resolve().relative_to(book_dir.resolve()).as_posix())
+        pdf = directory / "document.pdf"
+        await asyncio.to_thread(_write_source_page_pdf, book, image_path, metadata, pdf)
         old = revision.layout_source
-        if old and old.source_disposition == "source_page_preserved" and any(
-            asset.purpose == "source_page" and asset.bbox == (0., 0., 1., 1.) for asset in old.source_assets
-        ):
-            layout = old
-        else:
-            asset = await asyncio.to_thread(persist_source_region, book_dir, image_path, metadata,
-                                            (0., 0., 1., 1.), None, reason, purpose="source_page")
-            layout = old.model_copy(update={
-                "source": metadata, "source_assets": [asset], "source_disposition": "source_page_preserved",
-                "disposition_reason": reason[:2_000],
-            }) if old else SourceFidelityLayout(
-                source=metadata, content_revision=revision.content_revision, layout_revision=revision.layout_revision,
-                source_assets=[asset], source_disposition="source_page_preserved", disposition_reason=reason[:2_000],
-            )
+        asset = SourceRegionAsset(asset_id=f"preserved-{revision.revision_id}", bbox=(0., 0., 1., 1.),
+                                  image_name=image_name, purpose="source_page", reason=reason[:2_000])
+        layout = old.model_copy(update={
+            "source": metadata, "source_assets": [asset], "source_disposition": "source_page_preserved",
+            "disposition_reason": reason[:2_000],
+        }) if old else SourceFidelityLayout(
+            source=metadata, content_revision=revision.content_revision, layout_revision=revision.layout_revision,
+            source_assets=[asset], source_disposition="source_page_preserved", disposition_reason=reason[:2_000],
+        )
         preserved = revision.model_copy(update={"layout_source": layout, "source_metadata": metadata,
                                                  "render_strategy": "source_fidelity"})
         page = _revision_page(preserved)
-        document = build_latex_documents(BookDetail(book=book, pages=[page]))[0]
-        copy_document_resources(document, book_dir, directory)
-        (directory / "document.tex").write_text(document.source, encoding="utf-8", newline="")
-        pdf = directory / "document.pdf"
-        await asyncio.to_thread(_write_preserved_pdf, document, layout, book_dir, pdf)
-        diagnostics, sizes = await asyncio.to_thread(inspect_pdf, pdf, page, document, book.id)
-        diagnostics.extend(_preservation_diagnostics(book, page, layout, len(sizes)))
-        png = await asyncio.to_thread(render_output_page, pdf, 1)
-        return CandidateRenderResult(pdf, png, diagnostics, {}, document, layout, "source_page_preserved")
+        diagnostics = _preservation_diagnostics(book, page, layout, 1)
+        if metadata.pdf_geometry is None:
+            diagnostics.append(diagnostic(page, book.id, 1, "SOURCE_PHYSICAL_SIZE_ASSUMED",
+                                          "原图缺少可靠物理尺寸，保留原图比例并使用项目纸宽。",
+                                          severity="info", coverage="partial", basis="project"))
     except (LatexCompileError, OSError, ValueError, fitz.FileDataError) as error:
         return _candidate_failure(book, revision, error, code="SOURCE_UNREADABLE")
+    document = None
+    try:
+        document = preserved_source_document(book, metadata, image_name)
+        (directory / "document.tex").write_text(document.source, encoding="utf-8", newline="")
+    except (OSError, ValueError) as error:
+        diagnostics.append(diagnostic(page, book.id, 1, "SOURCE_PACKAGE_FAILED",
+                                      f"原页 PDF 可用，但源码包装失败：{error}", severity="warning", coverage="partial"))
+    png = None
+    try:
+        png = await asyncio.to_thread(render_output_page, pdf, 1)
+    except (OSError, ValueError, fitz.FileDataError):
+        diagnostics.append(diagnostic(page, book.id, 1, "PREVIEW_UNAVAILABLE", "原页 PDF 可用，预览暂未生成。",
+                                      severity="info", coverage="partial"))
+    return CandidateRenderResult(pdf, png, diagnostics, {}, document, layout, "source_page_preserved")
 
 
 async def preserve_source_page(
@@ -379,7 +510,9 @@ async def preserve_source_page(
     """Retain the source; the workflow binds this output after saving its new revision."""
     if page_id != revision.page_id or metadata.source_version != revision.source_version:
         raise ValueError("源页保留身份与当前修订不一致")
-    directory = _candidate_directory(book, revision, book_dir) / "source-preservation" / _safe_segment(run_id)
+    if revision.workflow_version == 2 and (metadata.book_id, metadata.page_id) != (book.id, page_id):
+        raise ValueError("原页保留来源不属于当前冻结页面")
+    directory = _candidate_directory(book, revision, book_dir) / "src"
     return await _preserve_source_page_in_directory(
         book, revision, book_dir, image_path=image_path, metadata=metadata, reason=reason, directory=directory,
     )
@@ -486,7 +619,7 @@ async def generate_manifest_outputs(
                 image_path, metadata = await asyncio.to_thread(_manifest_source, book_dir, entry, page, book.id)
                 result = await _preserve_source_page_in_directory(
                     book, revision, book_dir, image_path=image_path, metadata=metadata,
-                    reason=fallback_reason, directory=directory / "pages" / f"{position:04d}",
+                    reason=fallback_reason, directory=directory / "p" / f"{position:04d}",
                 )
             except (LatexCompileError, OSError, ValueError, fitz.FileDataError) as error:
                 result = _candidate_failure(book, revision, error, code="SOURCE_UNREADABLE")
@@ -610,6 +743,191 @@ async def generate_manifest_outputs(
         package.writestr("result.json", json.dumps(payload, ensure_ascii=False, indent=2))
         package.writestr("README.txt", "\n".join(instructions) + "\n")
     return outputs
+
+
+class SnapshotFormatError(ValueError):
+    def __init__(self, format_name: str, issues: list[dict]):
+        self.issues = issues
+        details = "；".join(f"第{item['position'] + 1}页：{item['reason']}" for item in issues[:8])
+        super().__init__(f"{format_name} 有{len(issues)}页未形成完整结果：{details}"[:1_000])
+
+
+def _snapshot_issue(entry: OutputSnapshotPage, reason: str) -> dict:
+    return {"page_id": entry.page_id, "position": entry.position,
+            "source_filename": entry.source_filename, "source_page": entry.source_page,
+            "source_version": entry.source_version, "revision_id": entry.revision_id,
+            "reason": reason[:1_000]}
+
+
+def _snapshot_image(book_dir: Path, entry: OutputSnapshotPage) -> Path:
+    path = (book_dir / source_resource_name(entry.image_name)).resolve()
+    if not path.is_relative_to(book_dir.resolve()):
+        raise ValueError("冻结原页图像不属于本书来源目录")
+    return path
+
+
+def _snapshot_book(storage: Storage, snapshot: OutputSnapshot) -> Book:
+    book = storage.get_book(snapshot.book_id)
+    if book is None:
+        raise ValueError("冻结输出资料不存在")
+    settings = snapshot.settings_snapshot
+    return book.model_copy(update={
+        "paper_size": settings["paper_size"], "layout": LayoutSettings.model_validate(settings["layout"]),
+        "render_strategy": "source_fidelity", "output_settings_version": snapshot.output_settings_version,
+    })
+
+
+def _write_snapshot_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_suffix(path.suffix + ".pending")
+    pending.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending.replace(path)
+
+
+def _snapshot_content_payload(storage: Storage, snapshot: OutputSnapshot) -> dict:
+    pages = []
+    for entry in snapshot.pages:
+        record = entry.model_dump(mode="json")
+        revision = storage.get_snapshot_revision(snapshot.book_id, snapshot.output_snapshot_id, entry.page_id)
+        record["content"] = revision.page_content.model_dump(mode="json") if revision and revision.page_content else None
+        record["layout"] = revision.page_layout.model_dump(mode="json") if revision and revision.page_layout else None
+        pages.append(record)
+    return {"schema_version": 2, "output_snapshot": snapshot.model_dump(mode="json", exclude={"pages", "formats"}),
+            "pages": pages}
+
+
+def _snapshot_latex_package(storage: Storage, snapshot: OutputSnapshot, book: Book,
+                            book_dir: Path, target: Path) -> None:
+    """Package typed content and source references independently of PDF success."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pending = target.with_suffix(".pending.zip")
+    issues, instructions, written = [], [], set()
+    payload = _snapshot_content_payload(storage, snapshot)
+    with zipfile.ZipFile(pending, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        package.writestr("content.json", json.dumps(payload, ensure_ascii=False, indent=2))
+        for entry in snapshot.pages:
+            try:
+                if not entry.outcome.source_readable:
+                    raise ValueError("冻结来源不可读")
+                if entry.outcome.source_disposition == "page_preserved":
+                    if entry.source_metadata is None:
+                        raise ValueError("原页保留缺少冻结来源几何")
+                    if (entry.source_metadata.book_id, entry.source_metadata.page_id, entry.source_metadata.source_version) != (
+                        snapshot.book_id, entry.page_id, entry.source_version
+                    ):
+                        raise ValueError("原页包装来源与冻结页面不一致")
+                    document = preserved_source_document(book, entry.source_metadata, entry.image_name)
+                else:
+                    revision = storage.get_snapshot_revision(snapshot.book_id, snapshot.output_snapshot_id, entry.page_id)
+                    if revision is None:
+                        raise ValueError("冻结内容修订不存在")
+                    document = build_v2_latex_document(book, revision, position=entry.position)
+                filename = f"{entry.position:04d}.tex"
+                package.writestr(filename, document.source)
+                instructions.append(f"{filename}\t{entry.page_id}\t{entry.revision_id or '-'}\t{entry.outcome.source_disposition}")
+                for name in document.resource_names:
+                    relative = source_resource_name(name)
+                    if relative in written:
+                        continue
+                    resource = (book_dir / relative).resolve()
+                    if not resource.is_relative_to(book_dir.resolve()) or not resource.is_file():
+                        raise ValueError(f"冻结源码资源缺失：{relative}")
+                    package.write(resource, arcname=relative)
+                    written.add(relative)
+            except (LatexCompileError, OSError, ValueError, fitz.FileDataError) as error:
+                issues.append(_snapshot_issue(entry, str(error)))
+        package.writestr("README.txt", "\n".join((
+            "此包使用同一 OCR V2 输出快照、冻结页序、内容与布局修订。",
+            "每个编号 .tex 对应一张源页；在包目录编译，再按编号顺序合并。",
+            "内容 JSON 保留全部已识别文字和结构。源区域或原页图像保留不计为可靠文字化。",
+            "未知表格网格/合并边框采用对应表格原区域；没有编造边框或覆盖正确的其他内容。",
+            "文件\t页ID\t修订ID\t来源处置", *instructions,
+        )) + "\n")
+    if issues:
+        raise SnapshotFormatError("LaTeX 资源包", issues)
+    pending.replace(target)
+
+
+async def _snapshot_pdf(storage: Storage, snapshot: OutputSnapshot, book: Book,
+                        book_dir: Path, target: Path) -> None:
+    paths, issues = [], []
+    for entry in snapshot.pages:
+        try:
+            if not entry.outcome.source_readable:
+                raise ValueError("冻结来源不可读")
+            if entry.outcome.source_disposition == "page_preserved":
+                if entry.source_metadata is None:
+                    raise ValueError("原页保留缺少冻结来源几何")
+                if (entry.source_metadata.book_id, entry.source_metadata.page_id, entry.source_metadata.source_version) != (
+                    snapshot.book_id, entry.page_id, entry.source_version
+                ):
+                    raise ValueError("原页 PDF 来源与冻结页面不一致")
+                pdf = target.parent / "p" / f"{entry.position:04d}.pdf"
+                await asyncio.to_thread(_write_source_page_pdf, book, _snapshot_image(book_dir, entry),
+                                        entry.source_metadata, pdf)
+            else:
+                revision = storage.get_snapshot_revision(snapshot.book_id, snapshot.output_snapshot_id, entry.page_id)
+                if revision is None:
+                    raise ValueError("冻结内容修订不存在")
+                result = load_candidate_render(book, revision, book_dir)
+                if result is None or result.pdf_path is None:
+                    raise ValueError("冻结修订的渲染候选缺失；导出不会新增编译或改变页结论")
+                if result.source_disposition != entry.outcome.source_disposition:
+                    raise ValueError("渲染候选的来源处置与冻结页结论不一致")
+                pdf = result.pdf_path
+            with IMAGE_LOCK, fitz.open(pdf) as document:
+                if len(document) != 1:
+                    raise ValueError("冻结源页的候选不是一张完整输出页")
+            paths.append(pdf)
+        except (LatexCompileError, OSError, ValueError, KeyError, TypeError, fitz.FileDataError) as error:
+            issues.append(_snapshot_issue(entry, str(error)))
+    if issues:
+        raise SnapshotFormatError("PDF", issues)
+    if not paths:
+        raise ValueError("冻结输出快照没有可生成的源页")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(_merge_pdfs, paths, target)
+
+
+async def generate_snapshot_outputs(storage: Storage, snapshot: OutputSnapshot, book_dir: Path) -> OutputSnapshot:
+    """Settle JSON first and each format separately, without new compilations."""
+    current = storage.get_output_snapshot(snapshot.book_id, snapshot.output_snapshot_id)
+    if current is None:
+        raise ValueError("输出快照不存在")
+    if current.model_dump(exclude={"formats"}) != snapshot.model_dump(exclude={"formats"}):
+        raise ValueError("输出快照的来源、设置或修订已经不一致")
+    if [entry.page_id for entry in current.pages] != current.page_ids:
+        raise ValueError("冻结页序与快照逐页引用不一致")
+    relative_dir = Path("exports") / _safe_segment(current.output_snapshot_id)
+    directory = book_dir / relative_dir
+    for format_name, filename in (("json", "content.json"), ("pdf", "document.pdf"), ("latex", "latex.zip")):
+        if current.formats[format_name].status == "available":
+            continue
+        current = storage.record_output_format(current.book_id, current.output_snapshot_id,
+                                               format_name, status="generating")
+        try:
+            if format_name == "json":
+                payload = _snapshot_content_payload(storage, current)
+                await asyncio.to_thread(_write_snapshot_json, directory / filename, payload)
+            else:
+                book = _snapshot_book(storage, current)
+                if format_name == "latex":
+                    await asyncio.to_thread(_snapshot_latex_package, storage, current, book, book_dir, directory / filename)
+                else:
+                    await _snapshot_pdf(storage, current, book, book_dir, directory / filename)
+        except (LatexCompileError, OSError, ValueError, KeyError, TypeError, fitz.FileDataError) as error:
+            if isinstance(error, SnapshotFormatError):
+                try:
+                    await asyncio.to_thread(_write_snapshot_json, directory / f"{format_name}-errors.json",
+                                            {"output_snapshot_id": current.output_snapshot_id, "issues": error.issues})
+                except OSError:
+                    pass  # The format's persisted error still names the missing pages.
+            current = storage.record_output_format(current.book_id, current.output_snapshot_id,
+                                                   format_name, status="failed", error=str(error)[:1_000])
+        else:
+            current = storage.record_output_format(current.book_id, current.output_snapshot_id, format_name,
+                                                   status="available", asset=(relative_dir / filename).as_posix())
+    return current
 
 
 def _digest(value: object) -> str:
@@ -806,8 +1124,8 @@ async def compile_documents(detail: BookDetail, documents: list[LatexDocument], 
         cached = json.loads(record_path.read_text(encoding="utf-8")) if record_path.is_file() else None
         if cached is None or not pdf.is_file() or file_digest(pdf) != cached["pdf_fingerprint"]:
             try:
-                copy_document_resources(document, book_dir, unit_dir)
-                pdf = await compile_pdf(document.source, unit_dir)
+                source_text = _render_source(document, book_dir, unit_dir)
+                pdf = await compile_pdf(source_text, unit_dir)
             except LatexCompileError as error:
                 return failed_result(detail, LatexCompileError(str(error), code=error.code,
                     page_number=page.number, line_id=error.line_id), positions)

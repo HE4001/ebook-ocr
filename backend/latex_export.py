@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import shutil
@@ -15,8 +16,8 @@ from .fidelity_rendering import (
     GENERATOR_VERSION, MATHRSFS_FONT_SHAPES, FidelityLayoutError, canvas_dimensions, render_fidelity_source,
 )
 from .latex_content import escape_latex, is_latex_document, latex_image_resources, source_resource_name
-from .layout_contract import AffineTransform, RenderStrategy, SourceFidelityLayout
-from .models import BookDetail, MarginSegment, Page
+from .layout_contract import AffineTransform, PageSourceMetadata, RenderStrategy, SourceFidelityLayout
+from .models import Book, BookDetail, MarginSegment, Page, Revision, Usage
 
 
 # Keep these physical dimensions identical to frontend/src/paper.ts.
@@ -334,6 +335,70 @@ def build_latex_documents(detail: BookDetail, print_version: bool = False) -> li
                 resource_names=latex_image_resources(page.text),
             ))
     return documents
+
+
+def build_v2_latex_document(book: Book, revision: Revision, *, position: int = 1) -> LatexDocument:
+    """Render all typed content, including covers and contents, through one path."""
+    from .layout_solver import to_source_fidelity_layout
+
+    if revision.workflow_version != 2 or revision.page_content is None or revision.page_layout is None:
+        raise LatexCompileError("此内容修订尚无可用派生布局", code="LAYOUT_UNVERIFIED",
+                                page_number=revision.page_number)
+    layout = to_source_fidelity_layout(
+        revision.page_content, revision.page_layout,
+        content_revision=revision.content_revision, layout_revision=revision.layout_revision,
+    )
+    page = Page(
+        number=revision.page_number, page_id=revision.page_id, source_version=revision.source_version,
+        current_revision_id=revision.revision_id, source_id=layout.source.source_id,
+        source_page=layout.source.source_page, status="ready", error=None, text="",
+        render_strategy="source_fidelity", content_revision=revision.content_revision,
+        layout_revision=revision.layout_revision, generated_content_revision=revision.content_revision,
+        layout_source=layout, source_metadata=layout.source, page_kind="content", page_side=revision.page_side,
+        header_segments=[], footer_segments=[], attempts=0,
+        usage=Usage(input_tokens=None, output_tokens=None, total_tokens=None, complete=False),
+    )
+    return _fidelity_document(BookDetail(book=book, pages=[page]), page, position, False)
+
+
+def source_page_geometry(
+    metadata: PageSourceMetadata, book: Book,
+) -> tuple[float, float, float, float, float, float, float]:
+    """Source and output dimensions without content, fonts, or precise layout."""
+    width_mm, height_mm, default_margin, _ = PAPER_SIZES[book.paper_size]
+    if metadata.pdf_geometry is not None:
+        a, b, c, d, _, _ = metadata.canonical_to_source_affine
+        width = math.hypot(a, b) * metadata.canonical_width_px
+        height = math.hypot(c, d) * metadata.canonical_height_px
+    else:
+        width = width_mm * 72 / 25.4
+        height = width * metadata.canonical_height_px / metadata.canonical_width_px
+    if book.layout.source_fidelity_paper == "source":
+        return width, height, width, height, 1., 0., 0.
+    output_width, output_height = width_mm * 72 / 25.4, height_mm * 72 / 25.4
+    margin = (book.layout.margin_mm if book.layout.margin_mm is not None else default_margin) * 72 / 25.4
+    scale = min((output_width - 2 * margin) / width, (output_height - 2 * margin) / height)
+    if scale <= 0:
+        raise ValueError("目标纸型未留下可用原页画布")
+    return width, height, output_width, output_height, scale, (output_width - width * scale) / 2, (output_height - height * scale) / 2
+
+
+def preserved_source_document(book: Book, metadata: PageSourceMetadata, image_name: str) -> LatexDocument:
+    """A source-image package reference, independent of editable-page generation."""
+    name = source_resource_name(image_name)
+    width, height, output_width, output_height, scale, x, y = source_page_geometry(metadata, book)
+    source = "\n".join((
+        r"\documentclass{article}", r"\usepackage{geometry,graphicx}",
+        rf"\geometry{{paperwidth={_number(output_width)}bp,paperheight={_number(output_height)}bp,margin=0bp}}",
+        r"\pagestyle{empty}", r"\setlength{\unitlength}{1bp}", r"\begin{document}",
+        r"\hoffset=-1in\voffset=-1in",
+        rf"\shipout\vbox{{\offinterlineskip\hbox{{\begin{{picture}}({_number(output_width)},{_number(output_height)})",
+        rf"\put({_number(x)},{_number(output_height-y-height*scale)}){{\includegraphics[width={_number(width*scale)}bp,height={_number(height*scale)}bp]{{\detokenize{{{name}}}}}}}",
+        r"\end{picture}}}", r"\end{document}", "",
+    ))
+    return LatexDocument(source, [1], "source_fidelity",
+                         (width * scale, 0., 0., height * scale, x, y), scale,
+                         output_width, output_height, (name,))
 
 
 def copy_document_resources(document: LatexDocument, book_dir: Path, output_dir: Path) -> None:

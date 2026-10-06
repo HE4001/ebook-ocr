@@ -247,6 +247,11 @@ class SourceRegionAsset(LayoutModel):
 
 
 class SourceFidelityLayout(LayoutObservation):
+    # The old model wire remains LayoutObservation (500 / 2,000). V2 local
+    # derived rendering may reference the larger saved content collection.
+    regions: list[LayoutRegion] = Field(default_factory=list, max_length=2_000)
+    lines: list[LayoutLine] = Field(default_factory=list, max_length=10_000)
+    review_reasons: list[str] = Field(default_factory=list, max_length=500)
     source: PageSourceMetadata
     content_revision: int = Field(ge=0)
     layout_revision: int = Field(ge=0)
@@ -258,7 +263,7 @@ class SourceFidelityLayout(LayoutObservation):
     body_font_size_bp: float | None = Field(default=None, gt=0, le=200)
     body_font_family: FontFamily | None = None
     body_font_basis: EvidenceBasis | None = None
-    source_assets: list[SourceRegionAsset] = Field(default_factory=list, max_length=500)
+    source_assets: list[SourceRegionAsset] = Field(default_factory=list, max_length=2_000)
     source_disposition: Literal["transcribed", "regions_preserved", "source_page_preserved"] = "transcribed"
     disposition_reason: str | None = Field(default=None, max_length=2_000)
 
@@ -270,6 +275,97 @@ class SourceFidelityLayout(LayoutObservation):
             raise ValueError("规范画布必须记录尺寸依据")
         if (self.body_font_size_bp is not None or self.body_font_family is not None) and self.body_font_basis is None:
             raise ValueError("基准字体必须记录依据")
+        return self
+
+
+# V2 observations precede content recognition. These are evidence, not an
+# assertion that the page's visible content has already been covered.
+class CoarseRegion(LayoutModel):
+    region_id: LayoutId
+    kind: Literal["text", "body", "column", "equation", "table", "figure", "header", "footer", "title", "spanning_title", "footnote", "margin", "unknown"]
+    bbox: BBox
+    order: int = Field(ge=0)
+    column_id: str | None = None
+    basis: EvidenceBasis = "local_measurement"
+    reasons: list[str] = Field(default_factory=list, max_length=100)
+
+
+class CropMapping(LayoutModel):
+    """Affine maps normalized crop coordinates to normalized canonical page."""
+    crop_id: LayoutId
+    page_id: str
+    source_version: int = Field(ge=1)
+    bbox: BBox
+    width_px: int = Field(gt=0)
+    height_px: int = Field(gt=0)
+    crop_to_canonical_affine: AffineTransform
+    source_region_ids: list[str] = Field(default_factory=list, max_length=100)
+    reason: str = Field(default="", max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_mapping(self) -> "CropMapping":
+        a, b, c, d, _, _ = self.crop_to_canonical_affine
+        if a * d - b * c == 0:
+            raise ValueError("裁切坐标映射必须可逆")
+        return self
+
+
+class RecognitionInput(LayoutModel):
+    image_path: str
+    kind: Literal["overview", "crop"] = "overview"
+    mapping: CropMapping | None = None
+
+    @model_validator(mode="after")
+    def validate_input(self) -> "RecognitionInput":
+        if (self.kind == "crop") != (self.mapping is not None):
+            raise ValueError("高清局部图必须带映射；概览图不使用局部映射")
+        return self
+
+
+class PageLinePlacement(LayoutModel):
+    """Positions reference saved content; they carry no independent text."""
+    line_id: LayoutId
+    block_id: LayoutId
+    order: int = Field(ge=0)
+    bbox: BBox | None = None
+    baseline: NormalizedCoordinate | None = None
+    style: LineStyle = Field(default_factory=LineStyle)
+    basis: EvidenceBasis | None = None
+
+
+class PageLayout(LayoutModel):
+    schema_version: Literal[2] = 2
+    layout_revision_id: str
+    content_revision_id: str
+    page_id: str
+    source_version: int = Field(ge=1)
+    source: PageSourceMetadata
+    canvas_width_bp: float | None = Field(default=None, gt=0)
+    canvas_height_bp: float | None = Field(default=None, gt=0)
+    canvas_basis: Literal["file_metadata", "manual", "project"] | None = None
+    body_frame: BBox | None = None
+    regions: list[LayoutRegion] = Field(default_factory=list, max_length=2_000)
+    lines: list[PageLinePlacement] = Field(default_factory=list, max_length=10_000)
+    equation_groups: list[EquationGroup] = Field(default_factory=list, max_length=500)
+    body_font_size_bp: float | None = Field(default=None, gt=0, le=200)
+    body_font_family: FontFamily | None = None
+    body_font_basis: EvidenceBasis | None = None
+    source_assets: list[SourceRegionAsset] = Field(default_factory=list, max_length=2_000)
+    conclusion: Literal["faithful", "approximate", "unavailable", "unverified"] = "unverified"
+    review_reasons: list[str] = Field(default_factory=list, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "PageLayout":
+        if (self.page_id, self.source_version) != (self.source.page_id, self.source.source_version):
+            raise ValueError("布局与来源版本不一致")
+        if (self.canvas_width_bp is None) != (self.canvas_height_bp is None):
+            raise ValueError("画布宽高必须同时提供")
+        if self.canvas_width_bp is not None and self.canvas_basis is None:
+            raise ValueError("画布尺寸必须记录依据")
+        if (self.body_font_size_bp is not None or self.body_font_family is not None) and self.body_font_basis is None:
+            raise ValueError("字体必须记录依据")
+        if len({line.line_id for line in self.lines}) != len(self.lines):
+            raise ValueError("布局原行 ID 不能重复")
         return self
 
 

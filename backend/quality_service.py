@@ -7,13 +7,236 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from .compile_service import CandidateRenderResult
+from .content_contract import ContentIssue, EquationBlock, PageContent, TableBlock, TextBlock
 from .layout_contract import BBox, SourceFidelityLayout
 from .models import Assessment, Issue, Revision, StructuredPageResult
-from .source_analysis import SourceAnalysis
-from .workflow_model_contract import PageReview, RepairProposal
+from .source_analysis import SourceAnalysis, merge_region_content
+from .workflow_model_contract import ContentReview, PageReview, RepairProposal
 
 
 RULE_VERSION = "automatic-quality-v1"
+CONTENT_RULE_VERSION = "content-review-v2"
+
+
+def renew_content(content: PageContent) -> PageContent:
+    result = content.model_copy(deep=True)
+    result.content_revision_id = str(uuid4())
+    for block in result.blocks:
+        block.content_revision_id = result.content_revision_id
+    return result
+
+
+def content_block_bbox(block) -> BBox | None:
+    boxes = [block.bbox] if block.bbox is not None else []
+    boxes.extend(line.bbox for line in getattr(block, "lines", []) if line.bbox is not None)
+    boxes.extend(cell.bbox for cell in getattr(block, "cells", []) if cell.bbox is not None)
+    return (min(box[0] for box in boxes), min(box[1] for box in boxes),
+            max(box[2] for box in boxes), max(box[3] for box in boxes)) if boxes else None
+
+
+def source_coverage_content(content: PageContent, analysis: SourceAnalysis) -> PageContent:
+    """Observe the entire source, including areas outside candidate/coarse boxes."""
+    additions = []
+    boxes = [content_block_bbox(block) for block in content.blocks]
+    boxes = [box for box in boxes if box is not None]
+    for observation in analysis.uncovered_content(content):
+        box = observation.bbox
+        located = bool(boxes) and not any(outer[0] <= box[0] and outer[1] <= box[1]
+                                         and outer[2] >= box[2] and outer[3] >= box[3] for outer in boxes)
+        category = "missing_content" if located or not content.blocks else "layout"
+        if any(issue.category == category and issue.source_bbox == box and not issue.resolved for issue in content.issues):
+            continue
+        additions.append(ContentIssue(category=category, reason=observation.reason, source_bbox=box,
+                                       severity="warning" if category == "missing_content" else "info"))
+    if not additions:
+        return content
+    result = renew_content(content)
+    result.issues = [*result.issues, *additions][:2_000]
+    return result
+
+
+def reviewed_content(content: PageContent, review: ContentReview | None, *, reason: str | None = None,
+                     checked_targets: list[dict] | tuple[dict, ...] = ()) -> PageContent:
+    """A fresh revision records independent review; ink/agreement never pass it."""
+    if review is not None and review.base_content_revision_id != content.content_revision_id:
+        raise ValueError("内容复核不属于当前内容修订")
+    result = renew_content(content)
+    reliable = bool(review and review.full_page_reviewed)
+    passed_all = bool(reliable and review.content == "usable" and review.coverage == "passed" and not review.issues)
+    def overlaps(left, right):
+        return (left is not None and right is not None and max(left[0], right[0]) < min(left[2], right[2])
+                and max(left[1], right[1]) < min(left[3], right[3]))
+
+    if reliable:
+        for previous in result.issues:
+            # Local ink is a review hint, not a ground truth veto. The full-page
+            # visual review can settle it without claiming an accuracy proof.
+            checked = any(
+                (target.get("block_id") is not None and target["block_id"] == previous.block_id)
+                or (previous.source_bbox is not None and target.get("bbox") is not None
+                    and target["bbox"][0] <= previous.source_bbox[0] and target["bbox"][1] <= previous.source_bbox[1]
+                    and target["bbox"][2] >= previous.source_bbox[2] and target["bbox"][3] >= previous.source_bbox[3])
+                or (previous.category == "reading_order" and target.get("category") == "reading_order")
+                for target in checked_targets
+            )
+            remains = any(
+                (previous.block_id is not None and problem.block_id == previous.block_id)
+                or overlaps(previous.source_bbox, problem.source_bbox)
+                or (problem.category == "reading_order" and previous.category == "reading_order")
+                for problem in review.issues
+            )
+            # Only a complete independent source review of this candidate can
+            # settle a changed target. Other unresolved areas remain recorded.
+            if passed_all or previous.category == "layout" or (checked and not remains and review.content != "unavailable"):
+                previous.resolved = True
+        for problem in review.issues:
+            result.issues.append(ContentIssue(category=problem.category, reason=problem.reason,
+                                               block_id=problem.block_id, source_bbox=problem.source_bbox,
+                                               field_path=problem.field_path, severity=problem.severity))
+        if not review.issues and not passed_all:
+            result.issues.append(ContentIssue(category="unreadable_source" if review.content == "unavailable" else "missing_content",
+                                               reason="独立全页复核未确认内容及完整覆盖", source_bbox=(0., 0., 1., 1.)))
+    else:
+        result.issues.append(ContentIssue(category="invalid_structure", reason=reason or "独立内容复核未取得可用结果",
+                                           source_bbox=(0., 0., 1., 1.)))
+    for block in result.blocks:
+        problems = [problem for problem in result.issues if not problem.resolved
+                    and (problem.block_id == block.block_id or (problem.block_id is None
+                         and overlaps(content_block_bbox(block), problem.source_bbox)))
+                    and problem.category not in {"layout", "render"}]
+        if passed_all:
+            block.recognition_status = block.review_status = "usable"
+            block.unresolved_reasons = []
+        elif reliable and not problems and review.content != "unavailable":
+            block.recognition_status = block.review_status = "usable"
+            block.unresolved_reasons = []
+        elif problems:
+            block.review_status = "uncertain"
+            block.unresolved_reasons = [problem.reason for problem in problems][:100]
+        elif block.review_status != "usable":
+            block.review_status = "unverified"
+    result.issues = result.issues[:2_000]
+    return PageContent.model_validate(result.model_dump())
+
+
+def content_conclusion(content: PageContent, *, blank_reviewed: bool = False) -> str:
+    active = [issue for issue in content.issues if not issue.resolved and issue.category not in {"layout", "render"}]
+    if not content.blocks:
+        return "usable" if content.blank and blank_reviewed and not active else "unverified" if content.blank else "unavailable"
+    if active or any(block.review_status in {"uncertain", "unavailable"} for block in content.blocks):
+        return "uncertain"
+    return "usable" if all(block.review_status == "usable" for block in content.blocks) else "unverified"
+
+
+def recovery_targets(content: PageContent, analysis: SourceAnalysis) -> list[dict]:
+    """Finite located content responsibilities, separate from font/render errors."""
+    blocks = {block.block_id: block for block in content.blocks}
+    targets, used = [], set()
+    for problem in content.issues:
+        if problem.resolved or problem.category not in {"small_text", "reading_order", "truncated_response",
+                                                       "invalid_structure", "missing_content", "equation", "table"}:
+            continue
+        block = blocks.get(problem.block_id)
+        box = (content_block_bbox(block) if block is not None else None) or problem.source_bbox
+        if problem.category == "reading_order":
+            targets.append({"id": problem.issue_id, "block_id": problem.block_id, "bbox": box,
+                            "category": "reading_order", "kind": "text"})
+            continue
+        if box is None:
+            # Complete malformed/truncated pages can recover complete observed
+            # regions; unknown geometry stays unavailable, never a fake crop.
+            observations = [region for region in analysis.regions if region.kind in {
+                "text", "body", "column", "title", "spanning_title", "header", "footer", "footnote", "equation", "table", "figure"}]
+            for region in observations:
+                if region.region_id not in used:
+                    targets.append({"id": region.region_id, "block_id": None, "bbox": region.bbox,
+                                    "category": problem.category, "kind": region.kind if region.kind in {"equation", "table", "figure"} else "text",
+                                    "source_region_id": region.region_id})
+                    used.add(region.region_id)
+            continue
+        identity = block.block_id if block is not None else problem.issue_id
+        if identity in used:
+            continue
+        used.add(identity)
+        targets.append({"id": identity, "block_id": block.block_id if block is not None else None,
+                        "bbox": box, "category": problem.category,
+                        "kind": block.type if block is not None else "equation" if problem.category == "equation" else
+                        "table" if problem.category == "table" else "text",
+                        "source_region_id": block.source_region_id if block is not None else None})
+    return targets
+
+
+def local_content_candidate(base: PageContent, local: PageContent, target: dict, *, old_value=None) -> PageContent:
+    """Only an explicitly bound source target can be replaced before review."""
+    selected = local.model_copy(deep=True)
+    box = target["bbox"]
+    selected.blocks = [block for block in selected.blocks if (position := content_block_bbox(block)) is not None
+                       and max(box[0], position[0]) < min(box[2], position[2])
+                       and max(box[1], position[1]) < min(box[3], position[3])]
+    if not selected.blocks:
+        raise ValueError("局部重读未取得能对应目标源区域的有效内容")
+    working = base.model_copy(deep=True)
+    if target.get("block_id"):
+        previous = next((block for block in working.blocks if block.block_id == target["block_id"]), None)
+        if previous is None or old_value is None or previous.model_dump(exclude={"content_revision_id"}) != old_value.model_dump(exclude={"content_revision_id"}):
+            raise ValueError("局部恢复旧值或内容修订已变化，不能替换当前稿")
+        positions = [content_block_bbox(block) for block in selected.blocks]
+        union = (min(value[0] for value in positions), min(value[1] for value in positions),
+                 max(value[2] for value in positions), max(value[3] for value in positions))
+        if not (union[0] <= box[0] + .01 and union[1] <= box[1] + .01
+                and union[2] >= box[2] - .01 and union[3] >= box[3] - .01):
+            raise ValueError("局部候选没有覆盖完整绑定块，保留旧值")
+        replaced_id = selected.blocks[0].block_id
+        selected.blocks[0].block_id = previous.block_id
+        for problem in selected.issues:
+            if problem.block_id == replaced_id:
+                problem.block_id = previous.block_id
+        working.blocks = [block for block in working.blocks if block.block_id != previous.block_id]
+    working.blank = False
+    merged = merge_region_content(working, selected, target_bbox=box)
+    if base.blank:
+        merged.page_kind = local.page_kind if local.page_kind != "blank" else "content"
+    return merged
+
+
+def content_improves(previous: PageContent, candidate: PageContent, *, blank_reviewed: bool = False) -> bool:
+    """Accept independent review improvement, never mere repeated text agreement."""
+    def keys(content):
+        return {(item.category, item.block_id, item.source_bbox) for item in content.issues
+                if not item.resolved and item.category not in {"layout", "render"}}
+    old, new = keys(previous), keys(candidate)
+    if not new <= old:
+        return False
+    severity = {"info": 0, "warning": 1, "error": 2}
+    old_severity = {}
+    for item in previous.issues:
+        if not item.resolved:
+            key = item.category, item.block_id, item.source_bbox
+            old_severity[key] = max(old_severity.get(key, -1), severity[item.severity])
+    if any(severity[item.severity] > old_severity.get((item.category, item.block_id, item.source_bbox), -1)
+           for item in candidate.issues if not item.resolved and item.category not in {"layout", "render"}):
+        return False
+    before, after = {block.block_id: block for block in previous.blocks}, {block.block_id: block for block in candidate.blocks}
+    if not before.keys() <= after.keys():
+        return False
+    status_fields = {"content_revision_id", "recognition_status", "review_status", "unresolved_reasons"}
+    # An unrelated usable block cannot change as a side effect. A retained
+    # target can improve, and an independently reviewed new located block can
+    # improve partial recovery while the remaining page issue stays uncertain.
+    for identity, block in before.items():
+        if block.review_status == "usable" and not any(item.block_id == identity and not item.resolved for item in previous.issues):
+            if block.model_dump(exclude=status_fields) != after[identity].model_dump(exclude=status_fields):
+                return False
+    gained = any(block.review_status == "usable" and content_block_bbox(block) is not None
+                 for identity, block in after.items() if identity not in before)
+    target_improved = any(after[identity].review_status == "usable" and block.review_status != "usable"
+                          for identity, block in before.items())
+    rank = {"usable": 0, "uncertain": 1, "unverified": 2, "unavailable": 3}
+    return (gained or target_improved or len(new) < len(old)
+            or rank[content_conclusion(candidate, blank_reviewed=blank_reviewed)]
+            < rank[content_conclusion(previous, blank_reviewed=blank_reviewed)])
+
+
 _PROGRAM_COMMAND = re.compile(
     r"\\(?:documentclass|usepackage|RequirePackage|PassOptionsTo\w+|input|include|includegraphics|"
     r"openin|openout|read\d*|write\d*|immediate|special|directlua|luaexec|latelua|catcode|csname|scantokens|"

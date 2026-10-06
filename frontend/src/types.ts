@@ -235,6 +235,16 @@ export type SourceFile = {
   position: number
   parent_id: string | null
 }
+export type SourcePageSummary = {
+  page_id: string
+  source_version: number
+  number: number
+  source_id: string
+  source_page: number
+  source_filename: string
+  width: number
+  height: number
+}
 
 export type BookDetail = { book: Book; pages: Page[]; files: SourceFile[] }
 export type QualityStatus = 'passed' | 'needs_review' | 'unverified' | 'compile_failed'
@@ -299,16 +309,26 @@ export type SourceRegionAsset = {
   purpose: 'figure' | 'uncertain_content' | 'source_page'
   reason: string
 }
-export type WorkflowStage = 'prepare' | 'recognize' | 'layout' | 'render' | 'verify' | 'repair' | 'finalize'
-export type ExecutionStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
-export type RunStatus = 'queued' | 'running' | 'pausing' | 'paused' | 'succeeded' | 'failed' | 'interrupted'
+export type WorkflowStage = 'prepare' | 'recognize' | 'review' | 'recover' | 'layout' | 'render' | 'export' | 'verify' | 'repair' | 'finalize'
+export type ExecutionStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'finished'
+export type RunStatus = 'queued' | 'running' | 'pausing' | 'paused' | 'succeeded' | 'failed' | 'interrupted' | 'finished'
 export type ResultStatus = 'auto_passed' | 'completed_with_issues' | 'failed'
 export type CheckStatus = 'passed' | 'uncertain' | 'unverified' | 'failed'
-export type RunPolicy = { replace_page_ids: string[] }
+export type RunPolicy = {
+  replace_page_ids: string[]
+  requests_per_page?: number
+  page_request_limit?: number
+  temporary_retry_limit?: number
+  local_recovery_limit?: number
+  compile_limit?: number
+  response_body_limit_bytes?: number
+}
 export type RunCreate = {
   page_ids?: string[]
   pages?: number[]
-  expected_arrangement_revision: number
+  expected_arrangement_revision?: number
+  selection_revision?: number
+  continuation_run_id?: string
   policy?: RunPolicy
   request_limit?: number
   client_request_id: string
@@ -335,6 +355,9 @@ export type PageTask = {
   review_count: number
   repair_count: number
   compile_count: number
+  recovery_round_count: number
+  outcome: PageOutcome | null
+  errors: WorkflowError[]
 }
 export type RunCounts = {
   total: number
@@ -342,8 +365,14 @@ export type RunCounts = {
   auto_passed: number
   completed_with_issues: number
   failed: number
+  editable: number
+  regions_preserved: number
+  page_preserved: number
+  no_result: number
+  protected_existing: number
 }
 export type Run = {
+  workflow_version: 1 | 2
   run_id: string
   book_id: string
   arrangement_revision: number
@@ -361,8 +390,15 @@ export type Run = {
   counts: RunCounts
   tasks: PageTask[]
   export_manifest_id: string | null
+  selection_revision: number | null
+  continuation_run_id: string | null
+  output_snapshot_id: string | null
+  continuation_outputs_needed: boolean
 }
 export type Revision = {
+  workflow_version: 1 | 2
+  page_content: PageContent | null
+  page_layout: PageLayout | null
   revision_id: string
   parent_revision_id: string | null
   book_id: string
@@ -418,12 +454,20 @@ export type Attempt = {
   stage: WorkflowStage
   ordinal: number
   retry: boolean
-  state: 'reserved' | 'succeeded' | 'failed' | 'unknown'
+  state: 'reserved' | 'succeeded' | 'failed' | 'unknown' | 'cancelled'
   usage: Usage
   provider_request_id: string | null
   error: string | null
   created_at: string
   finished_at: string | null
+  purpose: 'basic_recognition' | 'basic_review' | 'local_recognition' | 'recovery' | 'recovery_review' | 'retry' | null
+  reservation_key: string | null
+  recovery_round: number | null
+  block_ids: string[]
+  sent_at: string | null
+  settled_at: string | null
+  retryable: boolean
+  retry_of_attempt_id?: string | null
 }
 export type ExportManifestPage = {
   page_id: string
@@ -467,4 +511,199 @@ export type PageResult = {
   coverage: CheckStatus
   source_disposition: SourceDisposition | null
   issues: Issue[]
+}
+
+export type SelectionDraft = {
+  book_id: string
+  selection_revision: number
+  page_ids: string[]
+  source_versions: Record<string, number>
+  valid: boolean
+}
+export type SelectionUpdate = {
+  page_ids: string[]
+  expected_selection_revision: number
+  source_versions: Record<string, number>
+}
+export type ContentConclusion = 'usable' | 'uncertain' | 'unavailable' | 'unverified'
+export type LayoutConclusion = 'faithful' | 'approximate' | 'unavailable' | 'unverified'
+export type ContentRole = 'body' | 'header' | 'footer' | 'title' | 'footnote' | 'caption' | 'page_number' | 'other'
+export type RecoveryReason = 'small_text' | 'reading_order' | 'truncated_response' | 'invalid_structure' | 'missing_content' | 'equation' | 'table' | 'unreadable_source' | 'budget' | 'service_configuration' | 'temporary_service' | 'unknown_consumption' | 'layout' | 'render'
+export type InlineSpan = { kind: 'text'; text: string; bold: boolean; italic: boolean; font_family: FontFamily | null } | { kind: 'math'; text: string }
+export type VisualLine = { line_id: string; spans: InlineSpan[]; bbox: BBox | null; paragraph_start: boolean }
+export type EquationContentLine = { line_id: string; latex: string; number: string | null; alignment: 'left' | 'center' | 'right' | 'aligned' | 'unknown'; bbox: BBox | null }
+export type BlockBase = {
+  block_id: string
+  role: ContentRole
+  bbox: BBox | null
+  source_region_id: string | null
+  crop_id: string | null
+  content_revision_id: string
+  response_id: string | null
+  response_index: number | null
+  recognition_status: ContentConclusion
+  review_status: ContentConclusion
+  unresolved_reasons: string[]
+  uncertainty: string[]
+}
+export type TextBlock = BlockBase & { type: 'text'; lines: VisualLine[] }
+export type EquationBlock = BlockBase & { type: 'equation'; lines: EquationContentLine[] }
+export type TableCell = { cell_id: string; row: number; column: number; row_span: number; column_span: number; lines: VisualLine[]; bbox: BBox | null; preserved: boolean; reason: string | null }
+export type TableBlock = BlockBase & { type: 'table'; rows: number; columns: number; cells: TableCell[] }
+export type FigureBlock = BlockBase & { type: 'figure'; description: string | null; caption_block_ids: string[] }
+export type ContentBlock = TextBlock | EquationBlock | TableBlock | FigureBlock
+export type ContentIssue = {
+  issue_id: string
+  category: RecoveryReason
+  reason: string
+  block_id: string | null
+  source_bbox: BBox | null
+  response_id: string | null
+  response_index: number | null
+  field_path: string | null
+  severity: 'error' | 'warning' | 'info'
+  resolved: boolean
+}
+export type PageContent = {
+  schema_version: 2
+  content_revision_id: string
+  book_id: string
+  page_id: string
+  source_version: number
+  page_kind: 'content' | 'front_cover' | 'back_cover' | 'contents' | 'blank' | 'other'
+  blank: boolean
+  blocks: ContentBlock[]
+  issues: ContentIssue[]
+  response_ids: string[]
+}
+export type BlockParseFailure = { response_index: number | null; field_path: string; reason: string; source_bbox: BBox | null; category: RecoveryReason }
+export type ContentParseResult = { content: PageContent | null; failures: BlockParseFailure[]; json_complete: boolean }
+export type CoarseRegion = {
+  region_id: string
+  kind: 'text' | 'body' | 'column' | 'equation' | 'table' | 'figure' | 'header' | 'footer' | 'title' | 'spanning_title' | 'footnote' | 'margin' | 'unknown'
+  bbox: BBox
+  order: number
+  column_id: string | null
+  basis: EvidenceBasis
+  reasons: string[]
+}
+export type CropMapping = {
+  crop_id: string
+  page_id: string
+  source_version: number
+  bbox: BBox
+  width_px: number
+  height_px: number
+  crop_to_canonical_affine: AffineTransform // Normalized crop to normalized canonical page.
+  source_region_ids: string[]
+  reason: string
+}
+export type RecognitionInput = { image_path: string; kind: 'overview' | 'crop'; mapping: CropMapping | null }
+export type PageLinePlacement = { line_id: string; block_id: string; order: number; bbox: BBox | null; baseline: number | null; style: LineStyle; basis: EvidenceBasis | null }
+export type PageLayout = {
+  schema_version: 2
+  layout_revision_id: string
+  content_revision_id: string
+  page_id: string
+  source_version: number
+  source: PageSourceMetadata
+  canvas_width_bp: number | null
+  canvas_height_bp: number | null
+  canvas_basis: 'file_metadata' | 'manual' | 'project' | null
+  body_frame: BBox | null
+  regions: LayoutRegion[]
+  lines: PageLinePlacement[]
+  equation_groups: EquationGroup[]
+  body_font_size_bp: number | null
+  body_font_family: FontFamily | null
+  body_font_basis: EvidenceBasis | null
+  source_assets: SourceRegionAsset[]
+  conclusion: LayoutConclusion
+  review_reasons: string[]
+}
+export type WorkflowError = {
+  stage: WorkflowStage
+  category: RecoveryReason
+  message: string
+  field_path: string | null
+  attempt_id: string | null
+  block_id: string | null
+  source_bbox: BBox | null
+  phase: 'initial' | 'recovery' | 'output'
+}
+export type PageOutcome = {
+  page_id: string
+  source_version: number
+  content: ContentConclusion
+  layout: LayoutConclusion
+  source_disposition: 'transcribed' | 'regions_preserved' | 'page_preserved'
+  content_revision_id: string | null
+  layout_revision_id: string | null
+  adopted_revision_id: string | null
+  source_readable: boolean
+  protected_existing: boolean
+  errors: WorkflowError[]
+}
+export type PageOutcomeSummary = { page_id: string; page_number: number; position: number; stage: WorkflowStage; state: ExecutionStatus; outcome: PageOutcome | null }
+export type RecognitionResponse = {
+  attempt_id: string
+  run_id: string
+  page_id: string
+  body_asset: string | null
+  body_storage: 'saved' | 'failed'
+  body_bytes: number
+  body_truncated: boolean
+  completion_status: 'complete' | 'truncated' | 'incomplete' | 'unknown'
+  usage: Usage
+  provider_request_id: string | null
+  parse_errors: WorkflowError[]
+  storage_error: string | null
+  created_at: string
+}
+export type OutputFormat = { status: 'pending' | 'generating' | 'available' | 'failed'; asset: string | null; error: string | null }
+export type OutputSnapshotPage = {
+  page_id: string
+  position: number
+  source_version: number
+  source_file_id: string
+  source_page: number
+  source_filename: string
+  image_name: string
+  source_metadata: PageSourceMetadata | null
+  revision_id: string | null
+  content_revision_id: string | null
+  layout_revision_id: string | null
+  outcome: PageOutcome
+}
+export type OutputSnapshot = {
+  workflow_version: 2
+  output_snapshot_id: string
+  book_id: string
+  run_id: string
+  selection_revision: number
+  page_ids: string[]
+  output_settings_version: number
+  settings_snapshot: Record<string, unknown>
+  generator_version: string
+  pages: OutputSnapshotPage[]
+  formats: Record<'json' | 'pdf' | 'latex', OutputFormat>
+  created_at: string
+}
+export type RunSummary = {
+  workflow_version: 1 | 2
+  run_id: string
+  book_id: string
+  selection_revision: number | null
+  status: RunStatus
+  counts: RunCounts
+  active_stages: Record<string, number>
+  updated_at: string
+  error: string | null
+  recent_errors: WorkflowError[]
+  output_snapshot_id: string | null
+  formats: Record<string, OutputFormat>
+  request_limit: number
+  request_count: number
+  usage: Usage
+  model_wait_started_at: string | null
 }

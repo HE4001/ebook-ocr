@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .layout_contract import (
     BBox, EquationGroup, LayoutId, LayoutLine, LayoutRegion, NormalizedCoordinate,
 )
+from .content_contract import ContentConclusion
 
 
 class WorkflowModel(BaseModel):
@@ -134,3 +135,56 @@ RepairOperation = ReplaceLine | InsertRegion | UpdateGeometry | UpdateEquationGr
 class RepairProposal(WorkflowModel):
     base_revision_id: str = Field(min_length=1, max_length=128)
     operations: list[RepairOperation] = Field(max_length=40)
+
+
+class ContentReviewIssue(WorkflowModel):
+    category: Literal["small_text", "reading_order", "invalid_structure", "missing_content",
+                      "equation", "table", "unreadable_source"]
+    severity: Literal["warning", "error"]
+    block_id: str | None = Field(default=None, max_length=128)
+    source_bbox: BBox | None = None
+    field_path: str | None = Field(default=None, max_length=300)
+    reason: str = Field(min_length=1, max_length=2_000)
+    repairable: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def require_source_evidence(self) -> "ContentReviewIssue":
+        if self.block_id is None and self.source_bbox is None:
+            raise ValueError("无候选块的复核问题必须提供源页证据框")
+        if self.category == "missing_content" and self.source_bbox is None:
+            raise ValueError("遗漏内容必须提供源页证据框")
+        return self
+
+
+class ContentReview(WorkflowModel):
+    schema_version: Literal[2] = 2
+    base_content_revision_id: str = Field(min_length=1, max_length=128)
+    content: ContentConclusion
+    coverage: Literal["passed", "uncertain", "failed"]
+    full_page_reviewed: bool = Field(strict=True)
+    issues: list[ContentReviewIssue] = Field(max_length=200)
+
+    @model_validator(mode="after")
+    def prevent_unsupported_pass(self) -> "ContentReview":
+        if not self.full_page_reviewed or self.issues:
+            if self.content == "usable":
+                self.content = "uncertain"
+            if self.coverage == "passed":
+                self.coverage = "uncertain"
+        return self
+
+
+class ReadingOrder(WorkflowModel):
+    schema_version: Literal[2] = 2
+    base_content_revision_id: str = Field(min_length=1, max_length=128)
+    block_ids: list[str] = Field(max_length=2_000)
+    status: Literal["observed", "uncertain"]
+    reasons: list[str] = Field(max_length=100)
+
+    @model_validator(mode="after")
+    def require_unique_ids(self) -> "ReadingOrder":
+        if len(self.block_ids) != len(set(self.block_ids)):
+            raise ValueError("阅读顺序不能重复引用内容块")
+        if self.reasons:
+            self.status = "uncertain"
+        return self

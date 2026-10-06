@@ -1,6 +1,15 @@
-import type { Arrangement, Book, BookDetail, ExportManifest, ExportManifestCreate, Issue, LayoutCalibrationUpdate, LayoutSettings, Page, PageDraft, PageResult, PaperSize, PdfCompileResult, RenderStrategy, Run, RunCreate, Settings } from './types'
+import type { Arrangement, Book, BookDetail, ExportManifest, ExportManifestCreate, Issue, LayoutCalibrationUpdate, LayoutSettings, OutputSnapshot, Page, PageContent, PageDraft, PageOutcomeSummary, PageResult, PaperSize, PdfCompileResult, RenderStrategy, Run, RunCreate, RunSummary, SelectionDraft, SelectionUpdate, Settings, SourcePageSummary } from './types'
+
+export type ImportError = { filename: string; reason: string }
+export type ImportResult = Arrangement & { import_errors?: ImportError[] }
+export type SourcePageList = { items: SourcePageSummary[]; total: number; offset: number; limit: number }
+export type OutputPageError = { page_id: string; position: number; source_filename: string; source_page: number; source_version: number; revision_id: string | null; reason: string }
+export type OutputErrors = { pdf: OutputPageError[]; latex: OutputPageError[] }
 
 const API_PREFIX = '/api'
+export class ApiError extends Error {
+  constructor(message: string, public readonly status?: number) { super(message); this.name = 'ApiError' }
+}
 
 function detailMessage(value: unknown, fallback: string): string {
   if (typeof value === 'object' && value && 'detail' in value) {
@@ -17,7 +26,7 @@ async function request<T>(path: string, init?: RequestInit, responseFormat: 'jso
     response = await fetch(requestPath, init)
   } catch (error) {
     if (init?.signal?.aborted) throw error
-    throw new Error(`无法连接本地服务（请求 ${requestPath}），请确认后端已启动。`)
+    throw new ApiError('无法连接本地服务，请确认后端已启动。')
   }
 
   if (!response.ok) {
@@ -29,7 +38,7 @@ async function request<T>(path: string, init?: RequestInit, responseFormat: 'jso
     }
     const detail = detailMessage(body, '')
     const suffix = detail ? `：${detail}` : ''
-    throw new Error(`本地接口 ${requestPath} 请求失败（HTTP ${response.status}）${suffix}`)
+    throw new ApiError(`本地请求失败（HTTP ${response.status}）${suffix}`, response.status)
   }
   if (response.status === 204) return undefined as T
   if (responseFormat === 'response') return response as T
@@ -46,7 +55,7 @@ export const api = {
   uploadFiles: (id: string, files: File[]) => {
     const form = new FormData()
     files.forEach((file) => form.append('files', file))
-    return request<Arrangement>(`/books/${encodeURIComponent(id)}/files`, { method: 'POST', body: form })
+    return request<ImportResult>(`/books/${encodeURIComponent(id)}/files`, { method: 'POST', body: form })
   },
   confirmUpload: (id: string) => request<Arrangement>(`/books/${encodeURIComponent(id)}/confirm-upload`, { method: 'POST' }),
   getArrangement: (id: string) => request<Arrangement>(`/books/${encodeURIComponent(id)}/arrangement`),
@@ -59,6 +68,20 @@ export const api = {
   pagePreviewUrl: (id: string, number: number) => `${API_PREFIX}/books/${encodeURIComponent(id)}/pages/${number}/preview`,
   compiledPageUrl: (pdfUrl: string, outputPage: number) => pdfUrl.replace(/\.pdf$/, `/pages/${outputPage}.png`),
   getBook: (id: string) => request<BookDetail>(`/books/${encodeURIComponent(id)}`),
+  getOverview: (id: string, signal?: AbortSignal) => request<BookDetail>(`/books/${encodeURIComponent(id)}/overview`, { signal }),
+  getSelection: (id: string, signal?: AbortSignal) => request<SelectionDraft>(`/books/${encodeURIComponent(id)}/selection`, { signal }),
+  saveSelection: (id: string, value: SelectionUpdate) => request<SelectionDraft>(`/books/${encodeURIComponent(id)}/selection`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value),
+  }),
+  getSourcePages: (id: string, offset = 0, limit = 100, sourceId?: string, signal?: AbortSignal) => request<SourcePageList>(`/books/${encodeURIComponent(id)}/source-pages?offset=${offset}&limit=${limit}${sourceId ? `&source_id=${encodeURIComponent(sourceId)}` : ''}`, { signal }),
+  sourcePreviewUrl: (id: string, pageId: string, runId?: string, sourceVersion?: number) => `${API_PREFIX}/books/${encodeURIComponent(id)}/source-pages/${encodeURIComponent(pageId)}/preview?${new URLSearchParams({ ...(runId ? { run_id: runId } : {}), ...(sourceVersion !== undefined ? { source_version: String(sourceVersion) } : {}) })}`,
+  listRunSummaries: (id: string, signal?: AbortSignal) => request<RunSummary[]>(`/books/${encodeURIComponent(id)}/runs/summaries`, { signal }),
+  getRunSummary: (id: string, runId: string, signal?: AbortSignal) => request<RunSummary>(`/books/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/summary`, { signal }),
+  getRunOutcomes: (id: string, runId: string, offset = 0, limit = 50, signal?: AbortSignal) => request<PageOutcomeSummary[]>(`/books/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/outcomes?offset=${offset}&limit=${limit}`, { signal }),
+  getRunContent: (id: string, runId: string, pageId: string, signal?: AbortSignal) => request<PageContent | null>(`/books/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/pages/${encodeURIComponent(pageId)}/content`, { signal }),
+  getOutputSnapshot: (id: string, snapshotId: string, signal?: AbortSignal) => request<OutputSnapshot>(`/books/${encodeURIComponent(id)}/output-snapshots/${encodeURIComponent(snapshotId)}`, { signal }),
+  getOutputErrors: (id: string, snapshotId: string, signal?: AbortSignal) => request<OutputErrors>(`/books/${encodeURIComponent(id)}/output-snapshots/${encodeURIComponent(snapshotId)}/errors`, { signal }),
+  snapshotDownloadUrl: (id: string, snapshotId: string, format: 'json' | 'pdf' | 'latex') => `${API_PREFIX}/books/${encodeURIComponent(id)}/output-snapshots/${encodeURIComponent(snapshotId)}/${format}`,
   createRun: (id: string, run: RunCreate) => request<Run>(`/books/${encodeURIComponent(id)}/runs`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(run),
   }),
