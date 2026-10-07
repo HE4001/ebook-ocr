@@ -190,6 +190,8 @@ export type PageSourceMetadata = {
 }
 
 export type SourceFidelityLayout = LayoutObservation & {
+  recognition_scope?: 'printed_original_only' | 'legacy_all_visible'
+  unresolved_notices?: string[]
   source: PageSourceMetadata
   content_revision: number
   layout_revision: number
@@ -302,6 +304,8 @@ export type Notice = { kind: 'success' | 'error' | 'info'; text: string } | null
 
 export type SourceDisposition = 'transcribed' | 'regions_preserved' | 'source_page_preserved'
 export type SourceRegionAsset = {
+  source_layer?: 'printed' | 'annotation' | 'mixed' | 'unknown'
+  cleanliness_verified?: boolean
   asset_id: string
   region_id: string | null
   bbox: BBox
@@ -360,6 +364,7 @@ export type PageTask = {
   errors: WorkflowError[]
 }
 export type RunCounts = {
+  partial_content?: number
   total: number
   completed: number
   auto_passed: number
@@ -372,6 +377,7 @@ export type RunCounts = {
   protected_existing: number
 }
 export type Run = {
+  recognition_scope?: 'printed_original_only' | 'legacy_all_visible'
   workflow_version: 1 | 2
   run_id: string
   book_id: string
@@ -565,6 +571,11 @@ export type ContentIssue = {
   resolved: boolean
 }
 export type PageContent = {
+  recognition_scope: 'printed_original_only' | 'legacy_all_visible'
+  regions: { region_id: string; layer: 'printed' | 'annotation' | 'mixed' | 'decoration' | 'noise' | 'unknown' }[]
+  coverage_reviewed: boolean
+  coverage_observations: { scope_disposition: string }[]
+  unresolved_spans: { region_id: string; source_bbox: BBox | null; reason: string }[]
   schema_version: 2
   content_revision_id: string
   book_id: string
@@ -599,8 +610,9 @@ export type CropMapping = {
   reason: string
 }
 export type RecognitionInput = { image_path: string; kind: 'overview' | 'crop'; mapping: CropMapping | null }
-export type PageLinePlacement = { line_id: string; block_id: string; order: number; bbox: BBox | null; baseline: number | null; style: LineStyle; basis: EvidenceBasis | null }
+export type PageLinePlacement = { match_status?: 'matched' | 'unknown'; line_id: string; block_id: string; order: number; bbox: BBox | null; baseline: number | null; style: LineStyle; basis: EvidenceBasis | null }
 export type PageLayout = {
+  recognition_scope?: 'printed_original_only' | 'legacy_all_visible'
   schema_version: 2
   layout_revision_id: string
   content_revision_id: string
@@ -690,6 +702,7 @@ export type OutputSnapshot = {
   created_at: string
 }
 export type RunSummary = {
+  recognition_scope?: 'printed_original_only' | 'legacy_all_visible'
   workflow_version: 1 | 2
   run_id: string
   book_id: string

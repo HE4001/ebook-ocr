@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .layout_contract import (
     BBox, EquationGroup, LayoutId, LayoutLine, LayoutRegion, NormalizedCoordinate,
 )
-from .content_contract import ContentConclusion
+from .content_contract import ContentConclusion, PageRegion, ScopeDisposition
 
 
 class WorkflowModel(BaseModel):
@@ -136,6 +136,38 @@ class RepairProposal(WorkflowModel):
     base_revision_id: str = Field(min_length=1, max_length=128)
     operations: list[RepairOperation] = Field(max_length=40)
 
+    @model_validator(mode="after")
+    def reset_model_matching(self) -> "RepairProposal":
+        for operation in self.operations:
+            if isinstance(operation, InsertRegion):
+                lines = operation.lines
+            elif isinstance(operation, DeleteDuplicateRegion):
+                lines = operation.old_lines
+            else:
+                continue
+            for line in lines:
+                line.match_status = "unknown"
+        return self
+
+
+class RegionPlan(WorkflowModel):
+    schema_version: Literal[2] = 2
+    regions: list[PageRegion] = Field(max_length=2_000)
+
+
+class RegionVerdict(WorkflowModel):
+    cleanliness_verified: bool = False
+    region_id: str = Field(min_length=1, max_length=128)
+    candidate_id: str = Field(min_length=1, max_length=128)
+    content: ContentConclusion
+    coverage: Literal["passed", "uncertain", "failed"]
+
+
+class ObservationDisposition(WorkflowModel):
+    observation_id: str = Field(min_length=1, max_length=128)
+    scope_disposition: ScopeDisposition
+    mapped_region_ids: list[str] = Field(max_length=100)
+
 
 class ContentReviewIssue(WorkflowModel):
     category: Literal["small_text", "reading_order", "invalid_structure", "missing_content",
@@ -146,6 +178,8 @@ class ContentReviewIssue(WorkflowModel):
     field_path: str | None = Field(default=None, max_length=300)
     reason: str = Field(min_length=1, max_length=2_000)
     repairable: bool = Field(strict=True)
+    region_id: str | None = None
+    stable_target_id: str | None = None
 
     @model_validator(mode="after")
     def require_source_evidence(self) -> "ContentReviewIssue":
@@ -159,6 +193,10 @@ class ContentReviewIssue(WorkflowModel):
 class ContentReview(WorkflowModel):
     schema_version: Literal[2] = 2
     base_content_revision_id: str = Field(min_length=1, max_length=128)
+    discovered_regions: list[PageRegion] = Field(default_factory=list, max_length=2_000)
+    checked_region_ids: list[str] = Field(default_factory=list, max_length=2_000)
+    region_verdicts: list[RegionVerdict] = Field(default_factory=list, max_length=2_000)
+    observation_dispositions: list[ObservationDisposition] = Field(default_factory=list, max_length=2_000)
     content: ContentConclusion
     coverage: Literal["passed", "uncertain", "failed"]
     full_page_reviewed: bool = Field(strict=True)

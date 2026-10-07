@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import re
+from hashlib import sha256
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from .compile_service import CandidateRenderResult
-from .content_contract import ContentIssue, EquationBlock, PageContent, TableBlock, TextBlock
+from .content_contract import CoverageObservation, ContentIssue, EquationBlock, PageContent, TableBlock, TextBlock
 from .layout_contract import BBox, SourceFidelityLayout
 from .models import Assessment, Issue, Revision, StructuredPageResult
 from .source_analysis import SourceAnalysis, merge_region_content
@@ -36,6 +37,16 @@ def content_block_bbox(block) -> BBox | None:
 
 def source_coverage_content(content: PageContent, analysis: SourceAnalysis) -> PageContent:
     """Observe the entire source, including areas outside candidate/coarse boxes."""
+    if content.recognition_scope == "printed_original_only":
+        result = renew_content(content)
+        known = {item.observation_id for item in result.coverage_observations}
+        for index, observation in enumerate(analysis.uncovered_content(content)):
+            identity = f"{content.source_version}-ink-" + sha256(repr(observation.bbox).encode()).hexdigest()[:20]
+            if identity not in known:
+                result.coverage_observations.append(CoverageObservation(
+                    observation_id=identity, source_bbox=observation.bbox, origin="local_ink",
+                    scope_disposition="pending", mapped_region_ids=[]))
+        return result
     additions = []
     boxes = [content_block_bbox(block) for block in content.blocks]
     boxes = [box for box in boxes if box is not None]
@@ -61,6 +72,54 @@ def reviewed_content(content: PageContent, review: ContentReview | None, *, reas
     if review is not None and review.base_content_revision_id != content.content_revision_id:
         raise ValueError("内容复核不属于当前内容修订")
     result = renew_content(content)
+    if content.recognition_scope == "printed_original_only":
+        result.coverage_reviewed = bool(review and review.full_page_reviewed)
+        if review:
+            result.regions.extend(review.discovered_regions)
+            if review.discovered_regions:
+                result.blank = False
+                if result.page_kind == "blank":
+                    result.page_kind = "content"
+        verdicts = {item.region_id: item for item in review.region_verdicts
+                    if item.candidate_id == content.content_revision_id and item.region_id in review.checked_region_ids} if review else {}
+        for region in result.regions:
+            verdict = verdicts.get(region.region_id)
+            region.cleanliness_verified = bool(verdict and verdict.cleanliness_verified
+                and verdict.content == "usable" and verdict.coverage == "passed"
+                and region.layer == "printed" and region.kind == "figure")
+        for observation in result.coverage_observations:
+            disposition = next((item for item in review.observation_dispositions
+                                if item.observation_id == observation.observation_id), None) if review else None
+            if disposition:
+                observation.scope_disposition = disposition.scope_disposition
+                observation.mapped_region_ids = disposition.mapped_region_ids
+        for previous in result.issues:
+            verdict = verdicts.get(previous.region_id)
+            if verdict and verdict.content == "usable" and verdict.coverage == "passed":
+                previous.resolved = True
+        if review:
+            for problem in review.issues:
+                region_id = problem.region_id
+                region = next((item for item in result.regions if item.region_id == region_id), None)
+                if region is None or region.layer in {"annotation", "noise", "decoration"}:
+                    continue
+                result.issues.append(ContentIssue(category=problem.category, reason=problem.reason,
+                    block_id=problem.block_id, source_bbox=problem.source_bbox, field_path=problem.field_path,
+                    severity=problem.severity, repairable=problem.repairable, origin="model_review",
+                    region_id=region_id, stable_target_id=problem.stable_target_id or region_id))
+        for block in result.blocks:
+            verdict = verdicts.get(block.source_region_id)
+            problems = [item for item in result.issues if not item.resolved and item.region_id == block.source_region_id
+                        and item.category not in {"layout", "render"}]
+            if verdict and verdict.content == "usable" and verdict.coverage == "passed" and not problems:
+                block.recognition_status = block.review_status = "usable"
+                block.unresolved_reasons = []
+            elif verdict:
+                block.review_status = "uncertain"
+                block.unresolved_reasons = [item.reason for item in problems]
+            else:
+                block.review_status = "unverified"
+        return PageContent.model_validate(result.model_dump())
     reliable = bool(review and review.full_page_reviewed)
     passed_all = bool(reliable and review.content == "usable" and review.coverage == "passed" and not review.issues)
     def overlaps(left, right):
@@ -92,7 +151,9 @@ def reviewed_content(content: PageContent, review: ContentReview | None, *, reas
         for problem in review.issues:
             result.issues.append(ContentIssue(category=problem.category, reason=problem.reason,
                                                block_id=problem.block_id, source_bbox=problem.source_bbox,
-                                               field_path=problem.field_path, severity=problem.severity))
+                                               field_path=problem.field_path, severity=problem.severity,
+                                               repairable=problem.repairable, origin="model_review",
+                                               region_id=problem.region_id, stable_target_id=problem.stable_target_id))
         if not review.issues and not passed_all:
             result.issues.append(ContentIssue(category="unreadable_source" if review.content == "unavailable" else "missing_content",
                                                reason="独立全页复核未确认内容及完整覆盖", source_bbox=(0., 0., 1., 1.)))
@@ -121,6 +182,11 @@ def reviewed_content(content: PageContent, review: ContentReview | None, *, reas
 
 def content_conclusion(content: PageContent, *, blank_reviewed: bool = False) -> str:
     active = [issue for issue in content.issues if not issue.resolved and issue.category not in {"layout", "render"}]
+    if content.recognition_scope == "printed_original_only":
+        required = {region.region_id for region in content.regions if region.layer in {"printed", "mixed", "unknown"}}
+        covered = {block.source_region_id for block in content.blocks if block.review_status == "usable"}
+        if not content.coverage_reviewed or content.unresolved_spans or required - covered or any(item.scope_disposition in {"pending", "unknown", "confirmed_printed_missing"} for item in content.coverage_observations):
+            return "uncertain" if content.blocks else "unavailable"
     if not content.blocks:
         return "usable" if content.blank and blank_reviewed and not active else "unverified" if content.blank else "unavailable"
     if active or any(block.review_status in {"uncertain", "unavailable"} for block in content.blocks):
@@ -132,13 +198,20 @@ def recovery_targets(content: PageContent, analysis: SourceAnalysis) -> list[dic
     """Finite located content responsibilities, separate from font/render errors."""
     blocks = {block.block_id: block for block in content.blocks}
     targets, used = [], set()
-    for problem in content.issues:
+    for problem in sorted(content.issues, key=lambda item: (item.category != "missing_content", item.category not in {"equation", "table"})):
+        if content.recognition_scope == "printed_original_only" and (not problem.repairable or problem.origin != "model_review"):
+            continue
         if problem.resolved or problem.category not in {"small_text", "reading_order", "truncated_response",
                                                        "invalid_structure", "missing_content", "equation", "table"}:
             continue
         block = blocks.get(problem.block_id)
         box = (content_block_bbox(block) if block is not None else None) or problem.source_bbox
-        if problem.category == "reading_order":
+        if content.recognition_scope == "printed_original_only":
+            region = next((item for item in content.regions if item.region_id == problem.region_id), None)
+            if region is None or region.layer not in {"printed", "mixed"}:
+                continue
+            box = region.bbox
+        if problem.category == "reading_order" and content.recognition_scope != "printed_original_only":
             targets.append({"id": problem.issue_id, "block_id": problem.block_id, "bbox": box,
                             "category": "reading_order", "kind": "text"})
             continue
@@ -154,15 +227,15 @@ def recovery_targets(content: PageContent, analysis: SourceAnalysis) -> list[dic
                                     "source_region_id": region.region_id})
                     used.add(region.region_id)
             continue
-        identity = block.block_id if block is not None else problem.issue_id
+        identity = problem.region_id or problem.stable_target_id or (block.block_id if block is not None else problem.issue_id)
         if identity in used:
             continue
         used.add(identity)
         targets.append({"id": identity, "block_id": block.block_id if block is not None else None,
-                        "bbox": box, "category": problem.category,
+                        "bbox": box, "category": "invalid_structure" if problem.category == "reading_order" else problem.category,
                         "kind": block.type if block is not None else "equation" if problem.category == "equation" else
                         "table" if problem.category == "table" else "text",
-                        "source_region_id": block.source_region_id if block is not None else None})
+                        "source_region_id": problem.region_id or (block.source_region_id if block is not None else None)})
     return targets
 
 
@@ -170,6 +243,29 @@ def local_content_candidate(base: PageContent, local: PageContent, target: dict,
     """Only an explicitly bound source target can be replaced before review."""
     selected = local.model_copy(deep=True)
     box = target["bbox"]
+    if base.recognition_scope == "printed_original_only":
+        region_id = target.get("source_region_id")
+        region = next((item for item in base.regions if item.region_id == region_id), None)
+        if region is None or region.layer not in {"printed", "mixed"}:
+            raise ValueError("恢复目标没有绑定可转录的印刷区域")
+        selected.blocks = [block for block in selected.blocks if block.source_region_id == region_id]
+        if not selected.blocks:
+            raise ValueError("局部候选没有返回绑定区域内容")
+        working = renew_content(base)
+        indices = [index for index, block in enumerate(working.blocks) if block.source_region_id == region_id]
+        position = min(indices) if indices else next((index for index, block in enumerate(working.blocks)
+            if next((item.reading_order for item in working.regions if item.region_id == block.source_region_id), 0) > region.reading_order), len(working.blocks))
+        working.blocks = [block for block in working.blocks if block.source_region_id != region_id]
+        working.blocks[position:position] = selected.blocks
+        local_region = next((item for item in selected.regions if item.region_id == region_id), None)
+        if local_region is not None:
+            next(item for item in working.regions if item.region_id == region_id).cleanliness_verified = local_region.cleanliness_verified
+        working.issues.extend(item for item in selected.issues if item.region_id == region_id)
+        working.unresolved_spans = [item for item in working.unresolved_spans if item.region_id != region_id] + [item for item in selected.unresolved_spans if item.region_id == region_id]
+        for block in working.blocks:
+            block.content_revision_id = working.content_revision_id
+        working.blank = False
+        return PageContent.model_validate(working.model_dump())
     selected.blocks = [block for block in selected.blocks if (position := content_block_bbox(block)) is not None
                        and max(box[0], position[0]) < min(box[2], position[2])
                        and max(box[1], position[1]) < min(box[3], position[3])]
@@ -201,8 +297,11 @@ def local_content_candidate(base: PageContent, local: PageContent, target: dict,
 
 def content_improves(previous: PageContent, candidate: PageContent, *, blank_reviewed: bool = False) -> bool:
     """Accept independent review improvement, never mere repeated text agreement."""
+    def key(item, content):
+        return ((item.category, item.stable_target_id or item.region_id or item.block_id or item.issue_id)
+                if content.recognition_scope == "printed_original_only" else (item.category, item.block_id, item.source_bbox))
     def keys(content):
-        return {(item.category, item.block_id, item.source_bbox) for item in content.issues
+        return {key(item, content) for item in content.issues
                 if not item.resolved and item.category not in {"layout", "render"}}
     old, new = keys(previous), keys(candidate)
     if not new <= old:
@@ -211,11 +310,25 @@ def content_improves(previous: PageContent, candidate: PageContent, *, blank_rev
     old_severity = {}
     for item in previous.issues:
         if not item.resolved:
-            key = item.category, item.block_id, item.source_bbox
-            old_severity[key] = max(old_severity.get(key, -1), severity[item.severity])
-    if any(severity[item.severity] > old_severity.get((item.category, item.block_id, item.source_bbox), -1)
+            identity = key(item, previous)
+            old_severity[identity] = max(old_severity.get(identity, -1), severity[item.severity])
+    if any(severity[item.severity] > old_severity.get(key(item, candidate), -1)
            for item in candidate.issues if not item.resolved and item.category not in {"layout", "render"}):
         return False
+    if previous.recognition_scope == "printed_original_only":
+        fields = {"content_revision_id", "recognition_status", "review_status", "unresolved_reasons"}
+        old_regions = {block.source_region_id for block in previous.blocks}
+        gained = False
+        for region_id in old_regions | {block.source_region_id for block in candidate.blocks}:
+            before_blocks = [block for block in previous.blocks if block.source_region_id == region_id]
+            after_blocks = [block for block in candidate.blocks if block.source_region_id == region_id]
+            protected = before_blocks and all(block.review_status == "usable" for block in before_blocks) and not any(
+                item.region_id == region_id and not item.resolved for item in previous.issues)
+            if protected and [block.model_dump(exclude=fields) for block in before_blocks] != [block.model_dump(exclude=fields) for block in after_blocks]:
+                return False
+            if after_blocks and all(block.review_status == "usable" for block in after_blocks) and not protected:
+                gained = True
+        return gained or len(new) < len(old)
     before, after = {block.block_id: block for block in previous.blocks}, {block.block_id: block for block in candidate.blocks}
     if not before.keys() <= after.keys():
         return False
@@ -531,7 +644,7 @@ def apply_repair(revision: Revision, assessment: Assessment, proposal: RepairPro
             retained = regions.get(operation.duplicate_of_region_id)
             old_lines = sorted((item for item in layout.lines if item.block_id == operation.region_id), key=lambda item: item.order)
             other_lines = sorted((item for item in layout.lines if item.block_id == operation.duplicate_of_region_id), key=lambda item: item.order)
-            if deleted != operation.old_region or old_lines != operation.old_lines or retained is None or not old_lines:
+            if deleted != operation.old_region or [item.model_dump(exclude={"match_status"}) for item in old_lines] != [item.model_dump(exclude={"match_status"}) for item in operation.old_lines] or retained is None or not old_lines:
                 raise ValueError("重复块删除的旧值或保留块不匹配")
             if not deleted.bbox or deleted.bbox != retained.bbox:
                 raise ValueError("源图不同位置的相同文字不能按重复内容删除")

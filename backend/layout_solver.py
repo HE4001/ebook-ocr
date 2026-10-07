@@ -18,10 +18,10 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 from .fidelity_rendering import GENERATOR_VERSION
 from .content_contract import EquationBlock, FigureBlock, MathSpan, PageContent, TableBlock, TextBlock
 from .latex_content import escape_latex, is_latex_document
-from .latex_export import PAPER_SIZES
+from .latex_export import PAPER_SIZES, printed_content_notices
 from .layout_contract import (
     BBox, EquationGroup, EquationNumber, LayoutLine, LayoutRegion, LineStyle, PageLayout,
-    PageLinePlacement, PageSourceMetadata, SourceFidelityLayout, equation_alignment_index, tex_pt_to_bp,
+    PageLinePlacement, PageSourceMetadata, SourceFidelityLayout, equation_alignment_index, tex_pt_to_bp, output_source_assets,
 )
 from .models import Book, StructuredPageResult
 from .source_analysis import InkBand, PdfTextLine, SourceAnalysis, analyze_source, persist_source_region
@@ -70,11 +70,12 @@ def _set_geometry(line: LayoutLine, band: InkBand, analysis: SourceAnalysis) -> 
                  min(1., x1 + 1 / analysis.width), min(1., y1 + 1 / analysis.height))
     line.baseline = min(line.bbox[3], max(line.bbox[1], band.baseline))
     line.basis = "local_measurement"
+    line.match_status = "matched"
 
 
 def _match_region(
     lines: list[LayoutLine], box: BBox, analysis: SourceAnalysis,
-    pdf_matches: dict[str, PdfTextLine], measurements: dict[str, InkBand],
+    pdf_matches: dict[str, PdfTextLine], measurements: dict[str, InkBand], *, printed_only: bool = False,
 ) -> list[str]:
     """Anchor first; only fill a gap when its two sequences have equal length."""
     bands = analysis.region_bands(box)
@@ -122,13 +123,17 @@ def _match_region(
     for line in lines:
         if line.kind != "equation":
             continue
-        band = analysis.measure_bbox(line.bbox, equation=True) if line.bbox is not None else None
-        if band is None:
-            line.baseline = None
-            unresolved.append(line.line_id)
-        else:
-            measurements[line.line_id] = band
-            _set_geometry(line, band, analysis)
+        if not printed_only:
+            band = analysis.measure_bbox(line.bbox, equation=True) if line.bbox is not None else None
+            if band is not None:
+                measurements[line.line_id] = band
+                _set_geometry(line, band, analysis)
+                continue
+        # Ink within a model box cannot establish formula identity. No local
+        # formula-component matcher exists yet; retain the text and unknown geometry.
+        line.baseline = None
+        line.match_status = "unknown"
+        unresolved.append(line.line_id)
     return unresolved
 
 
@@ -495,7 +500,7 @@ def derive_layout(
                                         bbox=source_line.bbox or _block_box(block),
                                         number=EquationNumber(latex=escape_latex(source_line.number), line_id=source_line.line_id)
                                         if source_line.number else None, basis="model_estimate"))
-    candidate = SourceFidelityLayout(source=metadata, content_revision=0, layout_revision=0,
+    candidate = SourceFidelityLayout(recognition_scope=content.recognition_scope, source=metadata, content_revision=0, layout_revision=0,
                                     generated_content_revision=0, generator_version=GENERATOR_VERSION,
                                     canvas_width_bp=width, canvas_height_bp=height, canvas_basis=canvas_basis,
                                     regions=regions, lines=lines, equation_groups=groups)
@@ -538,19 +543,23 @@ def derive_layout(
             for cell in block.cells:
                 cell_lines = [line_map[line.line_id] for line in cell.lines]
                 if cell_lines and cell.bbox is not None:
-                    unresolved.extend(_match_region(cell_lines, cell.bbox, analysis, pdf_matches, measurements))
+                    unresolved.extend(_match_region(cell_lines, cell.bbox, analysis, pdf_matches, measurements, printed_only=content.recognition_scope == "printed_original_only"))
                 elif cell_lines:
                     unresolved.extend(line.line_id for line in cell_lines)
             if region.bbox is not None:
                 preservation[block.block_id] = (region.bbox, "uncertain_content", "缺少表格网格与合并边界的来源测量，保留完整可定位表格及表头；单元格内容仍保存在 JSON")
-                reasons.append(f"表格 {block.block_id} 网格及合并几何未知，按完整源区域保留，布局为 approximate")
+                reasons.append(f"表格 {block.block_id} 网格及合并几何未知；单元格正文已保存，忠实 PDF 未生成"
+                               if content.recognition_scope == "printed_original_only" else
+                               f"表格 {block.block_id} 网格及合并几何未知，按完整源区域保留，布局为 approximate")
             else:
-                reasons.append(f"表格 {block.block_id} 完整源位置未知；不伪造整页表格框，布局不可用")
+                reasons.append(f"表格 {block.block_id} 完整源位置与网格几何未知；单元格正文已保存，忠实 PDF 未生成"
+                               if content.recognition_scope == "printed_original_only" else
+                               f"表格 {block.block_id} 完整源位置未知；不伪造整页表格框，布局不可用")
         elif block_lines and not all(line.line_id in measurements for line in block_lines):
             if isinstance(block, EquationBlock) and len(block_lines) == 1 and block_lines[0].bbox is None:
                 block_lines[0].bbox = region.bbox
             if region.bbox is not None:
-                unresolved.extend(_match_region(block_lines, region.bbox, analysis, pdf_matches, measurements))
+                unresolved.extend(_match_region(block_lines, region.bbox, analysis, pdf_matches, measurements, printed_only=content.recognition_scope == "printed_original_only"))
             else:
                 unresolved.extend(line.line_id for line in block_lines)
         if isinstance(block, EquationBlock):
@@ -585,6 +594,21 @@ def derive_layout(
             if region.bbox is not None and block.block_id not in preservation:
                 preservation[block.block_id] = (region.bbox, "uncertain_content", "此块原行未能唯一恢复源位置，保留必要源区域")
             reasons.append(f"块 {block.block_id} 部分原行位置或基线未知")
+    if content.recognition_scope == "printed_original_only":
+        # No region expansion can turn unverified pixels into a clean source asset.
+        # Keep recognized text even when geometry or a graphic remains unresolved.
+        clean_figures = {region.region_id: region for region in content.regions if region.layer == "printed" and region.kind == "figure" and region.cleanliness_verified}
+        for block in content.blocks:
+            if isinstance(block, FigureBlock) and block.source_region_id in clean_figures:
+                region = clean_figures[block.source_region_id]
+                try:
+                    asset = persist_source_region(book_dir, image_path, metadata, region.bbox, block.block_id, "已核验干净印刷图形", purpose="figure")
+                    candidate.source_assets.append(asset.model_copy(update={"source_layer": "printed", "cleanliness_verified": True}))
+                except (OSError, RuntimeError, ValueError) as error:
+                    reasons.append(f"干净图形 {block.block_id} 保存失败：{str(error)[:250]}")
+        if preservation:
+            reasons.append("已辨印刷正文保存；几何、图形或内容仍有未决项，忠实 PDF 未生成")
+        preservation = {}
     # Expand a preserved region to cover any other item it intersects. This
     # avoids clipping a line in half or drawing the source and text twice.
     for block_id, (box, purpose, reason) in list(preservation.items()):
@@ -632,12 +656,12 @@ def derive_layout(
         reasons.append("图片缺少可信物理尺寸；采用项目纸宽及原图比例，字号与画布尺寸仍为估计")
     if any(line.style.basis == "project" for line in lines):
         reasons.append("部分字体族或字号采用项目设置，未把估计标为测量真值")
-    uncovered = analysis.uncovered_content(content)
+    uncovered = analysis.uncovered_content(content) if content.recognition_scope == "legacy_all_visible" else []
     if uncovered:
         reasons.append(f"完整源页另有 {len(uncovered)} 个可能遗漏区域；墨迹只作复核线索，不宣称文字已覆盖")
     unresolved_unknown = any(line.baseline is None and not any(asset.region_id == line.block_id for asset in candidate.source_assets)
                              for line in lines)
-    figures_unknown = any(isinstance(block, FigureBlock) and _block_box(block) is None
+    figures_unknown = any(isinstance(block, FigureBlock) and (content.recognition_scope == "printed_original_only" or _block_box(block) is None)
                           and not any(asset.region_id == block.block_id for asset in candidate.source_assets) for block in content.blocks)
     tables_unknown = any(isinstance(block, TableBlock) and not any(asset.region_id == block.block_id and asset.purpose == "uncertain_content"
                                                                  for asset in candidate.source_assets) for block in content.blocks)
@@ -647,7 +671,7 @@ def derive_layout(
     body_boxes = [region.bbox for region in regions if region.bbox is not None and region.kind not in {"header", "footer"}]
     body_frame = ((min(box[0] for box in body_boxes), min(box[1] for box in body_boxes),
                    max(box[2] for box in body_boxes), max(box[3] for box in body_boxes)) if body_boxes else None)
-    return PageLayout(layout_revision_id=layout_revision_id or str(uuid4()), content_revision_id=content.content_revision_id,
+    return PageLayout(recognition_scope=content.recognition_scope, layout_revision_id=layout_revision_id or str(uuid4()), content_revision_id=content.content_revision_id,
                       page_id=content.page_id, source_version=content.source_version, source=metadata,
                       canvas_width_bp=width, canvas_height_bp=height, canvas_basis=canvas_basis, body_frame=body_frame,
                       regions=regions, lines=[PageLinePlacement(**line.model_dump(exclude={"kind", "latex"})) for line in lines],
@@ -675,6 +699,14 @@ def to_source_fidelity_layout(
             raise ValueError("布局原行不能改换内容块归属")
         line.order, line.bbox, line.baseline = placement.order, placement.bbox, placement.baseline
         line.style, line.basis = placement.style.model_copy(deep=True), placement.basis
+        line.match_status = placement.match_status
+    if content.recognition_scope == "printed_original_only":
+        # Unsupported math can use a text rendering kind, but remains a formula.
+        for block in content.blocks:
+            if isinstance(block, EquationBlock):
+                for source_line in block.lines:
+                    line_map[source_line.line_id].baseline = None
+                    line_map[source_line.line_id].match_status = "unknown"
     content_numbers = {line.line_id: line.number for block in content.blocks if isinstance(block, EquationBlock) for line in block.lines}
     groups = [group.model_copy(deep=True) for group in layout.equation_groups]
     for group in groups:
@@ -689,16 +721,17 @@ def to_source_fidelity_layout(
     grouped_numbers = {group.number.line_id for group in groups if group.number is not None}
     if any(number and line_id not in grouped_numbers for line_id, number in content_numbers.items() if line_map[line_id].kind == "equation"):
         raise ValueError("布局遗漏已保存的公式编号")
+    assets = output_source_assets(layout.model_copy(update={"recognition_scope": content.recognition_scope}))
     whole_page = any(asset.purpose == "source_page" or (asset.purpose == "uncertain_content" and asset.bbox == (0., 0., 1., 1.))
-                     for asset in layout.source_assets)
+                     for asset in assets)
     disposition = "source_page_preserved" if whole_page else "regions_preserved" if any(
-        asset.purpose == "uncertain_content" for asset in layout.source_assets
+        asset.purpose == "uncertain_content" for asset in assets
     ) else "transcribed"
-    return SourceFidelityLayout(source=layout.source, content_revision=content_revision, layout_revision=layout_revision,
+    return SourceFidelityLayout(recognition_scope=content.recognition_scope, unresolved_notices=printed_content_notices(content) if content.recognition_scope == "printed_original_only" else [], source=layout.source, content_revision=content_revision, layout_revision=layout_revision,
                                 generated_content_revision=content_revision, generator_version=GENERATOR_VERSION,
                                 canvas_width_bp=layout.canvas_width_bp, canvas_height_bp=layout.canvas_height_bp,
                                 canvas_basis=layout.canvas_basis, body_frame=layout.body_frame, regions=layout.regions,
-                                lines=lines, equation_groups=groups, source_assets=layout.source_assets,
+                                lines=lines, equation_groups=groups, source_assets=assets,
                                 body_font_size_bp=layout.body_font_size_bp, body_font_family=layout.body_font_family,
                                 body_font_basis=layout.body_font_basis, review_reasons=layout.review_reasons[:103],
                                 source_disposition=disposition,

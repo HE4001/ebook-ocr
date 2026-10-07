@@ -5,11 +5,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .layout_contract import LayoutLine, SourceFidelityLayout, equation_alignment_index
+from .layout_contract import LayoutLine, SourceFidelityLayout, equation_alignment_index, output_source_assets
 from .latex_content import source_resource_name
 
 
-GENERATOR_VERSION = "source-fidelity-v2"
+GENERATOR_VERSION = "source-fidelity-v2-printed-scope"
 MEASUREMENT_VERSION = "measurement-v2"
 _FONT_COMMANDS = {"songti": r"\songti", "heiti": r"\heiti", "kaiti": r"\kaishu"}
 MATHRSFS_FONT_SHAPES = r"""\input{ursfs.fd}
@@ -84,6 +84,8 @@ def _contains(outer: tuple[float, float, float, float], inner: tuple[float, floa
 
 def source_preserved_line_ids(layout: SourceFidelityLayout) -> set[str]:
     """Hide uncertain candidate text only when the source image covers the whole item."""
+    if layout.recognition_scope == "printed_original_only":
+        return set()
     if layout.source_disposition == "source_page_preserved":
         return {line.line_id for line in layout.lines}
     assets = [asset for asset in layout.source_assets if asset.purpose == "uncertain_content"]
@@ -125,6 +127,8 @@ def fidelity_items(layout: SourceFidelityLayout, width_bp: float, height_bp: flo
     for index, line in enumerate(sorted(layout.lines, key=lambda line: line.order), 1):
         if line.line_id in preserved:
             continue
+        if layout.recognition_scope == "printed_original_only" and line.kind == "equation" and line.match_status != "matched":
+            raise FidelityLayoutError(f"公式行 {line.line_id} 尚无可信组件匹配", line.line_id)
         if line.bbox is None or line.baseline is None:
             raise FidelityLayoutError(f"原行 {line.line_id} 未取得可用区域或基线", line.line_id)
         latex = line.latex
@@ -200,7 +204,13 @@ def render_fidelity_source(
     output_width_bp: float, output_height_bp: float, scale: float = 1,
     offset_x_bp: float = 0, offset_y_bp: float = 0,
 ) -> str:
-    preserved_page = layout.source_disposition == "source_page_preserved"
+    if layout.recognition_scope == "printed_original_only":
+        if layout.unresolved_notices:
+            raise FidelityLayoutError("存在未决印刷片段；请使用含未决说明的可编辑正文源码或 JSON")
+        represented = {asset.region_id for asset in output_source_assets(layout)}
+        if any(region.kind in {"figure", "table"} and region.region_id not in represented for region in layout.regions):
+            raise FidelityLayoutError("图形资源或表格几何尚未核验；忠实格式未生成，正文仍可导出")
+    preserved_page = layout.source_disposition == "source_page_preserved" and layout.recognition_scope == "legacy_all_visible"
     items = [] if preserved_page else fidelity_items(layout, canvas_width_bp, canvas_height_bp)
     width, height = number(output_width_bp), number(output_height_bp)
     bottom = output_height_bp - offset_y_bp - scale * canvas_height_bp
@@ -227,7 +237,7 @@ def render_fidelity_source(
             rf"{{{number(canvas_height_bp - item.baseline_bp)}}}{{{mode}}}"
             "{" + item.latex + "}{" + item.suffix + "}%"
         )
-    for asset in layout.source_assets:
+    for asset in output_source_assets(layout):
         image_name = source_resource_name(asset.image_name)
         x0, y0, x1, y1 = asset.bbox
         asset_width = (x1 - x0) * canvas_width_bp

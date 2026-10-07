@@ -1320,6 +1320,7 @@ class Storage:
             return sum(values) if values else None
         return Run(
             workflow_version=snapshot.get("workflow_version", 1),
+            recognition_scope=snapshot.get("recognition_scope", "legacy_all_visible"),
             run_id=row["run_id"], book_id=row["book_id"],
             arrangement_revision=snapshot["arrangement_revision"], page_ids=snapshot["page_ids"],
             settings_snapshot=_without_retired_settings(snapshot["settings"]), policy=snapshot["policy"], status=row["status"],
@@ -1340,6 +1341,7 @@ class Storage:
                 completed_with_issues=sum(task.result_status == "completed_with_issues" for task in tasks),
                 failed=sum(task.result_status == "failed" for task in tasks),
                 editable=sum(cls._outcome_category(task.outcome) == "editable" for task in tasks),
+                partial_content=sum(cls._outcome_category(task.outcome) == "partial_content" for task in tasks),
                 regions_preserved=sum(cls._outcome_category(task.outcome) == "regions_preserved" for task in tasks),
                 page_preserved=sum(cls._outcome_category(task.outcome) == "page_preserved" for task in tasks),
                 no_result=sum(cls._outcome_category(task.outcome) == "no_result" for task in tasks),
@@ -1363,8 +1365,8 @@ class Storage:
             book = connection.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
             if book is None:
                 raise KeyError("book")
-            workflow_version = 2 if request.selection_revision is not None else 1
-            if workflow_version == 1 and book["arrangement_revision"] != request.expected_arrangement_revision:
+            workflow_version = 2
+            if request.selection_revision is None and book["arrangement_revision"] != request.expected_arrangement_revision:
                 raise RevisionConflict("页序已更新，请使用最新编排启动任务")
             if connection.execute(
                 "SELECT 1 FROM workflow_runs WHERE book_id = ? AND status IN ('queued','running','pausing','paused')",
@@ -1375,7 +1377,7 @@ class Storage:
                 "SELECT pages.*, source_files.filename AS source_filename, source_files.kind AS source_kind, "
                 "source_files.directory AS source_directory, source_files.page_count AS source_page_count "
                 "FROM pages JOIN source_files ON pages.book_id = source_files.book_id AND pages.source_id = source_files.id "
-                "WHERE pages.book_id = ?" + (" AND selected=1" if workflow_version == 1 else "") + " ORDER BY pages.position,pages.number", (book_id,),
+                "WHERE pages.book_id = ?" + (" AND selected=1" if request.selection_revision is None else "") + " ORDER BY pages.position,pages.number", (book_id,),
             ).fetchall()
             continuation = None
             continuation_outputs_needed = False
@@ -1383,10 +1385,11 @@ class Storage:
                 if generator_version == "workflow-v1":
                     generator_version = "workflow-v2"
                 draft = self._selection(connection, book_id)
-                if draft.selection_revision != request.selection_revision or not draft.valid:
+                if request.selection_revision is not None and (draft.selection_revision != request.selection_revision or not draft.valid):
                     raise RevisionConflict("来源或选页已更新，请回到选页保存当前选择")
                 by_id = {row["page_id"]: row for row in records}
-                records = [by_id[page_id] for page_id in draft.page_ids]
+                if request.selection_revision is not None:
+                    records = [by_id[page_id] for page_id in draft.page_ids]
                 if request.continuation_run_id is not None:
                     old = connection.execute("SELECT * FROM workflow_runs WHERE book_id=? AND run_id=?", (book_id, request.continuation_run_id)).fetchone()
                     if old is None or old["workflow_version"] != 2 or old["status"] not in {"finished", "failed", "interrupted"}:
@@ -1417,6 +1420,7 @@ class Storage:
             if not set(request.policy.replace_page_ids) <= set(page_ids):
                 raise ValueError("人工稿替换范围必须属于本轮处理范围")
             safe_settings = {key: settings.get(key, default) for key, default in DEFAULT_SETTINGS.items()}
+            safe_settings["recognition_scope"] = "printed_original_only" if workflow_version == 2 else "legacy_all_visible"
             safe_settings.update(paper_size=book["paper_size"], layout=json.loads(book["layout_json"]),
                                  render_strategy=book["render_strategy"], output_settings_version=book["output_settings_version"],
                                  title=book["title"], filename=book["filename"])
@@ -1424,7 +1428,8 @@ class Storage:
                              "image_name", "source_filename", "source_kind", "source_directory", "source_page_count")
             run_id, now = str(uuid4()), self._now()
             snapshot = {"workflow_version": workflow_version,
-                        "selection_revision": request.selection_revision,
+                        "recognition_scope": safe_settings["recognition_scope"],
+                        "selection_revision": draft.selection_revision if workflow_version == 2 else request.selection_revision,
                         "continuation_run_id": request.continuation_run_id,
                         "continuation_outputs_needed": continuation_outputs_needed,
                         "arrangement_revision": book["arrangement_revision"], "page_ids": page_ids,
@@ -1444,6 +1449,7 @@ class Storage:
                     position=position, base_revision_id=row["current_revision_id"],
                     base_content_revision=row["content_revision"], base_layout_revision=row["layout_revision"],
                 )
+                task.stage_data["recognition_scope"] = safe_settings["recognition_scope"]
                 if workflow_version == 2:
                     task.stage_data["protected_existing"] = bool(row["manual_protected"] and row["page_id"] not in request.policy.replace_page_ids)
                     if continuation is not None:
@@ -1928,6 +1934,9 @@ class Storage:
                 revision = self._revision(connection, revision_id)
                 if revision is None:
                     raise ValueError("输出页面缺少已保存修订")
+                if run_id is None and ((revision.page_content and revision.page_content.recognition_scope == "printed_original_only")
+                    or (revision.layout_source and revision.layout_source.recognition_scope == "printed_original_only")):
+                    settings["recognition_scope"] = "printed_original_only"
                 status = task.result_status if task else source["result_status"]
                 assessment = self._assessment(connection, revision_id, run_id=run_id)
                 explanation = task.stage_data.get("candidate_not_adopted_reason") if task else None
@@ -1966,7 +1975,7 @@ class Storage:
                     assessment=assessment,
                 ))
             manifest = ExportManifest(
-                manifest_id=str(uuid4()), book_id=book_id, run_id=run_id, arrangement_revision=arrangement_revision,
+                recognition_scope=settings.get("recognition_scope", "legacy_all_visible"), manifest_id=str(uuid4()), book_id=book_id, run_id=run_id, arrangement_revision=arrangement_revision,
                 output_settings_version=settings["output_settings_version"], settings_snapshot=settings,
                 generator_version=generator_version, pages=entries,
                 complete=all(entry.result_status != "failed" and (run_id is None or entry.result_status is not None) for entry in entries),
@@ -2177,6 +2186,8 @@ class Storage:
             return "regions_preserved"
         if outcome.content_revision_id and outcome.content == "usable":
             return "editable"
+        if outcome.content_revision_id and outcome.content in {"uncertain", "unverified"}:
+            return "partial_content"
         return "no_result"
 
     @staticmethod
@@ -2194,12 +2205,19 @@ class Storage:
         parent = self._revision(connection, old.candidate_revision_id)
         if parent is None or parent.page_content is None:
             return
+        if parent.page_content.recognition_scope != task.stage_data.get("recognition_scope", "legacy_all_visible"):
+            return
         revision = parent.model_copy(update={"revision_id": str(uuid4()), "parent_revision_id": parent.revision_id,
                                               "run_id": task.run_id, "created_at": self._now()})
         self._insert_revision(connection, revision)
         task.candidate_revision_id = revision.revision_id
         task.stage_data["inherited_from_run_id"] = old.run_id
-        task.stage_data["basic_recognition_complete"] = bool(parent.page_content.blocks or parent.page_content.blank)
+        if parent.page_content.recognition_scope == "printed_original_only":
+            task.stage_data["region_plan_complete"] = True
+            task.stage_data["initial_batches_finished"] = True
+            task.stage_data["region_plan"] = [region.model_dump(mode="json") for region in parent.page_content.regions]
+            task.stage_data["region_adoptions"] = dict(old.stage_data.get("region_adoptions", {}))
+        task.stage_data["basic_recognition_complete"] = bool(parent.page_content.blocks or parent.page_content.blank or parent.page_content.recognition_scope == "printed_original_only")
         task.stage_data["basic_review_complete"] = bool(old.stage_data.get("basic_review_complete"))
         task.completed_stages = [stage for stage in old.completed_stages if stage in {"prepare", "recognize", "review", "layout"}]
         task.stage = "render" if parent.page_layout is not None else ("layout" if task.stage_data["basic_review_complete"] else "review")
@@ -2215,10 +2233,17 @@ class Storage:
             recognition = int(not task.stage_data.get("basic_recognition_complete") and not task.stage_data.get("basic_recognition_unavailable") and not any(
                 attempt.purpose == "basic_recognition" and attempt.state in {"reserved", "unknown"} for attempt in attempts
             ))
+            if "recognition_batches" in task.stage_data and not task.stage_data.get("initial_batches_finished"):
+                done = set(task.stage_data.get("recognition_batches_done", []))
+                operations = task.stage_data.get("v2_operations", {})
+                counted = {attempt.attempt_id for attempt in attempts if attempt.state != "cancelled"}
+                recognition = sum(1 for index in range(len(task.stage_data["recognition_batches"]))
+                    if index not in done and operations.get(f"recognize-batch-{index}", {}).get("attempt_id") not in counted)
             review = int(not task.stage_data.get("basic_review_complete") and not task.stage_data.get("basic_review_unavailable") and not any(
                 attempt.purpose in {"basic_review", "recovery_review"} and attempt.state in {"reserved", "unknown"} for attempt in attempts
             ))
-            needed[task.page_id] = recognition + review
+            plan = int(task.stage_data.get("recognition_scope") == "printed_original_only" and not task.stage_data.get("region_plan_complete") and not task.stage_data.get("region_plan_unavailable") and not any(attempt.purpose == "region_plan" and attempt.state in {"reserved", "unknown"} for attempt in attempts))
+            needed[task.page_id] = plan + recognition + review
         return needed
 
     def _reserve_v2_attempts(
@@ -2287,10 +2312,12 @@ class Storage:
                     "basic_review" if stages[0] == "review" and not task.stage_data.get("basic_review_complete") else "local_recognition")
             if (purpose == "basic_recognition" and stages[0] != "recognize") or (purpose == "basic_review" and stages[0] != "review"):
                 raise ValueError("基础预约用途与模型职责不一致")
-            if purpose not in {"basic_recognition", "basic_review", "local_recognition"}:
+            if purpose not in {"region_plan", "basic_recognition", "basic_review", "local_recognition"}:
                 raise ValueError("修复和修后复核不能使用单次预约绕过完整额度保护")
             if purpose == "local_recognition" and (stages[0] != "recognize" or not block_ids):
                 raise ValueError("局部识别必须有明确目标区域；重复复核须使用恢复轮已预约请求")
+            if purpose == "region_plan" and (stages[0] != "recognize" or any(attempt.purpose == purpose and attempt.state != "cancelled" for attempt in previous)):
+                raise RequestBudgetExceeded("区域计划已发出；只能解析保存响应或走安全暂时重试")
             if purpose == "basic_recognition" and any(attempt.purpose == purpose and attempt.state != "cancelled" for attempt in previous):
                 raise RequestBudgetExceeded("基础识别已发出；保存响应需本地解析，已知暂时错误须走共享重试")
             if purpose == "basic_review" and any(attempt.purpose == purpose and attempt.state != "cancelled" for attempt in previous):
@@ -2299,10 +2326,17 @@ class Storage:
                 raise ValueError("内容复核必须基于已取得的有效内容或明确空白观察")
         tasks = self._tasks(connection, run_id)
         needed = self._basic_v2_needs(connection, tasks)
-        basic_request = count == 1 and not retry and purpose in {"basic_recognition", "basic_review"}
+        initial_batch = purpose == "local_recognition" and "recognition_batches" in task.stage_data and not task.stage_data.get("initial_batches_finished")
+        basic_request = count == 1 and not retry and (purpose in {"region_plan", "basic_recognition", "basic_review"} or initial_batch)
         if basic_request:
             # When the budget cannot cover everyone, preserve frozen page order.
             protected = sum(needed[other.page_id] for other in tasks if other.position < task.position)
+            own_remaining = max(0, needed[task.page_id] - 1)
+            if initial_batch:
+                own_remaining = int(not task.stage_data.get("basic_review_complete") and not task.stage_data.get("basic_review_unavailable"))
+            if task.request_count + count + own_remaining > policy.page_request_limit:
+                raise RequestBudgetExceeded("本页额度不足以完成区域计划、转录与独立核验")
+            protected += own_remaining
         else:
             protected = sum(needed.values())
         if run["request_count"] + count + protected > run["request_limit"]:
@@ -2499,7 +2533,7 @@ class Storage:
                                 generator_version=json.loads(run["snapshot_json"])["generator_version"])
             self._insert_revision(connection, revision)
             task.candidate_revision_id = revision.revision_id
-            task.stage_data["basic_recognition_complete"] = bool(content.blocks or content.blank)
+            task.stage_data["basic_recognition_complete"] = bool(content.blocks or content.blank or (content.recognition_scope == "printed_original_only" and task.stage_data.get("initial_batches_finished")))
             self._write_task(connection, task)
             return revision
 
@@ -2624,7 +2658,7 @@ class Storage:
         snapshot = self.get_output_snapshot(book_id, run.output_snapshot_id) if run.output_snapshot_id else None
         waiting = [attempt.sent_at for attempt in self.get_attempts(run_id)
                    if attempt.sent_at is not None and attempt.settled_at is None and attempt.state in {"reserved", "succeeded"}]
-        return RunSummary(workflow_version=run.workflow_version, run_id=run_id, book_id=book_id,
+        return RunSummary(recognition_scope=run.recognition_scope, workflow_version=run.workflow_version, run_id=run_id, book_id=book_id,
                           selection_revision=run.selection_revision, status=run.status, counts=run.counts,
                           active_stages=active, updated_at=run.updated_at, error=run.error, recent_errors=errors[-5:],
                           output_snapshot_id=run.output_snapshot_id, formats=snapshot.formats if snapshot else {},
@@ -2660,7 +2694,7 @@ class Storage:
                                                   source_metadata=metadata, revision_id=revision.revision_id if revision else None,
                                                   content_revision_id=task.outcome.content_revision_id, layout_revision_id=task.outcome.layout_revision_id,
                                                   outcome=task.outcome))
-            snapshot = OutputSnapshot(output_snapshot_id=str(uuid4()), book_id=book_id, run_id=run_id,
+            snapshot = OutputSnapshot(recognition_scope=frozen.get("recognition_scope", "legacy_all_visible"), output_snapshot_id=str(uuid4()), book_id=book_id, run_id=run_id,
                                       selection_revision=frozen["selection_revision"], page_ids=frozen["page_ids"],
                                       output_settings_version=frozen["settings"]["output_settings_version"], settings_snapshot=frozen["settings"],
                                       generator_version=frozen["generator_version"], pages=entries, created_at=self._now())

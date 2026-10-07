@@ -46,7 +46,7 @@ _MATH_ENVIRONMENTS = {
 _ENVIRONMENT_TOKEN = re.compile(r"\\(begin|end)\s*\{([^{}]+)\}")
 
 
-def equation_alignment_index(latex: str) -> int | None:
+def equation_alignment_index(latex: str, *, allow_multiple: bool = False) -> int | None:
     """Return the single top-level alignment marker in an equation math body."""
     stripped = latex.strip()
     outer = _ENVIRONMENT_TOKEN.match(stripped)
@@ -77,9 +77,10 @@ def equation_alignment_index(latex: str) -> int | None:
         elif character == "}":
             braces -= 1
         elif character == "&" and braces == 0 and environments == 0:
-            if marker is not None:
+            if marker is not None and not allow_multiple:
                 raise ValueError("一个公式原行最多包含一个顶层对齐锚点 &")
-            marker = index
+            if marker is None:
+                marker = index
         index += 1
     return marker
 
@@ -112,6 +113,7 @@ class LayoutLine(LayoutModel):
     baseline: NormalizedCoordinate | None = None
     style: LineStyle = Field(default_factory=LineStyle)
     basis: EvidenceBasis | None = None
+    match_status: Literal["matched", "unknown"] = "unknown"
 
 
 class EquationNumber(LayoutModel):
@@ -244,9 +246,21 @@ class SourceRegionAsset(LayoutModel):
     image_name: str = Field(min_length=1, max_length=1_000)
     purpose: Literal["figure", "uncertain_content", "source_page"]
     reason: str = Field(default="", max_length=2_000)
+    source_layer: Literal["printed", "annotation", "mixed", "unknown"] = "unknown"
+    cleanliness_verified: bool = False
+
+
+def output_source_assets(layout):
+    """Only explicitly verified clean figures are eligible in printed scope."""
+    if layout.recognition_scope == "legacy_all_visible":
+        return layout.source_assets
+    return [asset for asset in layout.source_assets if asset.purpose == "figure"
+            and asset.source_layer == "printed" and asset.cleanliness_verified]
 
 
 class SourceFidelityLayout(LayoutObservation):
+    recognition_scope: Literal["legacy_all_visible", "printed_original_only"] = "legacy_all_visible"
+    unresolved_notices: list[str] = Field(default_factory=list, max_length=2_000)
     # The old model wire remains LayoutObservation (500 / 2,000). V2 local
     # derived rendering may reference the larger saved content collection.
     regions: list[LayoutRegion] = Field(default_factory=list, max_length=2_000)
@@ -323,6 +337,7 @@ class RecognitionInput(LayoutModel):
 
 
 class PageLinePlacement(LayoutModel):
+    match_status: Literal["matched", "unknown"] = "unknown"
     """Positions reference saved content; they carry no independent text."""
     line_id: LayoutId
     block_id: LayoutId
@@ -334,6 +349,7 @@ class PageLinePlacement(LayoutModel):
 
 
 class PageLayout(LayoutModel):
+    recognition_scope: Literal["legacy_all_visible", "printed_original_only"] = "legacy_all_visible"
     schema_version: Literal[2] = 2
     layout_revision_id: str
     content_revision_id: str

@@ -17,7 +17,7 @@ from .compile_service import (
     CandidateRenderResult, cache_candidate_render, generate_manifest_outputs, generate_snapshot_outputs,
     load_candidate_render, preserve_source_page, preserve_source_regions, render_candidate,
 )
-from .content_contract import ContentIssue, ContentParseResult, PageContent
+from .content_contract import UnresolvedSpan, ContentIssue, ContentParseResult, PageContent, PageRegion
 from .importers import IMAGE_LOCK, prepare_analyzed_page, prepare_page
 from .latex_diagnostics import local_geometry_adjustment
 from .latex_export import GENERATOR_VERSION, FidelityLayoutError, generate_source_fidelity_latex
@@ -386,7 +386,13 @@ class BookProcessor:
                 self.storage.record_response_parse_errors(attempt_id, [error])
                 raise _Unavailable(reason, recorded=True, category="unknown_consumption")
         diagnostics = []
-        if stage == "review":
+        if operation.get("kind") == "region_plan":
+            try:
+                parsed = ContentClientV2.parse_saved_region_plan(body, source_version=self._task(context, page_id).source_version, completion_status=completion)
+            except (ValueError, RecursionError):
+                parsed = None
+                diagnostics = [RequestDiagnostic(stage, "invalid_structure", "$", "区域计划响应无有效绑定边界")]
+        elif stage == "review":
             try:
                 parsed = ContentClientV2.parse_saved_review(body, content, completion_status=completion)
             except (ValueError, RecursionError):
@@ -398,9 +404,14 @@ class BookProcessor:
             parsed = ContentClientV2.parse_saved_content(
                 body, book_id=context.run.book_id, page_id=page_id, source_version=self._task(context, page_id).source_version,
                 response_id=attempt_id, completion_status=completion,
-                content_revision_id=operation["parse_content_revision_id"], crop_mapping=mapping)
+                content_revision_id=operation["parse_content_revision_id"], crop_mapping=mapping,
+                recognition_scope=operation.get("recognition_scope", "legacy_all_visible"),
+                target_regions=[PageRegion.model_validate(item) for item in operation.get("target_regions", [])])
             diagnostics = [RequestDiagnostic(stage, failure.category, failure.field_path, failure.reason) for failure in parsed.failures]
             if parsed.content is not None:
+                if parsed.content.recognition_scope == "printed_original_only":
+                    order = {region.region_id: region.reading_order for region in parsed.content.regions}
+                    parsed.content.blocks.sort(key=lambda block: order[block.source_region_id])
                 # These IDs depend only on the persisted response and item
                 # positions, so interruption cannot create another authority.
                 remap = {}
@@ -431,15 +442,30 @@ class BookProcessor:
 
     async def _request_v2(self, context: _RunContext, page_id: str, client: Any, stage: str, name: str,
                           inputs, *, content: PageContent | None = None, target: dict | None = None,
-                          reserved_attempt_id: str | None = None):
+                          reserved_attempt_id: str | None = None, target_regions: list[PageRegion] | None = None):
         operation = self._operation_v2(context, page_id, name)
         if not operation:
+            regions = target_regions if target_regions is not None else [PageRegion.model_validate(item)
+                for item in self._task(context, page_id).stage_data.get("region_plan", [])]
+            if target:
+                regions = [item for item in regions if item.region_id == target.get("source_region_id")]
             operation = {"parse_content_revision_id": str(uuid4()), "reservation_key": str(uuid4()),
-                         "result_content_revision_id": str(uuid4())}
+                         "result_content_revision_id": str(uuid4()), "kind": "region_plan" if name == "region-plan" else "content",
+                         "recognition_scope": self._task(context, page_id).stage_data.get("recognition_scope", "legacy_all_visible"),
+                         "source_version": self._task(context, page_id).source_version,
+                         "target_regions": [item.model_dump(mode="json") for item in regions]}
             if reserved_attempt_id:
                 operation["attempt_id"] = reserved_attempt_id
             self._store_operation_v2(context, page_id, name, operation)
-        phase = "initial" if name in {"recognize", "review"} else "recovery"
+        if "recognition_scope" not in operation and content is not None:
+            operation.update(recognition_scope=content.recognition_scope, source_version=content.source_version,
+                target_regions=[item.model_dump(mode="json") for item in content.regions])
+            self._store_operation_v2(context, page_id, name, operation)
+        if "recognition_scope" not in operation and self._task(context, page_id).stage_data.get("recognition_scope", "legacy_all_visible") == "legacy_all_visible":
+            operation.update(recognition_scope="legacy_all_visible", source_version=self._task(context, page_id).source_version,
+                target_regions=[])
+            self._store_operation_v2(context, page_id, name, operation)
+        phase = "initial" if name in {"region-plan", "recognize", "review"} or name.startswith("recognize-batch-") else "recovery"
         while True:
             attempts = self.storage.get_attempts(context.run.run_id, page_id)
             previous = next((item for item in attempts
@@ -486,8 +512,8 @@ class BookProcessor:
                 retry_of = previous.attempt_id if retry and previous is not None else None
                 attempt = reusable or self.storage.reserve_attempt(
                     context.run.run_id, page_id, stage, retry=retry,
-                    purpose="retry" if retry else "basic_review" if stage == "review" else "basic_recognition",
-                    block_ids=[target["id"]] if target else None,
+                    purpose="retry" if retry else "region_plan" if name == "region-plan" else "basic_review" if stage == "review" else "local_recognition" if name.startswith("recognize-batch-") else "basic_recognition",
+                    block_ids=[target["id"]] if target else [item["region_id"] for item in operation.get("target_regions", [])],
                     retry_of_attempt_id=retry_of,
                     reservation_key=operation["reservation_key"] + (f"-retry-of-{retry_of}" if retry_of else ""))
                 operation["attempt_id"] = attempt.attempt_id
@@ -502,13 +528,20 @@ class BookProcessor:
                          "persist_response": self.storage.save_recognition_response, "retry": retry}
             try:
                 model = context.run.settings_snapshot["extraction_model"]
-                if stage == "review":
+                scope = operation["recognition_scope"]
+                regions = [PageRegion.model_validate(item) for item in operation.get("target_regions", [])]
+                if name == "region-plan":
+                    result = await client.plan_regions(model, inputs, book_id=context.run.book_id,
+                        page_id=page_id, source_version=self._task(context, page_id).source_version,
+                        recognition_scope=scope, **callbacks)
+                elif stage == "review":
                     result = await client.review_content(model, inputs, content, **callbacks)
                 elif target:
                     result = await client.reread_content(
                         model, inputs, book_id=context.run.book_id, page_id=page_id,
                         source_version=self._task(context, page_id).source_version, target_bbox=target["bbox"],
-                        target_kind=target["kind"], target_crop=crop, source_region_id=target.get("source_region_id"), **callbacks)
+                        target_kind=target["kind"], target_crop=crop, source_region_id=target.get("source_region_id"),
+                        recognition_scope=scope, target_regions=[item for item in regions if item.region_id == target.get("source_region_id")], **callbacks)
                 else:
                     analysis = context.prepared_pages[page_id][3]
                     evidence = [{"bbox": item.bbox, "text": item.text, "visible_geometry_correspondence": item.visible_ink}
@@ -516,7 +549,7 @@ class BookProcessor:
                     result = await client.recognize_content(
                         model, inputs, book_id=context.run.book_id, page_id=page_id,
                         source_version=self._task(context, page_id).source_version,
-                        coarse_regions=analysis.regions, native_text_evidence=json.dumps(evidence, ensure_ascii=False) if evidence else None,
+                        recognition_scope=scope, target_regions=regions, coarse_regions=analysis.regions, native_text_evidence=json.dumps(evidence, ensure_ascii=False) if evidence else None,
                         **callbacks)
             except RequestBudgetExceeded as exc:
                 self._checkpoint(context)
@@ -543,14 +576,17 @@ class BookProcessor:
             return result
 
     def _save_content_v2(self, context: _RunContext, page_id: str, content: PageContent) -> Revision:
-        return self.storage.save_content_candidate(context.run.run_id, page_id, content,
+        revision = self.storage.save_content_candidate(context.run.run_id, page_id, content,
                     expected_candidate_revision_id=self._task(context, page_id).candidate_revision_id)
+        if content.recognition_scope == "printed_original_only" and content.regions:
+            self._update(context, page_id, stage_data={"region_plan": [region.model_dump(mode="json") for region in content.regions]})
+        return revision
 
     def _empty_content_v2(self, context: _RunContext, page_id: str, reason: str,
                           *, category: str = "missing_content") -> PageContent:
         task = self._task(context, page_id)
         return PageContent(content_revision_id=str(uuid4()), book_id=context.run.book_id, page_id=page_id,
-                           source_version=task.source_version, issues=[ContentIssue(category=category, reason=reason)])
+                           source_version=task.source_version, recognition_scope=task.stage_data.get("recognition_scope", "legacy_all_visible"), issues=[ContentIssue(category=category, reason=reason)])
 
     async def _apply_review_v2(self, context: _RunContext, page_id: str, client, inputs, name: str,
                                *, targets=(), reserved_attempt_id=None) -> tuple[Revision, ContentReview | None]:
@@ -563,7 +599,10 @@ class BookProcessor:
             return current, saved.parsed if saved else None
         if not operation:
             operation = {"parse_content_revision_id": str(uuid4()), "reservation_key": str(uuid4()),
-                         "result_content_revision_id": str(uuid4()), "input_revision_id": current.revision_id}
+                         "result_content_revision_id": str(uuid4()), "input_revision_id": current.revision_id,
+                         "kind": "review", "recognition_scope": current.page_content.recognition_scope,
+                         "source_version": current.page_content.source_version,
+                         "target_regions": [item.model_dump(mode="json") for item in current.page_content.regions]}
             if reserved_attempt_id:
                 operation["attempt_id"] = reserved_attempt_id
             self._store_operation_v2(context, page_id, name, operation)
@@ -598,7 +637,12 @@ class BookProcessor:
         if response and response.body_storage == "saved":
             updated.response_ids = list(dict.fromkeys([*updated.response_ids, response.attempt_id]))
         revision = self._save_content_v2(context, page_id, updated)
-        self._update(context, page_id, stage_data={name + "_applied_revision_id": revision.revision_id})
+        adoption = ({region.region_id: updated.content_revision_id for region in updated.regions
+                     if any(block.source_region_id == region.region_id for block in updated.blocks)}
+                    if name == "review" else dict(self._task(context, page_id).stage_data.get("region_adoptions", {})))
+        self._update(context, page_id, stage_data={name + "_applied_revision_id": revision.revision_id,
+                     "region_adoptions": adoption,
+                     "region_plan": [region.model_dump(mode="json") for region in updated.regions]})
         return revision, review
 
     async def _basic_page_v2(self, context: _RunContext, page_id: str, client) -> None:
@@ -607,7 +651,94 @@ class BookProcessor:
         inputs = await asyncio.to_thread(prepare_recognition_inputs, image_path, metadata, analysis,
                                          book_dir=context.book_dir, max_crops=3)
         task = self._task(context, page_id)
-        if not task.stage_data.get("basic_recognition_complete") and not task.stage_data.get("basic_recognition_unavailable"):
+        if task.stage_data.get("recognition_scope") == "printed_original_only" and not task.stage_data.get("region_plan_complete"):
+            try:
+                planned = await self._request_v2(context, page_id, client, "recognize", "region-plan", inputs)
+                plan = planned.parsed
+                if plan is None:
+                    raise _Unavailable("区域计划未取得可用边界；不能开始无绑定的印刷转录")
+                self._update(context, page_id, stage_data={"region_plan_complete": True, "region_plan": [item.model_dump(mode="json") for item in plan.regions]})
+            except (_Unavailable, _ConfigurationStopped) as exc:
+                self._save_content_v2(context, page_id, self._empty_content_v2(context, page_id, _safe_error(exc)))
+                self._update(context, page_id, stage_data={"region_plan_unavailable": True,
+                    "basic_recognition_unavailable": True, "basic_review_unavailable": True})
+                return
+            task = self._task(context, page_id)
+        if (task.stage_data.get("recognition_scope") == "printed_original_only"
+            and not task.stage_data.get("initial_batches_finished")
+            and ("recognition_batches" in task.stage_data or not task.stage_data.get("basic_recognition_complete"))):
+            if "recognition_batches" not in task.stage_data:
+                regions = sorted((PageRegion.model_validate(item) for item in task.stage_data.get("region_plan", [])), key=lambda item: item.reading_order)
+                batches, simple = [], []
+                for region in regions:
+                    if region.layer in {"annotation", "noise", "decoration", "unknown"}:
+                        continue
+                    if region.kind == "table" or region.layer == "mixed":
+                        if simple:
+                            batches.append(simple)
+                            simple = []
+                        batches.append([region.model_dump(mode="json")])
+                    else:
+                        simple.append(region.model_dump(mode="json"))
+                        if len(simple) == 3:
+                            batches.append(simple)
+                            simple = []
+                if simple:
+                    batches.append(simple)
+                initial = self._empty_content_v2(context, page_id, "印刷区域转录尚未完成")
+                initial.issues = [ContentIssue(issue_id=f"{region.region_id}-initial-pending", region_id=region.region_id,
+                    stable_target_id=region.region_id, category="missing_content", reason="印刷区域尚未完成转录", origin="local_constraint")
+                    for region in regions if region.layer in {"printed", "mixed", "unknown"}]
+                initial.regions = regions
+                initial.blank = not any(region.layer in {"printed", "mixed", "unknown"} for region in regions)
+                initial.page_kind = "blank" if initial.blank else "content"
+                initial.unresolved_spans.extend(UnresolvedSpan(region_id=region.region_id, source_bbox=region.bbox,
+                    reason="区域来源尚未确定，等待整页覆盖复核") for region in regions if region.layer == "unknown")
+                self._save_content_v2(context, page_id, initial)
+                self._update(context, page_id, stage_data={"recognition_batches": batches, "recognition_batches_done": []})
+            batches = self._task(context, page_id).stage_data["recognition_batches"]
+            for index, batch in enumerate(batches):
+                done = list(self._task(context, page_id).stage_data.get("recognition_batches_done", []))
+                if index in done:
+                    continue
+                current = self._revision(self._task(context, page_id).candidate_revision_id).page_content
+                operation_name = f"recognize-batch-{index}"
+                try:
+                    result = await self._request_v2(context, page_id, client, "recognize", operation_name, inputs,
+                        target_regions=[PageRegion.model_validate(item) for item in batch])
+                    parsed = result.parsed.content if isinstance(result.parsed, ContentParseResult) else None
+                    if result.response_id not in current.response_ids:
+                        merged = renew_content(current)
+                        if parsed is not None:
+                            transcribed_ids = {block.source_region_id for block in parsed.blocks}
+                            merged.issues = [item for item in merged.issues if not (item.region_id in transcribed_ids and item.issue_id == f"{item.region_id}-initial-pending")]
+                            if parsed.page_kind != "blank":
+                                if not current.blocks or current.page_kind == "content":
+                                    merged.page_kind = parsed.page_kind
+                                elif current.page_kind != parsed.page_kind:
+                                    merged.issues.append(ContentIssue(category="invalid_structure", reason="不同区域批次的页面类型判断不一致"))
+                            merged.blank = False
+                            merged.blocks.extend(parsed.blocks)
+                            merged.issues.extend(parsed.issues)
+                            merged.unresolved_spans.extend(parsed.unresolved_spans)
+                            merged.response_ids.extend(parsed.response_ids)
+                        else:
+                            merged.issues.extend(ContentIssue(category="missing_content", region_id=item["region_id"], reason="本批印刷区域未取得有效转录") for item in batch)
+                        if result.response_id and result.response_id not in merged.response_ids:
+                            merged.response_ids.append(result.response_id)
+                        for block in merged.blocks:
+                            block.content_revision_id = merged.content_revision_id
+                        self._save_content_v2(context, page_id, merged)
+                except (_Unavailable, _ConfigurationStopped) as exc:
+                    merged = renew_content(current)
+                    merged.issues.extend(ContentIssue(category="missing_content", region_id=item["region_id"], reason=_safe_error(exc)) for item in batch)
+                    self._save_content_v2(context, page_id, merged)
+                self._update(context, page_id, stage_data={"recognition_batches_done": [*done, index]})
+            current = self._revision(self._task(context, page_id).candidate_revision_id).page_content
+            self._update(context, page_id, stage_data={"initial_batches_finished": True,
+                "basic_recognition_complete": True, "basic_recognition_unavailable": False})
+            task = self._task(context, page_id)
+        if task.stage_data.get("recognition_scope") != "printed_original_only" and not task.stage_data.get("basic_recognition_complete") and not task.stage_data.get("basic_recognition_unavailable"):
             content, reason, category = None, "页面未取得可用内容响应", "missing_content"
             try:
                 result = await self._request_v2(context, page_id, client, "recognize", "recognize", inputs)
@@ -641,7 +772,7 @@ class BookProcessor:
         if task.stage_data.get("basic_review_complete") or task.stage_data.get("basic_review_unavailable"):
             return
         revision = self._revision(task.candidate_revision_id)
-        if not revision.page_content.blocks and not revision.page_content.blank:
+        if revision.page_content.recognition_scope != "printed_original_only" and not revision.page_content.blocks and not revision.page_content.blank:
             self._update(context, page_id, stage_data={"basic_review_unavailable": True})
             return
         if not self._operation_v2(context, page_id, "review"):
@@ -724,9 +855,9 @@ class BookProcessor:
                 unique, identities = [], set()
                 attempted_targets = task.stage_data.get("v2_recovery_attempted_targets", [])
                 for target in targets:
-                    identity = target.get("block_id") or target["id"]
+                    identity = target.get("source_region_id") or target.get("block_id") or target["id"]
                     strategy = {"block_id": target.get("block_id"), "bbox": target.get("bbox"),
-                                "category": target["category"], "kind": target["kind"],
+                                "category": target["category"], "kind": target["kind"], "region_id": target.get("source_region_id"),
                                 "source_version": task.source_version, "input": "source_order" if target["category"] == "reading_order"
                                 else "original_resolution_complete_region_with_overview", "max_crops": 1}
                     # Plain persisted fields, not a hash: another target's
@@ -802,7 +933,7 @@ class BookProcessor:
                             raise _Unavailable("局部响应未取得完整有效内容；其他已保存块保留")
                         old_value = next((block for block in base.page_content.blocks if block.block_id == target.get("block_id")), None)
                         candidate = local_content_candidate(current.page_content, local, target, old_value=old_value)
-                        order = source_reading_order(candidate, analysis)
+                        order = ([block.block_id for block in candidate.blocks] if candidate.recognition_scope == "printed_original_only" else source_reading_order(candidate, analysis))
                         blocks = {block.block_id: block for block in candidate.blocks}
                         candidate.blocks = [blocks[identity] for identity in order]
                     if planned is None:
@@ -834,6 +965,7 @@ class BookProcessor:
                 if context.configuration_error or self._unknown_consumption_v2(context, page_id):
                     break
             current = self._revision(self._task(context, page_id).candidate_revision_id)
+            rollback_content = base.page_content
             if current.page_content == base.page_content:
                 review_attempt = next(item for item in self.storage.get_attempts(context.run.run_id, page_id)
                                       if item.attempt_id == attempts[-1].attempt_id)
@@ -851,13 +983,64 @@ class BookProcessor:
                 improved = bool(review and review.full_page_reviewed and content_improves(
                     base.page_content, reviewed.page_content,
                     blank_reviewed=bool(review.content == "usable" and review.coverage == "passed")))
+                if base.page_content.recognition_scope == "printed_original_only":
+                    rollback_content = renew_content(base.page_content)
+                    discovered_ids = {region.region_id for region in review.discovered_regions} if review else set()
+                    rollback_content.regions.extend(review.discovered_regions if review else [])
+                    if discovered_ids:
+                        rollback_content.blank = False
+                        if rollback_content.page_kind == "blank":
+                            rollback_content.page_kind = "content"
+                    changed_ids = {target.get("source_region_id") for target in recovery["checked_targets"]}
+                    unchanged_ids = {region.region_id for region in base.page_content.regions} - changed_ids
+                    evidence_ids = discovered_ids | unchanged_ids
+                    rollback_content.issues = [item for item in rollback_content.issues if item.region_id not in unchanged_ids]
+                    rollback_content.issues.extend(item for item in reviewed.page_content.issues if item.region_id in evidence_ids)
+                    reviewed_blocks = {block.block_id: block for block in reviewed.page_content.blocks if block.source_region_id in unchanged_ids}
+                    for block in rollback_content.blocks:
+                        if block.block_id in reviewed_blocks:
+                            block.review_status = reviewed_blocks[block.block_id].review_status
+                    if review and any(item.region_id in evidence_ids and (item.content != "usable" or item.coverage != "passed") for item in review.region_verdicts):
+                        rollback_content.coverage_reviewed = False
+                    rollback_content.unresolved_spans.extend(item for item in reviewed.page_content.unresolved_spans if item.region_id in discovered_ids)
+                    discovery_observations = {item.observation_id: item for item in reviewed.page_content.coverage_observations
+                        if item.mapped_region_ids and set(item.mapped_region_ids) <= evidence_ids}
+                    rollback_content.coverage_observations = [discovery_observations.pop(item.observation_id, item)
+                        for item in rollback_content.coverage_observations]
+                    rollback_content.coverage_observations.extend(discovery_observations.values())
+                    accepted = renew_content(rollback_content)
+                    adopted = dict(self._task(context, page_id).stage_data.get("region_adoptions", {}))
+                    changed = {target.get("source_region_id") for target in recovery["checked_targets"]}
+                    passed_regions = {verdict.region_id for verdict in review.region_verdicts
+                        if verdict.content == "usable" and verdict.coverage == "passed"} if review else set()
+                    accepted_regions = {region_id for region_id in changed & passed_regions
+                        if any(block.source_region_id == region_id for block in reviewed.page_content.blocks)
+                        and all(block.review_status == "usable" for block in reviewed.page_content.blocks if block.source_region_id == region_id)
+                        and not any(item.region_id == region_id and not item.resolved and item.category not in {"layout", "render"}
+                                    for item in reviewed.page_content.issues)
+                        and not any(item.region_id == region_id for item in reviewed.page_content.unresolved_spans)}
+                    for region_id in accepted_regions:
+                        target = next(item for item in recovery["checked_targets"] if item.get("source_region_id") == region_id)
+                        accepted = local_content_candidate(accepted, reviewed.page_content, target)
+                        accepted.issues = [item for item in accepted.issues if item.region_id != region_id]
+                        accepted.issues.extend(item for item in reviewed.page_content.issues if item.region_id == region_id)
+                        adopted[region_id] = reviewed.page_content.content_revision_id
+                    improved = bool(accepted_regions)
+                    if improved:
+                        accepted.coverage_reviewed = bool(reviewed.page_content.coverage_reviewed and changed <= accepted_regions)
+                        reviewed_observations = {item.observation_id: item for item in reviewed.page_content.coverage_observations
+                            if item.mapped_region_ids and set(item.mapped_region_ids) <= accepted_regions}
+                        accepted.coverage_observations = [reviewed_observations.get(item.observation_id, item)
+                            for item in accepted.coverage_observations]
+                        reviewed = self._save_content_v2(context, page_id, accepted)
+                        self._update(context, page_id, stage_data={"region_adoptions": adopted})
                 if improved:
                     self._update(context, page_id, completed_stage="review", stage_data={
                         "blank_reviewed": bool(review.content == "usable" and review.coverage == "passed"),
                         "basic_review_unavailable": False, "basic_recognition_unavailable": False})
                 else:
-                    restored = self._save_content_v2(context, page_id, base.page_content)
-                    if base.page_layout is not None:
+                    restored = self._save_content_v2(context, page_id, rollback_content)
+                    if base.page_layout is not None and base.page_content.recognition_scope != "printed_original_only":
                         restored = self._save_layout_v2(context, page_id, base.page_layout, restored)
                         cached = self._load_render_v2(context, base)
                         if cached:
@@ -962,6 +1145,8 @@ class BookProcessor:
     async def _preserve_page_v2(self, context: _RunContext, page_id: str, revision: Revision,
                                 image_path: Path, metadata: PageSourceMetadata, reason: str):
         self._checkpoint(context, source_only=True)
+        if revision.page_content.recognition_scope == "printed_original_only":
+            return revision, CandidateRenderResult(error="印刷原文结果不允许以未经确认干净的源页兜底")
         rendered = await preserve_source_page(context.book, revision, context.book_dir, image_path=image_path,
                     metadata=metadata, reason=reason, run_id=context.run.run_id, page_id=page_id)
         if rendered.pdf_path is None or rendered.layout is None:
@@ -980,6 +1165,8 @@ class BookProcessor:
 
     async def _content_source_assets_v2(self, context, page_id, content, layout, image_path, metadata, analysis):
         """Located content doubt includes omissions with no candidate block ID."""
+        if content.recognition_scope == "printed_original_only":
+            return layout, None
         semantic = [problem for problem in content.issues if not problem.resolved and problem.category not in {"layout", "render"}]
         regions = {region.region_id: region.bbox for region in layout.regions}
         boxes = []
@@ -1023,6 +1210,8 @@ class BookProcessor:
 
     async def _output_source_regions_v2(self, context, page_id, revision, rendered, image_path, metadata, analysis):
         """Settle located critical output faults without another TeX invocation."""
+        if revision.page_content.recognition_scope == "printed_original_only":
+            return revision, rendered
         critical = [item for item in rendered.diagnostics if item.severity == "error"]
         if not critical:
             return revision, rendered
@@ -1092,7 +1281,7 @@ class BookProcessor:
                 self.storage.cancel_unsent_attempt(attempt.attempt_id)
         if task.stage_data.get("v2_source_unavailable"):
             self.storage.save_page_outcome(context.run.run_id, page_id, PageOutcome(
-                page_id=page_id, source_version=task.source_version,
+                recognition_scope=task.stage_data.get("recognition_scope", "legacy_all_visible"), page_id=page_id, source_version=task.source_version,
                 content=content_conclusion(revision.page_content, blank_reviewed=task.stage_data.get("blank_reviewed", False)),
                 layout="unavailable", source_readable=False, errors=self._task(context, page_id).errors), adopt=False)
             return
@@ -1118,7 +1307,7 @@ class BookProcessor:
                         self._error_v2(context, page_id, "render", "unreadable_source", source_failure, phase="output")
                         self._update(context, page_id, stage_data={"v2_source_unavailable": True})
                 self.storage.save_page_outcome(context.run.run_id, page_id, PageOutcome(
-                    page_id=page_id, source_version=task.source_version,
+                    recognition_scope=task.stage_data.get("recognition_scope", "legacy_all_visible"), page_id=page_id, source_version=task.source_version,
                     content=content_conclusion(revision.page_content, blank_reviewed=task.stage_data.get("blank_reviewed", False)),
                     layout="unavailable", source_disposition="page_preserved" if rendered.pdf_path else "transcribed",
                     source_readable=source_failure is None, errors=self._task(context, page_id).errors), adopt=bool(rendered.pdf_path))
@@ -1192,7 +1381,7 @@ class BookProcessor:
             ):
                 layout_status = "unavailable"
             self.storage.save_page_outcome(context.run.run_id, page_id, PageOutcome(
-                page_id=page_id, source_version=task.source_version,
+                recognition_scope=task.stage_data.get("recognition_scope", "legacy_all_visible"), page_id=page_id, source_version=task.source_version,
                 content=content_conclusion(revision.page_content, blank_reviewed=self._task(context, page_id).stage_data.get("blank_reviewed", False)),
                 layout=layout_status, source_disposition=disposition, source_readable=source_failure is None,
                 content_revision_id=revision.page_content.content_revision_id,
@@ -1208,7 +1397,7 @@ class BookProcessor:
                 self._update(context, page_id, stage_data={"v2_source_unavailable": True})
             current = self._revision(self._task(context, page_id).candidate_revision_id)
             self.storage.save_page_outcome(context.run.run_id, page_id, PageOutcome(
-                page_id=page_id, source_version=task.source_version,
+                recognition_scope=task.stage_data.get("recognition_scope", "legacy_all_visible"), page_id=page_id, source_version=task.source_version,
                 content=content_conclusion(current.page_content, blank_reviewed=task.stage_data.get("blank_reviewed", False)),
                 layout="unavailable", source_readable=source_failure is None and not task.stage_data.get("v2_source_unavailable", False),
                 errors=self._task(context, page_id).errors), adopt=False)

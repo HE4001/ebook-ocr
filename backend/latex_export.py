@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .layout_contract import output_source_assets
+
 import asyncio
 import math
 import os
@@ -245,6 +247,8 @@ def build_latex(detail: BookDetail, print_version: bool = False) -> str:
         rf"\EbookLayout{{{_number(font_size)}}}{{{_number(font_size * layout.line_height)}}}{{{_number(layout.paragraph_indent)}}}{{{_number(layout.paragraph_spacing_pt)}}}",
     ]
     for index, page in enumerate(detail.pages):
+        if page.layout_source and page.layout_source.recognition_scope == "printed_original_only":
+            raise LatexCompileError("印刷原文须使用已冻结的内容或忠实布局导出，不能复用旧模板源图", code="PRINTED_SCOPE_SOURCE_BLOCKED", page_number=page.number)
         if index:
             parts.append(r"\clearpage")
         parts.append(_page_setup(page, margin, font_size, layout.line_height, print_version))
@@ -313,7 +317,7 @@ def _fidelity_document(detail: BookDetail, page: Page, position: int, print_vers
     return LatexDocument(
         source, [position], "source_fidelity", (width * scale, 0, 0, height * scale, x, y),
         scale, output_width, output_height,
-        tuple(source_resource_name(asset.image_name) for asset in layout.source_assets),
+        tuple(source_resource_name(asset.image_name) for asset in output_source_assets(layout)),
     )
 
 
@@ -321,6 +325,8 @@ def build_latex_documents(detail: BookDetail, print_version: bool = False) -> li
     """Compile every source page independently, keeping complete custom sources exact."""
     documents = []
     for position, page in enumerate(detail.pages, 1):
+        if page.layout_source and page.layout_source.recognition_scope == "printed_original_only" and page.render_strategy != "source_fidelity":
+            raise LatexCompileError("印刷原文不能通过旧自定义源码导出未核验资源", code="PRINTED_SCOPE_SOURCE_BLOCKED", page_number=page.number)
         if page.render_strategy == "source_fidelity":
             documents.append(_fidelity_document(detail, page, position, print_version))
         elif is_latex_document(page.text):
@@ -519,3 +525,89 @@ async def compile_pdf(source: str, output_dir: Path) -> Path:
         raise LatexCompileError("XeLaTeX 已结束，但没有生成 PDF")
     compiled_path.replace(pdf_path)
     return pdf_path
+
+
+
+def printed_content_notices(content) -> list[str]:
+    """User-readable unresolved coverage, separate from retained candidate text."""
+    notices = [span.reason for span in content.unresolved_spans]
+    notices.extend(issue.reason for issue in content.issues if not issue.resolved)
+    notices.extend(reason for block in content.blocks for reason in block.unresolved_reasons)
+    represented = {block.source_region_id for block in content.blocks}
+    for region in content.regions:
+        if region.layer == "unknown":
+            notices.append(f"区域 {region.region_id} 的印刷归属尚未确定")
+        elif region.layer in {"printed", "mixed"} and region.region_id not in represented:
+            notices.append(f"印刷区域 {region.region_id} 尚未取得采用正文")
+    if not content.regions and not content.blank:
+        notices.append("印刷区域计划尚未建立；不能确认源页覆盖完整")
+    if not content.coverage_reviewed:
+        notices.append("印刷覆盖核验尚未完成")
+    if any(item.scope_disposition in {"pending", "unknown"} for item in content.coverage_observations):
+        notices.append("仍有源区域尚未完成印刷范围归账")
+    if not content.blocks and not content.blank:
+        notices.append("本页尚未取得可编辑印刷正文")
+    return list(dict.fromkeys(notices))
+
+
+def printed_content_latex(content, *, paper_size: str, figure_assets=()) -> str:
+    """Editable content source, independent of fidelity geometry or PDF success."""
+    from .content_contract import EquationBlock, FigureBlock, TableBlock
+    from .layout_solver import _text_line_latex
+    from .layout_contract import equation_alignment_index
+
+    width, height, _, _ = PAPER_SIZES[paper_size]
+    # The caller supplies eligible output assets; repeat the explicit clean gate.
+    figures = {asset.region_id: asset for asset in figure_assets if asset.purpose == "figure"
+               and asset.source_layer == "printed" and asset.cleanliness_verified}
+    parts = [r"\documentclass[UTF8,fontset=fandol]{ctexart}",
+             r"\usepackage{geometry,graphicx,amsmath,amssymb,mathrsfs}",
+             rf"\geometry{{paperwidth={width}mm,paperheight={height}mm,margin=20mm}}",
+             r"\begin{document}",
+             r"\noindent 印刷原文可编辑稿（近似重排，未验证编译或内容完整性）。\par"]
+    standalone = {"equation", "equation*", "align", "align*", "alignat", "alignat*",
+                  "gather", "gather*", "multline", "multline*", "displaymath", "math", "eqnarray", "eqnarray*"}
+    for block in content.blocks:
+        if isinstance(block, FigureBlock):
+            asset = figures.get(block.block_id)
+            if asset:
+                parts.append(r"\includegraphics[width=\linewidth]{\detokenize{" + source_resource_name(asset.image_name) + "}}")
+            else:
+                parts.append(r"\noindent [此处印刷图形尚无已核验干净资源。]\par")
+            if block.description:
+                parts.append(escape_latex(block.description) + r"\par")
+            continue
+        if isinstance(block, TableBlock):
+            parts.append(r"\noindent [表格单元格正文；网格布局未还原。]\par")
+            lines = [line for cell in sorted(block.cells, key=lambda item: (item.row, item.column)) for line in cell.lines]
+        else:
+            lines = block.lines
+        for line in lines:
+            if isinstance(block, EquationBlock):
+                body = line.latex
+                outer = re.match(r"\\begin\s*\{([^{}]+)\}", body.strip())
+                environment = outer.group(1) if outer else None
+                if environment in standalone:
+                    # Standalone environments own their math mode.
+                    if environment in {"equation", "align", "alignat", "gather", "multline", "eqnarray"}:
+                        # Printed labels are retained below; never invent new labels.
+                        body = re.sub(r"\\(begin|end)\s*\{" + environment + r"\}",
+                                      lambda match: "\\" + match.group(1) + "{" + environment + "*}", body)
+                    parts.append(body)
+                    if line.number:
+                        parts.append(r"\noindent " + escape_latex(line.number) + r"\par")
+                    continue
+                # Inner environments already own their alignment. Plain math bodies
+                # with one or more top-level separators receive an aligned wrapper.
+                alignment = None if environment in {"aligned", "alignedat", "gathered", "split"} else equation_alignment_index(body, allow_multiple=True)
+                if alignment is not None:
+                    body = r"\begin{aligned}" + body + r"\end{aligned}"
+                if line.number:
+                    body += r"\qquad\text{" + escape_latex(line.number) + "}"
+                parts.append(r"\[" + body + r"\]")
+            else:
+                parts.append(_text_line_latex(line) + r"\par")
+    for notice in printed_content_notices(content):
+        parts.append(r"\noindent [未决印刷内容：" + escape_latex(notice) + r"]\par")
+    parts.append(r"\end{document}")
+    return "\n".join(parts) + "\n"

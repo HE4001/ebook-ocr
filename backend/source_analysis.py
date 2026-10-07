@@ -542,7 +542,8 @@ def _complete_crop_box(target: BBox, analysis: SourceAnalysis) -> BBox | None:
     if not regions:
         analysis.source_reasons.append("目标区域没有可确认的完整内容边界，继续提供整页；公式或表格关联边界未知")
         return None
-    box = _union([target, *(region.bbox for region in regions)])
+    semantic = [region for region in regions if region.kind in {"equation", "table"} and _contains(region.bbox, target)]
+    box = _union([target, min(semantic, key=lambda region: (region.bbox[2]-region.bbox[0])*(region.bbox[3]-region.bbox[1])).bbox]) if semantic else target
     complete_bands = analysis.region_bands((0., 0., 1., 1.))
     # Fixed-point expansion includes crossing source lines rather than cutting
     # a numerator, equation number, table heading or a cross-column title.

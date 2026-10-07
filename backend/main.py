@@ -950,7 +950,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         if not storage.get_pages(book_id):
             return ProcessResult(started=False)
         paused = next((run for run in storage.list_runs(book_id)
-                       if run.workflow_version == 1 and run.status == "paused"), None)
+                       if run.status == "paused"), None)
         if paused is not None:
             requested = set(request.pages) if request is not None and request.pages is not None else None
             if requested is not None and requested != {task.page_number for task in paused.tasks}:

@@ -10,7 +10,7 @@ from .layout_contract import (
     LayoutLine, LayoutObservation, LayoutRegion, LineStyle,
     PageLayout, PageSourceMetadata, RenderStrategy, SourceFidelityLayout,
 )
-from .content_contract import ContentConclusion, LayoutConclusion, PageContent, RecoveryReason
+from .content_contract import ContentConclusion, LayoutConclusion, PageContent, RecoveryReason, RecognitionScope
 
 PageStatus = Literal["uploaded", "processing", "ready", "failed", "interrupted"]
 BookStatus = PageStatus | Literal["pausing", "paused"]
@@ -444,8 +444,11 @@ class StructuredPageResult(BaseModel):
                 if group.get("number") is not None:
                     required_objects.append((group["number"], EquationNumber))
             for item, model in required_objects:
-                if not isinstance(item, dict) or not model.model_fields.keys() <= item.keys():
+                required_fields = set(model.model_fields) - {"match_status"}
+                if not isinstance(item, dict) or not required_fields <= item.keys():
                     raise ValueError("模型布局缺少必填字段；未知属性必须显式为 null")
+            for line in result.layout.lines:
+                line.match_status = "unknown"
             observations = result.layout.regions + result.layout.lines + result.layout.equation_groups
             if any(item.basis not in {None, "model_estimate"} for item in observations) or any(
                 line.style.basis not in {None, "model_estimate"} for line in result.layout.lines
@@ -528,6 +531,7 @@ class WorkflowError(BaseModel):
 
 
 class PageOutcome(BaseModel):
+    recognition_scope: RecognitionScope = "legacy_all_visible"
     model_config = ConfigDict(extra="forbid")
     page_id: str
     source_version: int = Field(ge=1)
@@ -583,6 +587,7 @@ class OutputSnapshotPage(BaseModel):
 
 
 class OutputSnapshot(BaseModel):
+    recognition_scope: RecognitionScope = "legacy_all_visible"
     model_config = ConfigDict(extra="forbid", frozen=True)
     workflow_version: Literal[2] = 2
     output_snapshot_id: str
@@ -664,6 +669,7 @@ class PageTask(BaseModel):
 
 
 class RunCounts(BaseModel):
+    partial_content: int = 0
     total: int = 0
     completed: int = 0
     auto_passed: int = 0
@@ -677,6 +683,7 @@ class RunCounts(BaseModel):
 
 
 class Run(BaseModel):
+    recognition_scope: RecognitionScope = "legacy_all_visible"
     workflow_version: Literal[1, 2] = 1
     run_id: str
     book_id: str
@@ -702,6 +709,7 @@ class Run(BaseModel):
 
 
 class RunSummary(BaseModel):
+    recognition_scope: RecognitionScope = "legacy_all_visible"
     workflow_version: Literal[1, 2]
     run_id: str
     book_id: str
@@ -721,6 +729,7 @@ class RunSummary(BaseModel):
 
 
 class PageOutcomeSummary(BaseModel):
+    category: Literal["editable", "partial_content", "regions_preserved", "page_preserved", "no_result", "protected_existing"] = "no_result"
     page_id: str
     page_number: int
     position: int
@@ -802,7 +811,7 @@ class Attempt(BaseModel):
     error: str | None = None
     created_at: str
     finished_at: str | None = None
-    purpose: Literal["basic_recognition", "basic_review", "local_recognition", "recovery", "recovery_review", "retry"] | None = None
+    purpose: Literal["region_plan", "basic_recognition", "basic_review", "local_recognition", "recovery", "recovery_review", "retry"] | None = None
     reservation_key: str | None = None
     recovery_round: int | None = None
     block_ids: list[str] = Field(default_factory=list)
@@ -827,6 +836,7 @@ class ExportManifestPage(BaseModel):
 
 
 class ExportManifest(BaseModel):
+    recognition_scope: RecognitionScope = "legacy_all_visible"
     model_config = ConfigDict(frozen=True)
     manifest_id: str
     book_id: str

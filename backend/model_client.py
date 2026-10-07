@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 
 from .gemini_client import GeminiClient, GeminiConfig
 from .responses_client import (
-    ContentRequestResult, ModelServiceError, OrderRequestResult, ResponsesClient,
+    ContentRequestResult, RegionPlanRequestResult, ModelServiceError, OrderRequestResult, ResponsesClient,
     ResponsesConfig, ReviewRequestResult,
 )
 

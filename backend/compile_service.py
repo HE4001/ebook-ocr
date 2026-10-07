@@ -28,9 +28,9 @@ from .latex_diagnostics import (
 from .latex_export import (
     LatexCompileError, LatexDocument, _xelatex_executable, build_latex_documents,
     build_v2_latex_document, compile_pdf, preserved_source_document,
-    source_page_geometry,
+    source_page_geometry, printed_content_latex, printed_content_notices,
 )
-from .layout_contract import PageSourceMetadata, SourceFidelityLayout, SourceRegionAsset
+from .layout_contract import PageSourceMetadata, SourceFidelityLayout, SourceRegionAsset, output_source_assets
 from .models import (
     Book, BookDetail, ExportManifest, LayoutSettings, Page, PageMapEntry,
     OutputSnapshot, OutputSnapshotPage, PdfCompileResult, RenderDiagnostic, Revision, Usage,
@@ -119,7 +119,7 @@ def _candidate_identity(book: Book, revision: Revision) -> dict:
         "output_settings_version": book.output_settings_version, "generator_version": GENERATOR_VERSION,
     }
     if revision.workflow_version == 2:
-        identity.update(workflow_version=2,
+        identity.update(workflow_version=2, recognition_scope=revision.page_content.recognition_scope if revision.page_content else "legacy_all_visible",
                         content_revision_id=revision.page_content.content_revision_id if revision.page_content else None,
                         layout_revision_id=revision.page_layout.layout_revision_id if revision.page_layout else None)
     return identity
@@ -137,6 +137,10 @@ def _read_cached_candidate(book: Book, revision: Revision, directory: Path) -> C
         return None
     record = json.loads(path.read_text(encoding="utf-8"))
     if record["identity"] != _candidate_identity(book, revision):
+        return None
+    printed_only = ((revision.page_content and revision.page_content.recognition_scope == "printed_original_only")
+                    or (revision.layout_source and revision.layout_source.recognition_scope == "printed_original_only"))
+    if printed_only and record.get("source_disposition") != "transcribed":
         return None
     pdf = directory / "document.pdf" if record.get("pdf") else None
     png = directory / "page-0001.png" if record.get("png") else None
@@ -219,6 +223,9 @@ async def cache_candidate_render(
     if result.pdf_path is None:
         _record_candidate(book, revision, book_dir, result)
         return result
+    if ((revision.page_content and revision.page_content.recognition_scope == "printed_original_only")
+            or (revision.layout_source and revision.layout_source.recognition_scope == "printed_original_only")) and result.source_disposition != "transcribed":
+        return _candidate_failure(book, revision, ValueError("印刷原文不能复用源图回退候选"), code="PRINTED_SCOPE_SOURCE_BLOCKED")
     if result.source_disposition == "source_page_preserved":
         document = result.document
     else:
@@ -333,7 +340,7 @@ def _write_preserved_pdf(document: LatexDocument, layout: SourceFidelityLayout, 
             # Formula rules and other painted paths must disappear with the replaced line.
             output.apply_redactions(images=0, graphics=2)
         a, _, _, d, x, y = document.source_to_output_affine
-        for asset in layout.source_assets:
+        for asset in output_source_assets(layout):
             left, top, right, bottom = asset.bbox
             rect = fitz.Rect(left * a + x, top * d + y, right * a + x, bottom * d + y)
             output.draw_rect(rect, color=None, fill=(1, 1, 1), overlay=True)
@@ -462,7 +469,10 @@ async def _preserve_source_page_in_directory(
     book: Book, revision: Revision, book_dir: Path, *, image_path: Path, metadata: PageSourceMetadata,
     reason: str, directory: Path,
 ) -> CandidateRenderResult:
-    """Direct source-page PDF; source packaging cannot block the available PDF."""
+    """Direct source-page PDF for historical all-visible revisions only."""
+    if ((revision.page_content and revision.page_content.recognition_scope == "printed_original_only")
+            or (revision.layout_source and revision.layout_source.recognition_scope == "printed_original_only")):
+        return _candidate_failure(book, revision, ValueError("印刷原文结果禁止原页回退；正文仍保存在 JSON"), code="PRINTED_SCOPE_SOURCE_BLOCKED")
     try:
         image_name = source_resource_name(image_path.resolve().relative_to(book_dir.resolve()).as_posix())
         pdf = directory / "document.pdf"
@@ -564,6 +574,12 @@ async def generate_manifest_outputs(
     for page, entry in zip(pages, manifest.pages):
         if page.page_id != entry.page_id or page.current_revision_id != entry.revision_id:
             raise ValueError("导出页面顺序或修订与冻结清单不一致")
+    if manifest.recognition_scope == "printed_original_only":
+        incompatible = [str(position) for position, page in enumerate(pages, 1)
+                        if page.layout_source is None or page.layout_source.recognition_scope != "printed_original_only"]
+        if incompatible:
+            raise ValueError("印刷原文高级导出包含历史或范围未知页面；请按印刷原文范围重新识别所选第 "
+                             + "、".join(incompatible) + " 页后再导出")
     settings = manifest.settings_snapshot
     book = book.model_copy(update={
         "paper_size": settings["paper_size"], "layout": LayoutSettings.model_validate(settings["layout"]),
@@ -616,6 +632,8 @@ async def generate_manifest_outputs(
                 "reason": fallback_reason, "disposition": "source_page_preserved",
             })
             try:
+                if manifest.recognition_scope == "printed_original_only":
+                    raise ValueError("印刷原文导出禁止源页回退；可用正文仍保留")
                 image_path, metadata = await asyncio.to_thread(_manifest_source, book_dir, entry, page, book.id)
                 result = await _preserve_source_page_in_directory(
                     book, revision, book_dir, image_path=image_path, metadata=metadata,
@@ -689,6 +707,21 @@ async def generate_manifest_outputs(
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as package:
         written = set()
         for position, (page, entry, document, record) in enumerate(zip(pages, manifest.pages, documents, page_records), 1):
+            if manifest.recognition_scope == "printed_original_only" or (page.layout_source and page.layout_source.recognition_scope == "printed_original_only"):
+                if document is not None:
+                    package.writestr(f"{position:04d}.tex", document.source)
+                    for name in document.resource_names:
+                        relative = source_resource_name(name)
+                        if relative not in written:
+                            resource = (book_dir / relative).resolve()
+                            if not resource.is_relative_to(book_dir.resolve()) or not resource.is_file():
+                                missing_resources.append(relative)
+                                continue
+                            package.write(resource, arcname=relative)
+                            written.add(relative)
+                else:
+                    instructions.append(f"第{position}页忠实排版源码未生成；请下载内容 JSON")
+                continue
             if document is None:
                 instructions.append(f"缺失第{position}页\t{page.page_id}\t{entry.revision_id}\t{record['error']}")
                 if page.text:
@@ -791,6 +824,10 @@ def _snapshot_content_payload(storage: Storage, snapshot: OutputSnapshot) -> dic
         revision = storage.get_snapshot_revision(snapshot.book_id, snapshot.output_snapshot_id, entry.page_id)
         record["content"] = revision.page_content.model_dump(mode="json") if revision and revision.page_content else None
         record["layout"] = revision.page_layout.model_dump(mode="json") if revision and revision.page_layout else None
+        if revision and revision.page_content and revision.page_content.recognition_scope == "printed_original_only":
+            record["unresolved_notices"] = printed_content_notices(revision.page_content)
+        if snapshot.recognition_scope == "printed_original_only" and record["layout"] is not None:
+            record["layout"]["source_assets"] = [asset.model_dump(mode="json") for asset in output_source_assets(revision.page_layout.model_copy(update={"recognition_scope": snapshot.recognition_scope}))]
         pages.append(record)
     return {"schema_version": 2, "output_snapshot": snapshot.model_dump(mode="json", exclude={"pages", "formats"}),
             "pages": pages}
@@ -807,9 +844,29 @@ def _snapshot_latex_package(storage: Storage, snapshot: OutputSnapshot, book: Bo
         package.writestr("content.json", json.dumps(payload, ensure_ascii=False, indent=2))
         for entry in snapshot.pages:
             try:
+                revision = storage.get_snapshot_revision(snapshot.book_id, snapshot.output_snapshot_id, entry.page_id)
+                if snapshot.recognition_scope == "printed_original_only" and revision and revision.page_content:
+                    if revision.page_content.recognition_scope != snapshot.recognition_scope:
+                        raise ValueError("冻结正文识别范围与输出快照不一致")
+                    filename = f"{entry.position:04d}.tex"
+                    figure_assets = output_source_assets(revision.page_layout.model_copy(update={"recognition_scope": snapshot.recognition_scope})) if revision.page_layout else ()
+                    package.writestr(filename, printed_content_latex(revision.page_content, paper_size=book.paper_size, figure_assets=figure_assets))
+                    instructions.append(f"{filename}\t{entry.page_id}\t{entry.revision_id or '-'}\t近似可编辑正文；未验证编译")
+                    if revision.page_layout:
+                        for asset in figure_assets:
+                            relative = source_resource_name(asset.image_name)
+                            if relative not in written:
+                                resource = (book_dir / relative).resolve()
+                                if not resource.is_relative_to(book_dir.resolve()) or not resource.is_file():
+                                    raise ValueError(f"已核验图形资源缺失：{relative}")
+                                package.write(resource, arcname=relative)
+                                written.add(relative)
+                    continue
                 if not entry.outcome.source_readable:
                     raise ValueError("冻结来源不可读")
                 if entry.outcome.source_disposition == "page_preserved":
+                    if snapshot.recognition_scope == "printed_original_only":
+                        raise ValueError("印刷原文快照不能包装未核验原页")
                     if entry.source_metadata is None:
                         raise ValueError("原页保留缺少冻结来源几何")
                     if (entry.source_metadata.book_id, entry.source_metadata.page_id, entry.source_metadata.source_version) != (
@@ -840,7 +897,7 @@ def _snapshot_latex_package(storage: Storage, snapshot: OutputSnapshot, book: Bo
             "此包使用同一 OCR V2 输出快照、冻结页序、内容与布局修订。",
             "每个编号 .tex 对应一张源页；在包目录编译，再按编号顺序合并。",
             "内容 JSON 保留全部已识别文字和结构。源区域或原页图像保留不计为可靠文字化。",
-            "未知表格网格/合并边框采用对应表格原区域；没有编造边框或覆盖正确的其他内容。",
+            "印刷范围的正文源码可近似重排；未知图形/表格几何仅保留说明，绝不使用未核验源图。",
             "文件\t页ID\t修订ID\t来源处置", *instructions,
         )) + "\n")
     if issues:
@@ -856,6 +913,8 @@ async def _snapshot_pdf(storage: Storage, snapshot: OutputSnapshot, book: Book,
             if not entry.outcome.source_readable:
                 raise ValueError("冻结来源不可读")
             if entry.outcome.source_disposition == "page_preserved":
+                if snapshot.recognition_scope == "printed_original_only":
+                    raise ValueError("印刷原文快照不能输出未核验原页")
                 if entry.source_metadata is None:
                     raise ValueError("原页保留缺少冻结来源几何")
                 if (entry.source_metadata.book_id, entry.source_metadata.page_id, entry.source_metadata.source_version) != (

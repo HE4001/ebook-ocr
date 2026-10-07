@@ -9,16 +9,16 @@ from typing import Any, Awaitable, Callable, Generic, Literal, TypeVar
 import httpx
 from pydantic import ValidationError
 
-from .content_contract import BlockParseFailure, ContentParseResult, PageContent, parse_content_response
+from .content_contract import BlockParseFailure, ContentParseResult, PageContent, PageRegion, RecognitionScope, parse_content_response
 from .layout_contract import BBox, CoarseRegion, CropMapping, RecognitionInput
 from .models import RecognitionResponse, StructuredPageResult, Usage
 from .prompts import (
-    CONTENT_ORDER_PROMPT, CONTENT_ORDER_SCHEMA, CONTENT_RECOGNITION_PROMPT,
+    REGION_PLAN_PROMPT, _wire_schema, CONTENT_ORDER_PROMPT, CONTENT_ORDER_SCHEMA, CONTENT_RECOGNITION_PROMPT,
     CONTENT_REREAD_PROMPT, CONTENT_REVIEW_PROMPT, CONTENT_REVIEW_SCHEMA, ContentKind,
     PAGE_REPAIR_SCHEMA, PAGE_RESPONSE_VERSION, PAGE_REVIEW_SCHEMA, content_candidate,
     content_request_input, content_response_schema, page_response_schema,
 )
-from .workflow_model_contract import ContentReview, PageReview, ReadingOrder, RepairProposal
+from .workflow_model_contract import ContentReview, PageReview, ReadingOrder, RepairProposal, RegionPlan
 
 
 MAX_RESPONSE_BYTES = 2_000_000
@@ -104,6 +104,7 @@ class ModelRequestResult(Generic[ResultType]):
 
 
 ContentRequestResult = ModelRequestResult[ContentParseResult]
+RegionPlanRequestResult = ModelRequestResult[RegionPlan]
 ReviewRequestResult = ModelRequestResult[ContentReview]
 OrderRequestResult = ModelRequestResult[ReadingOrder]
 
@@ -459,7 +460,8 @@ class ContentClientV2:
         persist_response: PersistResponse, content_kind: ContentKind | None,
         coarse_regions: list[CoarseRegion] | tuple[CoarseRegion, ...], native_text_evidence: str | None,
         target_bbox: BBox | None, target_crop: CropMapping | None, source_region_id: str | None,
-        retry: bool, stage: str,
+        retry: bool, stage: str, recognition_scope: RecognitionScope,
+        target_regions: list[PageRegion] | tuple[PageRegion, ...],
     ) -> ContentRequestResult:
         if any(item.mapping is not None and (item.mapping.page_id, item.mapping.source_version) !=
                (page_id, source_version) for item in inputs):
@@ -468,9 +470,10 @@ class ContentClientV2:
         prompt = CONTENT_REREAD_PROMPT if stage == "recover" else CONTENT_RECOGNITION_PROMPT
         try:
             input_value = await asyncio.to_thread(
-                content_request_input, inputs, prompt=prompt, content_kind=content_kind,
+                content_request_input, inputs, prompt=prompt, content_kind=None if recognition_scope == "printed_original_only" else content_kind,
                 coarse_regions=coarse_regions, native_text_evidence=native_text_evidence,
                 target_bbox=target_bbox, target_crop=target_crop,
+                recognition_scope=recognition_scope, target_regions=target_regions,
             )
         except OSError as exc:
             raise ModelServiceError("本次源页模型输入不可用", stage=stage,
@@ -479,7 +482,7 @@ class ContentClientV2:
             raise ModelServiceError(str(exc)[:500], stage=stage,
                                     reason_category="invalid_structure", field_path="inputs") from exc
         try:
-            payload = self._v2_payload(model, input_value, "ocr_content_v2", content_response_schema(content_kind))
+            payload = self._v2_payload(model, input_value, "ocr_content_v2", content_response_schema(None if recognition_scope == "printed_original_only" else content_kind))
         except ModelServiceError as exc:
             exc.stage = exc.stage or stage
             exc.reason_category = exc.reason_category or "service_configuration"
@@ -488,8 +491,9 @@ class ContentClientV2:
         def parse(body: str, response_id: str) -> ContentParseResult:
             result = parse_content_response(body, book_id=book_id, page_id=page_id,
                                             source_version=source_version, response_id=response_id,
-                                            crop_mapping=target_crop)
-            if result.content is not None and source_region_id is not None:
+                                            crop_mapping=target_crop, recognition_scope=recognition_scope,
+                                            target_regions=target_regions)
+            if result.content is not None and source_region_id is not None and not target_regions:
                 for block in result.content.blocks:
                     block.source_region_id = source_region_id
             return result
@@ -500,12 +504,49 @@ class ContentClientV2:
             on_attempt_end=on_attempt_end, persist_response=persist_response, retry=retry,
         )
 
+    async def plan_regions(
+        self, model: str, inputs: list[RecognitionInput], *, book_id: str, page_id: str,
+        source_version: int, recognition_scope: RecognitionScope,
+        on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd,
+        persist_response: PersistResponse, retry: bool = False,
+    ) -> RegionPlanRequestResult:
+        if any(item.mapping is not None and (item.mapping.page_id, item.mapping.source_version) != (page_id, source_version) for item in inputs):
+            raise ModelServiceError("区域观察来源版本不匹配", configuration_error=True, stage="recognize", field_path="inputs.mapping")
+        try:
+            input_value = await asyncio.to_thread(content_request_input, inputs,
+                prompt=REGION_PLAN_PROMPT, recognition_scope=recognition_scope,
+                native_text_evidence=f"source_version={source_version}; page_id={page_id}")
+            payload = self._v2_payload(model, input_value, "ocr_region_plan_v2", _wire_schema(RegionPlan))
+        except OSError as exc:
+            raise ModelServiceError("区域观察源图不可用", stage="recognize", reason_category="unreadable_source", field_path="inputs") from exc
+        except ValueError as exc:
+            raise ModelServiceError(str(exc)[:500], stage="recognize", reason_category="invalid_structure", field_path="inputs") from exc
+        return await _v2_request(
+            lambda: self._v2_send(model, payload), self._v2_text,
+            lambda body, response_id: self.parse_saved_region_plan(body, source_version=source_version, completion_status="complete"),
+            stage="recognize", api_key=self.config.api_key, on_attempt_start=on_attempt_start,
+            on_attempt_end=on_attempt_end, persist_response=persist_response, retry=retry)
+
+    @staticmethod
+    def parse_saved_region_plan(body: str, *, source_version: int, completion_status: CompletionStatus) -> RegionPlan:
+        if completion_status != "complete":
+            raise ResponseContractError("区域计划响应未完整完成", "completion_status")
+        plan = RegionPlan.model_validate(json.loads(body))
+        ids = [region.region_id for region in plan.regions]
+        if len(ids) != len(set(ids)) or any(region.source_version != source_version for region in plan.regions):
+            raise ResponseContractError("区域计划身份重复或来源版本不符", "regions")
+        for region in plan.regions:
+            region.cleanliness_verified = False
+        return plan
+
     async def recognize_content(
         self, model: str, inputs: list[RecognitionInput], *, book_id: str, page_id: str,
         source_version: int, on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd,
         persist_response: PersistResponse, content_kind: ContentKind | None = None,
         coarse_regions: list[CoarseRegion] | tuple[CoarseRegion, ...] = (),
         native_text_evidence: str | None = None, retry: bool = False,
+        recognition_scope: RecognitionScope = "legacy_all_visible",
+        target_regions: list[PageRegion] | tuple[PageRegion, ...] = (),
     ) -> ContentRequestResult:
         return await self._content_call(
             model, inputs, book_id=book_id, page_id=page_id, source_version=source_version,
@@ -513,6 +554,7 @@ class ContentClientV2:
             persist_response=persist_response, content_kind=content_kind, coarse_regions=coarse_regions,
             native_text_evidence=native_text_evidence, target_bbox=None, target_crop=None,
             source_region_id=None, retry=retry, stage="recognize",
+            recognition_scope=recognition_scope, target_regions=target_regions,
         )
 
     async def reread_content(
@@ -520,6 +562,8 @@ class ContentClientV2:
         source_version: int, target_bbox: BBox, target_kind: ContentKind,
         on_attempt_start: AttemptStart, on_attempt_end: AttemptEnd, persist_response: PersistResponse,
         target_crop: CropMapping | None = None, source_region_id: str | None = None, retry: bool = False,
+        recognition_scope: RecognitionScope = "legacy_all_visible",
+        target_regions: list[PageRegion] | tuple[PageRegion, ...] = (),
     ) -> ContentRequestResult:
         # No old candidate text or prior response is accepted by this interface.
         return await self._content_call(
@@ -528,6 +572,7 @@ class ContentClientV2:
             persist_response=persist_response, content_kind=target_kind, coarse_regions=(),
             native_text_evidence=None, target_bbox=target_bbox, target_crop=target_crop,
             source_region_id=source_region_id, retry=retry, stage="recover",
+            recognition_scope=recognition_scope, target_regions=target_regions,
         )
 
     async def review_content(
@@ -563,6 +608,7 @@ class ContentClientV2:
                 content_request_input, inputs,
                 prompt=CONTENT_ORDER_PROMPT if order_only else CONTENT_REVIEW_PROMPT,
                 candidate=content_candidate(content, order_only=order_only),
+                recognition_scope=content.recognition_scope,
             )
         except OSError as exc:
             raise ModelServiceError("完整源页复核输入不可用", stage=stage,
@@ -595,6 +641,8 @@ class ContentClientV2:
         body: str, *, book_id: str, page_id: str, source_version: int, response_id: str,
         completion_status: CompletionStatus,
         content_revision_id: str | None = None, crop_mapping: CropMapping | None = None,
+        recognition_scope: RecognitionScope = "legacy_all_visible",
+        target_regions: list[PageRegion] | tuple[PageRegion, ...] = (),
     ) -> ContentParseResult:
         if completion_status != "complete":
             return ContentParseResult(failures=[BlockParseFailure(
@@ -603,7 +651,8 @@ class ContentClientV2:
             )])
         return parse_content_response(body, book_id=book_id, page_id=page_id,
                                       source_version=source_version, response_id=response_id,
-                                      content_revision_id=content_revision_id, crop_mapping=crop_mapping)
+                                      content_revision_id=content_revision_id, crop_mapping=crop_mapping,
+                                      recognition_scope=recognition_scope, target_regions=target_regions)
 
     @staticmethod
     def parse_saved_review(body: str, content: PageContent, *,
@@ -617,6 +666,78 @@ class ContentClientV2:
         for index, issue in enumerate(review.issues):
             if issue.block_id is not None and issue.block_id not in block_ids:
                 raise ResponseContractError("复核问题引用了不存在的候选块", f"issues[{index}].block_id")
+        if content.recognition_scope == "legacy_all_visible" and review.discovered_regions:
+            raise ResponseContractError("历史范围不接受印刷遗漏扩展", "discovered_regions")
+        if content.recognition_scope == "printed_original_only":
+            existing_ids = {region.region_id for region in content.regions}
+            discovered_ids = [region.region_id for region in review.discovered_regions]
+            if len(discovered_ids) != len(set(discovered_ids)) or existing_ids.intersection(discovered_ids) or any(region.source_version != content.source_version or region.layer not in {"printed", "mixed"} for region in review.discovered_regions):
+                raise ResponseContractError("新增印刷遗漏区域身份、来源或层无效", "discovered_regions")
+            for region in review.discovered_regions:
+                region.cleanliness_verified = False
+                if not any(issue.region_id == region.region_id and issue.category == "missing_content" for issue in review.issues):
+                    raise ResponseContractError("新增区域必须有已确认印刷遗漏问题", "discovered_regions")
+            region_ids = existing_ids | set(discovered_ids)
+            checked = set(review.checked_region_ids)
+            if len(checked) != len(review.checked_region_ids) or not checked <= region_ids:
+                raise ResponseContractError("核验区域不属于目标计划或重复", "checked_region_ids")
+            verdict_ids = [verdict.region_id for verdict in review.region_verdicts]
+            if len(verdict_ids) != len(set(verdict_ids)) or set(verdict_ids) != checked:
+                raise ResponseContractError("逐区域结论必须恰好绑定已检查区域", "region_verdicts")
+            region_map = {region.region_id: region for region in [*content.regions, *review.discovered_regions]}
+            candidate_region_ids = {block.source_region_id for block in content.blocks}
+            unresolved_region_ids = {span.region_id for span in content.unresolved_spans}
+            for verdict in review.region_verdicts:
+                if verdict.cleanliness_verified and (region_map[verdict.region_id].layer != "printed" or region_map[verdict.region_id].kind != "figure" or verdict.content != "usable" or verdict.coverage != "passed"):
+                    raise ResponseContractError("干净图形核验必须属于通过的印刷图形", "region_verdicts.cleanliness_verified")
+                if verdict.region_id in discovered_ids and (verdict.content == "usable" or verdict.coverage == "passed"):
+                    raise ResponseContractError("新发现遗漏区域尚无采用文字，不能通过", "region_verdicts")
+                if region_map[verdict.region_id].layer == "unknown" and (verdict.content == "usable" or verdict.coverage == "passed"):
+                    raise ResponseContractError("来源层未决的区域不能宣称印刷核验通过", "region_verdicts")
+                if region_map[verdict.region_id].layer in {"printed", "mixed"} and verdict.region_id not in candidate_region_ids and (verdict.content == "usable" or verdict.coverage == "passed"):
+                    raise ResponseContractError("印刷区域没有绑定候选内容，不能通过", "region_verdicts")
+                if verdict.region_id in unresolved_region_ids and (verdict.content == "usable" or verdict.coverage == "passed"):
+                    raise ResponseContractError("候选仍含未决印刷片段，不能通过", "region_verdicts")
+                if verdict.candidate_id != content.content_revision_id:
+                    raise ResponseContractError("区域核验候选身份不匹配", "region_verdicts.candidate_id")
+            observation_ids = {item.observation_id for item in content.coverage_observations}
+            disposition_ids = [item.observation_id for item in review.observation_dispositions]
+            if len(disposition_ids) != len(set(disposition_ids)) or set(disposition_ids) != observation_ids:
+                raise ResponseContractError("核验必须逐条处置本次覆盖观察", "observation_dispositions")
+            for disposition in review.observation_dispositions:
+                if not set(disposition.mapped_region_ids) <= region_ids:
+                    raise ResponseContractError("观察处置引用计划外区域", "observation_dispositions.mapped_region_ids")
+                if disposition.scope_disposition in {"mapped_printed", "confirmed_printed_missing"} and any(region_map[region_id].layer not in {"printed", "mixed"} for region_id in disposition.mapped_region_ids):
+                    raise ResponseContractError("印刷观察不能绑定非印刷区域", "observation_dispositions.mapped_region_ids")
+                if disposition.scope_disposition in {"mapped_printed", "confirmed_printed_missing"} and not disposition.mapped_region_ids:
+                    raise ResponseContractError("印刷观察处置必须绑定区域", "observation_dispositions.mapped_region_ids")
+            stable_targets = {region_id: {region_id} for region_id in region_ids}
+            for block in content.blocks:
+                targets = stable_targets[block.source_region_id]
+                targets.add(block.block_id)
+                targets.update(line.line_id for line in getattr(block, "lines", []))
+                for cell in getattr(block, "cells", []):
+                    targets.add(cell.cell_id)
+                    targets.update(line.line_id for line in cell.lines)
+            for issue in review.issues:
+                if issue.region_id is None:
+                    raise ResponseContractError("印刷复核问题必须绑定稳定目标区域", "issues.region_id")
+                if issue.region_id is not None and issue.region_id not in checked:
+                    raise ResponseContractError("核验问题引用未检查区域", "issues.region_id")
+                issue.stable_target_id = issue.stable_target_id or issue.region_id
+                if issue.stable_target_id not in stable_targets[issue.region_id]:
+                    raise ResponseContractError("复核问题稳定目标不属于该区域候选", "issues.stable_target_id")
+                if issue.block_id is not None and next(block.source_region_id for block in content.blocks if block.block_id == issue.block_id) != issue.region_id:
+                    raise ResponseContractError("核验块和目标区域不一致", "issues.region_id")
+            required = {region.region_id for region in [*content.regions, *review.discovered_regions] if region.layer in {"printed", "mixed", "unknown"}}
+            if not required <= checked or any(verdict.content != "usable" or verdict.coverage != "passed" for verdict in review.region_verdicts) or content.unresolved_spans:
+                if review.content == "usable":
+                    review.content = "uncertain"
+                if review.coverage == "passed":
+                    review.coverage = "uncertain"
+            if any(item.scope_disposition in {"pending", "unknown", "confirmed_printed_missing"} for item in review.observation_dispositions):
+                if review.coverage == "passed":
+                    review.coverage = "uncertain"
         return review
 
     @staticmethod
