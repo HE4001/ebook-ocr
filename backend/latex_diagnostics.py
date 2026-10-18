@@ -140,11 +140,14 @@ def diagnose_document(
             dimension = "宽度" if match.group(1) == "h" else "高度"
             overflow = tex_pt_to_bp(float(match.group(2)))
             add("CONTENT_OUTSIDE_FRAME", f"编译器报告内容超出可用{dimension} {overflow:.2f} bp。",
-                "核对原行断点、公式结构与字体尺寸；不要删字或压缩单行。",
+                "核对 LaTeX 公式或表格的结构与自然宽度。" if document.fixed_layout_version is not None
+                else "核对原行断点、公式结构与字体尺寸；不要删字或压缩单行。",
                 severity="warning", basis="compiler_log", coverage="partial", overflow=overflow)
     else:
         add("LAYOUT_UNVERIFIED", "缺少当前编译日志，无法检查缺字与字体替换。", "重新编译当前修订以生成诊断记录。", coverage="none")
 
+    if document.fixed_layout_version is not None:
+        return diagnostics
     if document.render_strategy != "source_fidelity":
         add("LAYOUT_UNVERIFIED", "当前源码由模板或自定义文档控制，生成器未覆盖其全部自然尺寸。",
             "系统保留现有源码，并将其自然尺寸覆盖记录为未完成。", coverage="partial")

@@ -42,6 +42,7 @@ export function LayoutCalibration({ page, draft, dirty, disabled, saving, onChan
   const [groupId, setGroupId] = useState(draft?.observation.equation_groups[0]?.group_id ?? '')
   const fullDocument = isLatexDocument(page.text)
 
+  if (page.recognition_scope === 'printed_fixed_layout') return <p className="calibration-note">本页来自固定排版流程，按内容分类重新折行与分页。可使用源码编辑调整人工稿；原行、基线和原页画布校准仅用于历史布局稿。</p>
   if (page.page_kind !== 'content') return <p className="calibration-note">封面和封底请使用书目信息与源码编辑；正文原行校准只适用于正文页。</p>
   if (!draft) return <div className="calibration-empty">
     <strong>本页缺少原书布局，尚未还原</strong>

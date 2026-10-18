@@ -6,6 +6,7 @@ export type Usage = {
 }
 
 export type ApiProtocol = 'openai_responses' | 'gemini'
+export type RecognitionScope = 'printed_fixed_layout' | 'printed_original_only' | 'legacy_all_visible'
 
 export type Settings = {
   api_protocol: ApiProtocol
@@ -65,6 +66,8 @@ export type Book = {
 }
 
 export type Page = {
+  recognition_scope: RecognitionScope
+  fixed_layout_version: 1 | null
   number: number
   page_id: string
   source_version: number
@@ -190,7 +193,7 @@ export type PageSourceMetadata = {
 }
 
 export type SourceFidelityLayout = LayoutObservation & {
-  recognition_scope?: 'printed_original_only' | 'legacy_all_visible'
+  recognition_scope?: RecognitionScope
   unresolved_notices?: string[]
   source: PageSourceMetadata
   content_revision: number
@@ -377,7 +380,7 @@ export type RunCounts = {
   protected_existing: number
 }
 export type Run = {
-  recognition_scope?: 'printed_original_only' | 'legacy_all_visible'
+  recognition_scope?: RecognitionScope
   workflow_version: 1 | 2
   run_id: string
   book_id: string
@@ -402,6 +405,8 @@ export type Run = {
   continuation_outputs_needed: boolean
 }
 export type Revision = {
+  recognition_scope: RecognitionScope
+  fixed_layout_version: 1 | null
   workflow_version: 1 | 2
   page_content: PageContent | null
   page_layout: PageLayout | null
@@ -489,6 +494,7 @@ export type ExportManifestPage = {
   assessment: Assessment | null
 }
 export type ExportManifest = {
+  recognition_scope?: RecognitionScope
   manifest_id: string
   book_id: string
   run_id: string | null
@@ -557,7 +563,9 @@ export type EquationBlock = BlockBase & { type: 'equation'; lines: EquationConte
 export type TableCell = { cell_id: string; row: number; column: number; row_span: number; column_span: number; lines: VisualLine[]; bbox: BBox | null; preserved: boolean; reason: string | null }
 export type TableBlock = BlockBase & { type: 'table'; rows: number; columns: number; cells: TableCell[] }
 export type FigureBlock = BlockBase & { type: 'figure'; description: string | null; caption_block_ids: string[] }
-export type ContentBlock = TextBlock | EquationBlock | TableBlock | FigureBlock
+export type FixedContentCategory = 'title' | 'heading' | 'subheading' | 'paragraph' | 'equation' | 'table' | 'list' | 'caption' | 'footnote' | 'header' | 'footer' | 'page_number' | 'code' | 'quote'
+export type LatexBlock = BlockBase & { type: 'latex'; category: FixedContentCategory; latex: string }
+export type ContentBlock = LatexBlock | TextBlock | EquationBlock | TableBlock | FigureBlock
 export type ContentIssue = {
   issue_id: string
   category: RecoveryReason
@@ -571,11 +579,12 @@ export type ContentIssue = {
   resolved: boolean
 }
 export type PageContent = {
-  recognition_scope: 'printed_original_only' | 'legacy_all_visible'
+  recognition_scope: RecognitionScope
+  fixed_layout_version: 1 | null
   regions: { region_id: string; layer: 'printed' | 'annotation' | 'mixed' | 'decoration' | 'noise' | 'unknown' }[]
   coverage_reviewed: boolean
   coverage_observations: { scope_disposition: string }[]
-  unresolved_spans: { region_id: string; source_bbox: BBox | null; reason: string }[]
+  unresolved_spans: { region_id: string | null; source_bbox: BBox | null; reason: string }[]
   schema_version: 2
   content_revision_id: string
   book_id: string
@@ -612,7 +621,7 @@ export type CropMapping = {
 export type RecognitionInput = { image_path: string; kind: 'overview' | 'crop'; mapping: CropMapping | null }
 export type PageLinePlacement = { match_status?: 'matched' | 'unknown'; line_id: string; block_id: string; order: number; bbox: BBox | null; baseline: number | null; style: LineStyle; basis: EvidenceBasis | null }
 export type PageLayout = {
-  recognition_scope?: 'printed_original_only' | 'legacy_all_visible'
+  recognition_scope?: RecognitionScope
   schema_version: 2
   layout_revision_id: string
   content_revision_id: string
@@ -688,6 +697,7 @@ export type OutputSnapshotPage = {
   outcome: PageOutcome
 }
 export type OutputSnapshot = {
+  recognition_scope?: RecognitionScope
   workflow_version: 2
   output_snapshot_id: string
   book_id: string
@@ -702,7 +712,7 @@ export type OutputSnapshot = {
   created_at: string
 }
 export type RunSummary = {
-  recognition_scope?: 'printed_original_only' | 'legacy_all_visible'
+  recognition_scope?: RecognitionScope
   workflow_version: 1 | 2
   run_id: string
   book_id: string

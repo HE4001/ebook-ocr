@@ -15,6 +15,7 @@ from .models import RecognitionResponse, StructuredPageResult, Usage
 from .prompts import (
     REGION_PLAN_PROMPT, _wire_schema, CONTENT_ORDER_PROMPT, CONTENT_ORDER_SCHEMA, CONTENT_RECOGNITION_PROMPT,
     CONTENT_REREAD_PROMPT, CONTENT_REVIEW_PROMPT, CONTENT_REVIEW_SCHEMA, ContentKind,
+    FIXED_CONTENT_RECOGNITION_PROMPT, FIXED_CONTENT_REREAD_PROMPT, FIXED_CONTENT_REVIEW_PROMPT,
     PAGE_REPAIR_SCHEMA, PAGE_RESPONSE_VERSION, PAGE_REVIEW_SCHEMA, content_candidate,
     content_request_input, content_response_schema, page_response_schema,
 )
@@ -467,10 +468,15 @@ class ContentClientV2:
                (page_id, source_version) for item in inputs):
             raise ModelServiceError("源页裁切映射版本不匹配", configuration_error=True,
                                     stage=stage, field_path="inputs.mapping")
-        prompt = CONTENT_REREAD_PROMPT if stage == "recover" else CONTENT_RECOGNITION_PROMPT
+        fixed = recognition_scope == "printed_fixed_layout"
+        if fixed:
+            prompt = FIXED_CONTENT_REREAD_PROMPT if stage == "recover" else FIXED_CONTENT_RECOGNITION_PROMPT
+        else:
+            prompt = CONTENT_REREAD_PROMPT if stage == "recover" else CONTENT_RECOGNITION_PROMPT
         try:
             input_value = await asyncio.to_thread(
-                content_request_input, inputs, prompt=prompt, content_kind=None if recognition_scope == "printed_original_only" else content_kind,
+                content_request_input, inputs, prompt=prompt,
+                content_kind=None if recognition_scope in {"printed_original_only", "printed_fixed_layout"} else content_kind,
                 coarse_regions=coarse_regions, native_text_evidence=native_text_evidence,
                 target_bbox=target_bbox, target_crop=target_crop,
                 recognition_scope=recognition_scope, target_regions=target_regions,
@@ -482,7 +488,9 @@ class ContentClientV2:
             raise ModelServiceError(str(exc)[:500], stage=stage,
                                     reason_category="invalid_structure", field_path="inputs") from exc
         try:
-            payload = self._v2_payload(model, input_value, "ocr_content_v2", content_response_schema(None if recognition_scope == "printed_original_only" else content_kind))
+            payload = self._v2_payload(model, input_value, "ocr_fixed_latex_v1" if fixed else "ocr_content_v2",
+                                       content_response_schema(None if recognition_scope == "printed_original_only" else content_kind,
+                                                               recognition_scope=recognition_scope))
         except ModelServiceError as exc:
             exc.stage = exc.stage or stage
             exc.reason_category = exc.reason_category or "service_configuration"
@@ -604,9 +612,10 @@ class ContentClientV2:
             raise ModelServiceError("复核裁切与内容来源版本不匹配", configuration_error=True,
                                     stage=stage, field_path="inputs.mapping")
         try:
+            review_prompt = FIXED_CONTENT_REVIEW_PROMPT if content.recognition_scope == "printed_fixed_layout" else CONTENT_REVIEW_PROMPT
             input_value = await asyncio.to_thread(
                 content_request_input, inputs,
-                prompt=CONTENT_ORDER_PROMPT if order_only else CONTENT_REVIEW_PROMPT,
+                prompt=CONTENT_ORDER_PROMPT if order_only else review_prompt,
                 candidate=content_candidate(content, order_only=order_only),
                 recognition_scope=content.recognition_scope,
             )
@@ -668,6 +677,31 @@ class ContentClientV2:
                 raise ResponseContractError("复核问题引用了不存在的候选块", f"issues[{index}].block_id")
         if content.recognition_scope == "legacy_all_visible" and review.discovered_regions:
             raise ResponseContractError("历史范围不接受印刷遗漏扩展", "discovered_regions")
+        if content.recognition_scope == "printed_fixed_layout":
+            figures = {block.block_id: block for block in content.blocks if block.type == "figure"}
+            if review.discovered_regions or review.observation_dispositions:
+                raise ResponseContractError("固定排版复核不使用来源区域计划", "discovered_regions")
+            checked = review.checked_region_ids
+            if len(checked) != len(set(checked)) or not set(checked) <= set(figures):
+                raise ResponseContractError("图形复核必须引用现有图形块且不能重复", "checked_region_ids")
+            verdict_ids = [verdict.region_id for verdict in review.region_verdicts]
+            if len(verdict_ids) != len(set(verdict_ids)) or set(verdict_ids) != set(checked):
+                raise ResponseContractError("图形结论必须恰好覆盖本次已核对图形", "region_verdicts")
+            for verdict in review.region_verdicts:
+                if verdict.candidate_id != content.content_revision_id:
+                    raise ResponseContractError("图形核验修订不匹配", "region_verdicts.candidate_id")
+                if verdict.cleanliness_verified and (figures[verdict.region_id].bbox is None
+                        or verdict.content != "usable" or verdict.coverage != "passed"):
+                    raise ResponseContractError("干净图形必须有可裁切来源框且内容与覆盖通过", "region_verdicts.cleanliness_verified")
+            incomplete_figures = set(figures) - {verdict.region_id for verdict in review.region_verdicts
+                if verdict.cleanliness_verified and verdict.content == "usable" and verdict.coverage == "passed"}
+            if content.unresolved_spans or incomplete_figures or any(
+                block.uncertainty or block.unresolved_reasons for block in content.blocks
+            ):
+                if review.content == "usable":
+                    review.content = "uncertain"
+                if review.coverage == "passed":
+                    review.coverage = "uncertain"
         if content.recognition_scope == "printed_original_only":
             existing_ids = {region.region_id for region in content.regions}
             discovered_ids = [region.region_id for region in review.discovered_regions]

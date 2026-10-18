@@ -14,10 +14,12 @@ const COVER_FIELD_LABELS: Record<CoverField['kind'], string> = {
   isbn: 'ISBN',
 }
 
-export function PageEditor({ draft, onChange, disabled }: {
+export function PageEditor({ draft, onChange, disabled, fixedOrigin = false, manualProtected = false }: {
   draft: PageDraft
   onChange: (draft: PageDraft) => void
   disabled: boolean
+  fixedOrigin?: boolean
+  manualProtected?: boolean
 }) {
   const bodyInput = useRef<HTMLTextAreaElement>(null)
   const updateField = (index: number, changes: Partial<CoverField>) => {
@@ -38,8 +40,8 @@ export function PageEditor({ draft, onChange, disabled }: {
 
   return <fieldset className="page-editor" disabled={disabled}>
     <legend className="visually-hidden">本页校对</legend>
-    <div className="source-authority-note"><label><span>本页渲染策略</span><select value={draft.render_strategy} onChange={(event) => onChange({ ...draft, render_strategy: event.target.value as RenderStrategy })}><option value="source_fidelity">原书还原 · 结构布局控制</option><option value="legacy_template">现有模板</option><option value="custom_latex">自定义源码 · 源码控制</option></select></label><p>{draft.render_strategy === 'source_fidelity' ? '以下是布局生成的源码。只查看或原样保存仍沿用布局；实际编辑源码后，将保存为自定义源码并脱离旧布局。' : draft.render_strategy === 'custom_latex' ? '版式由源码控制；已存原书布局保留，但不会覆盖自由源码。' : '使用现有模板。实际编辑源码后，保存为自定义源码；完整文档采用自身排版。'}</p></div>
-    <div className="page-kind-control">
+    <div className="source-authority-note">{fixedOrigin ? <><strong>{manualProtected ? '人工稿 · 来自固定排版识别' : '固定排版识别生成稿'}</strong><p>{manualProtected ? '当前人工源码由你维护，固定来源标识仅说明识别出处。' : '本页由分类内容与固定模板生成，正文可以重新折行和自然分页。'} 修改后保存为人工源码，原识别快照仍可查看和下载。</p></> : <><label><span>本页历史 / 人工渲染策略</span><select value={draft.render_strategy} onChange={(event) => onChange({ ...draft, render_strategy: event.target.value as RenderStrategy })}><option value="source_fidelity">历史原书布局 · 结构控制</option><option value="legacy_template">历史模板</option><option value="custom_latex">人工源码 · 源码控制</option></select></label><p>{draft.render_strategy === 'source_fidelity' ? '以下是历史布局生成的源码。实际编辑后保存为人工源码；原布局继续归档。' : draft.render_strategy === 'custom_latex' ? '版式由源码控制；完整文档采用自身排版。' : '使用历史模板。实际编辑源码后保存为人工源码。'}</p></>}</div>
+    {!fixedOrigin && <div className="page-kind-control">
       <label htmlFor="page-kind">页面类型</label>
       <select id="page-kind" value={draft.page_kind} onChange={(event) => onChange({ ...draft, page_kind: event.target.value as PageKind })}>
         <option value="content">正文页</option>
@@ -47,8 +49,8 @@ export function PageEditor({ draft, onChange, disabled }: {
         <option value="back_cover">封底</option>
       </select>
       <p>识别为封面或封底时自动应用对应版式，也可在此修正类型。切换时保留未保存草稿；保存后仅保留所选类型的内容。</p>
-    </div>
-    {draft.page_kind === 'content'
+    </div>}
+    {fixedOrigin || draft.page_kind === 'content'
       ? <div className="body-editor">
         <label htmlFor="page-latex-body">LaTeX 源码</label>
         <div className="latex-tools" role="group" aria-label="插入 LaTeX 格式" onMouseDown={(event) => event.preventDefault()}>
@@ -64,7 +66,7 @@ export function PageEditor({ draft, onChange, disabled }: {
           <button type="button" onClick={() => insert('\\[\n', '\n\\]')}>公式</button>
         </div>
         <textarea ref={bodyInput} id="page-latex-body" aria-label="本页 LaTeX 源码" value={draft.text} onChange={(event) => onChange({ ...draft, text: event.target.value })} spellCheck={false} placeholder="本页暂无源码" />
-        <p className="latex-editor-hint">支持正文片段，也支持以 <code>{'\\documentclass'}</code> 开头的完整文档、宏包和自定义宏。片段使用项目模板；完整文档保留自身排版，不应用项目纸型、页眉页脚或装订设置。保留原行、行序和段落，超宽也不拆行、合行或缩放；语法、缺包和字体错误由 XeLaTeX 报告。</p>
+        <p className="latex-editor-hint">支持正文片段，也支持以 <code>{'\\documentclass'}</code> 开头的完整文档、宏包和自定义宏。片段使用人工稿模板；完整文档保持源码定义的纸型与排版。按内容组织段落，正文可自动折行和自然分页；语法、缺包和字体错误由 XeLaTeX 报告。</p>
         <p className="latex-editor-hint">黑体用 <code>{'{\\heiti 词语}'}</code>，粗体用 <code>{'\\textbf{词语}'}</code>，原页两者同时存在才叠加，不按语义自动加粗。“文字与公式加粗”只用于从文字模式选中、包含完整公式定界符或环境的范围；<code>{'\\bfseries'}</code> 和 <code>{'\\boldmath'}</code> 都须在数学模式外。</p>
         <p className="latex-editor-hint">公式内部及上下标使用“公式内加粗”，选中数学内容后插入 <code>{'\\boldsymbol{...}'}</code>，不选公式定界符；粗正体字母可用 <code>{'\\mathbf{A}'}</code>，不要将整式改为 <code>{'\\mathbf'}</code>。<code>{'\\textbf'}</code> 只改变文字字重；按钮和提示不会自动修复已有错误源码。</p>
       </div>

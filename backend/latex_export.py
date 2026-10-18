@@ -18,6 +18,7 @@ from .fidelity_rendering import (
     GENERATOR_VERSION, MATHRSFS_FONT_SHAPES, FidelityLayoutError, canvas_dimensions, render_fidelity_source,
 )
 from .latex_content import escape_latex, is_latex_document, latex_image_resources, source_resource_name
+from .fixed_layout import FIXED_LAYOUT_VERSION, fixed_block_latex, fixed_layout_preamble
 from .layout_contract import AffineTransform, PageSourceMetadata, RenderStrategy, SourceFidelityLayout
 from .models import Book, BookDetail, MarginSegment, Page, Revision, Usage
 
@@ -142,6 +143,7 @@ class LatexDocument:
     output_width_bp: float | None = None
     output_height_bp: float | None = None
     resource_names: tuple[str, ...] = ()
+    fixed_layout_version: int | None = None
 
 
 def _number(value: float) -> str:
@@ -331,7 +333,8 @@ def build_latex_documents(detail: BookDetail, print_version: bool = False) -> li
             documents.append(_fidelity_document(detail, page, position, print_version))
         elif is_latex_document(page.text):
             documents.append(LatexDocument(page.text, [position], "custom_latex",
-                                           resource_names=latex_image_resources(page.text)))
+                                           resource_names=latex_image_resources(page.text),
+                                           fixed_layout_version=page.fixed_layout_version if page.recognition_scope == "printed_fixed_layout" else None))
         else:
             page_detail = detail.model_copy(update={"pages": [page]})
             width, height, _, _ = PAPER_SIZES[detail.book.paper_size]
@@ -347,6 +350,13 @@ def build_v2_latex_document(book: Book, revision: Revision, *, position: int = 1
     """Render all typed content, including covers and contents, through one path."""
     from .layout_solver import to_source_fidelity_layout
 
+    if revision.workflow_version == 2 and revision.page_content is not None and revision.page_content.recognition_scope == "printed_fixed_layout":
+        assets = output_source_assets(revision.page_layout) if revision.page_layout else ()
+        source = fixed_content_latex(revision.page_content, paper_size=book.paper_size, figure_assets=assets)
+        width, height, _, _ = PAPER_SIZES[book.paper_size]
+        return LatexDocument(source, [position], "custom_latex", output_width_bp=width * 72 / 25.4,
+                             output_height_bp=height * 72 / 25.4, resource_names=latex_image_resources(source),
+                             fixed_layout_version=FIXED_LAYOUT_VERSION)
     if revision.workflow_version != 2 or revision.page_content is None or revision.page_layout is None:
         raise LatexCompileError("此内容修订尚无可用派生布局", code="LAYOUT_UNVERIFIED",
                                 page_number=revision.page_number)
@@ -533,21 +543,54 @@ def printed_content_notices(content) -> list[str]:
     notices = [span.reason for span in content.unresolved_spans]
     notices.extend(issue.reason for issue in content.issues if not issue.resolved)
     notices.extend(reason for block in content.blocks for reason in block.unresolved_reasons)
-    represented = {block.source_region_id for block in content.blocks}
-    for region in content.regions:
-        if region.layer == "unknown":
-            notices.append(f"区域 {region.region_id} 的印刷归属尚未确定")
-        elif region.layer in {"printed", "mixed"} and region.region_id not in represented:
-            notices.append(f"印刷区域 {region.region_id} 尚未取得采用正文")
-    if not content.regions and not content.blank:
+    if content.recognition_scope != "printed_fixed_layout":
+        represented = {block.source_region_id for block in content.blocks}
+        for region in content.regions:
+            if region.layer == "unknown":
+                notices.append(f"区域 {region.region_id} 的印刷归属尚未确定")
+            elif region.layer in {"printed", "mixed"} and region.region_id not in represented:
+                notices.append(f"印刷区域 {region.region_id} 尚未取得采用正文")
+    if content.recognition_scope == "printed_original_only" and not content.regions and not content.blank:
         notices.append("印刷区域计划尚未建立；不能确认源页覆盖完整")
     if not content.coverage_reviewed:
         notices.append("印刷覆盖核验尚未完成")
-    if any(item.scope_disposition in {"pending", "unknown"} for item in content.coverage_observations):
+    if content.recognition_scope != "printed_fixed_layout" and any(item.scope_disposition in {"pending", "unknown"} for item in content.coverage_observations):
         notices.append("仍有源区域尚未完成印刷范围归账")
     if not content.blocks and not content.blank:
         notices.append("本页尚未取得可编辑印刷正文")
     return list(dict.fromkeys(notices))
+
+
+def fixed_content_latex(content, *, paper_size: str, figure_assets=()) -> str:
+    """Wrap the model's classified LaTeX; source geometry never drives output."""
+    from .content_contract import FigureBlock, LatexBlock
+
+    if content.recognition_scope != "printed_fixed_layout" or content.fixed_layout_version != FIXED_LAYOUT_VERSION:
+        raise ValueError("正文不属于当前固定排版契约")
+    width, height, _, _ = PAPER_SIZES[paper_size]
+    figures = {asset.region_id: asset for asset in figure_assets if asset.purpose == "figure"
+               and asset.source_layer == "printed" and asset.cleanliness_verified}
+    parts = [fixed_layout_preamble(width, height)]
+    for block in content.blocks:
+        if isinstance(block, LatexBlock):
+            parts.append(fixed_block_latex(block.category, block.latex))
+        elif isinstance(block, FigureBlock):
+            asset = figures.get(block.block_id)
+            if asset is None or block.bbox is None:
+                parts.append(fixed_block_latex("caption", escape_latex("[图形资源尚未核验或不能裁切]")))
+            else:
+                name = source_resource_name(asset.image_name)
+                parts.extend((r"\par\addvspace{6pt}\begingroup\centering",
+                              r"\includegraphics[width=\linewidth,height=0.65\textheight,keepaspectratio]{\detokenize{" + name + "}}",
+                              r"\par\endgroup\addvspace{6pt}"))
+        else:
+            raise ValueError("固定排版不能将历史文字结构转换为模型 LaTeX")
+    if content.blank:
+        parts.append(r"\null")
+    for notice in printed_content_notices(content):
+        parts.append(fixed_block_latex("footnote", escape_latex("[识别未决] " + notice)))
+    parts.append(r"\end{document}")
+    return "\n".join(parts) + "\n"
 
 
 def printed_content_latex(content, *, paper_size: str, figure_assets=()) -> str:
@@ -556,6 +599,8 @@ def printed_content_latex(content, *, paper_size: str, figure_assets=()) -> str:
     from .layout_solver import _text_line_latex
     from .layout_contract import equation_alignment_index
 
+    if content.recognition_scope == "printed_fixed_layout":
+        return fixed_content_latex(content, paper_size=paper_size, figure_assets=figure_assets)
     width, height, _, _ = PAPER_SIZES[paper_size]
     # The caller supplies eligible output assets; repeat the explicit clean gate.
     figures = {asset.region_id: asset for asset in figure_assets if asset.purpose == "figure"

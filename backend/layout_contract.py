@@ -259,7 +259,7 @@ def output_source_assets(layout):
 
 
 class SourceFidelityLayout(LayoutObservation):
-    recognition_scope: Literal["legacy_all_visible", "printed_original_only"] = "legacy_all_visible"
+    recognition_scope: Literal["legacy_all_visible", "printed_original_only", "printed_fixed_layout"] = "legacy_all_visible"
     unresolved_notices: list[str] = Field(default_factory=list, max_length=2_000)
     # The old model wire remains LayoutObservation (500 / 2,000). V2 local
     # derived rendering may reference the larger saved content collection.
@@ -349,7 +349,7 @@ class PageLinePlacement(LayoutModel):
 
 
 class PageLayout(LayoutModel):
-    recognition_scope: Literal["legacy_all_visible", "printed_original_only"] = "legacy_all_visible"
+    recognition_scope: Literal["legacy_all_visible", "printed_original_only", "printed_fixed_layout"] = "legacy_all_visible"
     schema_version: Literal[2] = 2
     layout_revision_id: str
     content_revision_id: str

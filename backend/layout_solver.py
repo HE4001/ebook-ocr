@@ -465,6 +465,8 @@ def derive_layout(
     image_path: Path, book_dir: Path, layout_revision_id: str | None = None,
 ) -> PageLayout:
     """Derive geometry after content is saved, reusing exactly its source analysis."""
+    if content.recognition_scope == "printed_fixed_layout":
+        raise ValueError("固定排版内容由统一模板渲染，不派生原书位置布局")
     analysis.require_source(metadata)
     if (content.book_id, content.page_id, content.source_version) != (metadata.book_id, metadata.page_id, metadata.source_version):
         raise ValueError("内容、来源与布局输入版本不一致")
@@ -684,6 +686,8 @@ def to_source_fidelity_layout(
     content: PageContent, layout: PageLayout, *, content_revision: int = 0, layout_revision: int = 0,
 ) -> SourceFidelityLayout:
     """Explicit renderer adapter; layout can never provide authoritative text."""
+    if content.recognition_scope == "printed_fixed_layout":
+        raise ValueError("固定排版内容不转换为原书位置布局")
     if (layout.content_revision_id, layout.source.book_id, layout.page_id, layout.source_version) != (
         content.content_revision_id, content.book_id, content.page_id, content.source_version
     ):

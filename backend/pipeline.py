@@ -17,7 +17,7 @@ from .compile_service import (
     CandidateRenderResult, cache_candidate_render, generate_manifest_outputs, generate_snapshot_outputs,
     load_candidate_render, preserve_source_page, preserve_source_regions, render_candidate,
 )
-from .content_contract import UnresolvedSpan, ContentIssue, ContentParseResult, PageContent, PageRegion
+from .content_contract import UnresolvedSpan, ContentIssue, ContentParseResult, FigureBlock, PageContent, PageRegion
 from .importers import IMAGE_LOCK, prepare_analyzed_page, prepare_page
 from .latex_diagnostics import local_geometry_adjustment
 from .latex_export import GENERATOR_VERSION, FidelityLayoutError, generate_source_fidelity_latex
@@ -302,12 +302,16 @@ class BookProcessor:
         if page_id in context.prepared_pages:
             return context.prepared_pages[page_id]
         record = self.storage.get_run_page_record(context.run.run_id, page_id)
+        fixed = self._task(context, page_id).stage_data.get("recognition_scope") == "printed_fixed_layout"
         prepared = self._task(context, page_id).stage_data.get("prepared")
         if prepared is None:
             self._update(context, page_id, stage="prepare", state="running")
             try:
-                width, height, image_name, metadata, analysis = await asyncio.to_thread(
-                    prepare_analyzed_page, context.book_dir, record, max_crops=3)
+                if fixed:
+                    width, height, image_name, metadata = await asyncio.to_thread(prepare_page, context.book_dir, record)
+                else:
+                    width, height, image_name, metadata, analysis = await asyncio.to_thread(
+                        prepare_analyzed_page, context.book_dir, record, max_crops=3)
             except (OSError, fitz.FileDataError) as exc:
                 # Preparation includes analysis/cache writes. Only an actual
                 # failed read of the original frozen source proves unreadable.
@@ -320,8 +324,12 @@ class BookProcessor:
             self._update(context, page_id, completed_stage="prepare", stage_data={"prepared": prepared})
         else:
             metadata = PageSourceMetadata.model_validate(prepared["metadata"])
-            analysis = await asyncio.to_thread(analyze_source, context.book_dir / prepared["image_name"], metadata,
-                                               book_dir=context.book_dir, max_crops=3)
+            if not fixed:
+                analysis = await asyncio.to_thread(analyze_source, context.book_dir / prepared["image_name"], metadata,
+                                                   book_dir=context.book_dir, max_crops=3)
+        if fixed:
+            analysis = SourceAnalysis(width=prepared["width"], height=prepared["height"], mask=b"",
+                                      page_id=page_id, source_version=metadata.source_version)
         record.update(width=prepared["width"], height=prepared["height"], image_name=prepared["image_name"])
         context.prepared_pages[page_id] = record, context.book_dir / prepared["image_name"], metadata, analysis
         return context.prepared_pages[page_id]
@@ -586,7 +594,9 @@ class BookProcessor:
                           *, category: str = "missing_content") -> PageContent:
         task = self._task(context, page_id)
         return PageContent(content_revision_id=str(uuid4()), book_id=context.run.book_id, page_id=page_id,
-                           source_version=task.source_version, recognition_scope=task.stage_data.get("recognition_scope", "legacy_all_visible"), issues=[ContentIssue(category=category, reason=reason)])
+                           source_version=task.source_version, recognition_scope=task.stage_data.get("recognition_scope", "legacy_all_visible"),
+                           fixed_layout_version=1 if task.stage_data.get("recognition_scope") == "printed_fixed_layout" else None,
+                           issues=[ContentIssue(category=category, reason=reason)])
 
     async def _apply_review_v2(self, context: _RunContext, page_id: str, client, inputs, name: str,
                                *, targets=(), reserved_attempt_id=None) -> tuple[Revision, ContentReview | None]:
@@ -648,8 +658,9 @@ class BookProcessor:
     async def _basic_page_v2(self, context: _RunContext, page_id: str, client) -> None:
         _, image_path, metadata, analysis = await self._prepare_v2(context, page_id)
         self._checkpoint(context, source_only=True)
+        fixed = self._task(context, page_id).stage_data.get("recognition_scope") == "printed_fixed_layout"
         inputs = await asyncio.to_thread(prepare_recognition_inputs, image_path, metadata, analysis,
-                                         book_dir=context.book_dir, max_crops=3)
+                                         book_dir=context.book_dir, max_crops=0 if fixed else 3)
         task = self._task(context, page_id)
         if task.stage_data.get("recognition_scope") == "printed_original_only" and not task.stage_data.get("region_plan_complete"):
             try:
@@ -837,8 +848,9 @@ class BookProcessor:
         if task.stage_data.get("v2_recovery_done") or task.candidate_revision_id is None:
             return
         _, image_path, metadata, analysis = await self._prepare_v2(context, page_id)
+        fixed = task.stage_data.get("recognition_scope") == "printed_fixed_layout"
         inputs = await asyncio.to_thread(prepare_recognition_inputs, image_path, metadata, analysis,
-                                         book_dir=context.book_dir, max_crops=3)
+                                         book_dir=context.book_dir, max_crops=0 if fixed else 3)
         while True:
             self._checkpoint(context, source_only=True)
             task = self._task(context, page_id)
@@ -860,12 +872,15 @@ class BookProcessor:
                                 "category": target["category"], "kind": target["kind"], "region_id": target.get("source_region_id"),
                                 "source_version": task.source_version, "input": "source_order" if target["category"] == "reading_order"
                                 else "original_resolution_complete_region_with_overview", "max_crops": 1}
+                    if fixed:
+                        strategy = {"source_version": task.source_version, "input": "fixed_whole_page"}
                     # Plain persisted fields, not a hash: another target's
                     # improvement does not authorize repeating this scheme.
-                    if any({**strategy, "bbox": list(strategy["bbox"]) if strategy["bbox"] else None} == item
+                    strategy = {**strategy, "bbox": list(strategy["bbox"]) if strategy.get("bbox") else None}
+                    if any(strategy == item
                            for item in attempted_targets):
                         continue
-                    target["strategy"] = {**strategy, "bbox": list(strategy["bbox"]) if strategy["bbox"] else None}
+                    target["strategy"] = strategy
                     if identity not in identities and (target["category"] == "reading_order" or target.get("bbox") is not None):
                         if target["category"] == "reading_order" and any(item["category"] == "reading_order" for item in unique):
                             continue
@@ -925,7 +940,7 @@ class BookProcessor:
                     else:
                         local_inputs = await asyncio.to_thread(
                             prepare_recognition_inputs, image_path, metadata, analysis, book_dir=context.book_dir,
-                            max_crops=1, target_bbox=target["bbox"])
+                            max_crops=0 if fixed else 1, target_bbox=target["bbox"])
                         result = await self._request_v2(context, page_id, client, "recover", operation_name, local_inputs,
                                                         target=target, reserved_attempt_id=attempts[index].attempt_id)
                         local = result.parsed.content if isinstance(result.parsed, ContentParseResult) else None
@@ -933,7 +948,7 @@ class BookProcessor:
                             raise _Unavailable("局部响应未取得完整有效内容；其他已保存块保留")
                         old_value = next((block for block in base.page_content.blocks if block.block_id == target.get("block_id")), None)
                         candidate = local_content_candidate(current.page_content, local, target, old_value=old_value)
-                        order = ([block.block_id for block in candidate.blocks] if candidate.recognition_scope == "printed_original_only" else source_reading_order(candidate, analysis))
+                        order = ([block.block_id for block in candidate.blocks] if candidate.recognition_scope in {"printed_original_only", "printed_fixed_layout"} else source_reading_order(candidate, analysis))
                         blocks = {block.block_id: block for block in candidate.blocks}
                         candidate.blocks = [blocks[identity] for identity in order]
                     if planned is None:
@@ -1062,6 +1077,15 @@ class BookProcessor:
 
     def _save_layout_v2(self, context: _RunContext, page_id: str, layout: PageLayout, base: Revision,
                          *, render_layout: SourceFidelityLayout | None = None) -> Revision:
+        if base.page_content.recognition_scope == "printed_fixed_layout":
+            from .latex_export import fixed_content_latex
+            if layout.content_revision_id != base.page_content.content_revision_id:
+                layout = layout.model_copy(update={"layout_revision_id": str(uuid4()),
+                                                    "content_revision_id": base.page_content.content_revision_id})
+            generated = fixed_content_latex(base.page_content, paper_size=context.book.paper_size,
+                                            figure_assets=layout.source_assets)
+            return self.storage.save_layout_candidate(context.run.run_id, page_id, layout,
+                        expected_candidate_revision_id=base.revision_id, generated_text=generated)
         if render_layout is None:
             render_layout = to_source_fidelity_layout(base.page_content, layout,
                                                       content_revision=base.content_revision, layout_revision=base.layout_revision + 1)
@@ -1270,6 +1294,67 @@ class BookProcessor:
             revision = self._revision(self._task(context, page_id).candidate_revision_id)
         return await self._preserve_page_v2(context, page_id, revision, image_path, metadata, reason)
 
+    async def _finish_fixed_page_v2(self, context: _RunContext, page_id: str, revision: Revision) -> None:
+        """Use fixed typography and verified figures without source positioning."""
+        task = self._task(context, page_id)
+        rendered = None
+        try:
+            _, image_path, metadata, _ = await self._prepare_v2(context, page_id)
+            existing_layout = revision.page_layout
+            assets = list(existing_layout.source_assets) if existing_layout else []
+            available = {asset.region_id for asset in assets if asset.purpose == "figure"
+                         and asset.source_layer == "printed" and asset.cleanliness_verified
+                         and (context.book_dir / asset.image_name).is_file()}
+            missing_figures = []
+            for block in revision.page_content.blocks:
+                if not isinstance(block, FigureBlock) or block.block_id in available:
+                    continue
+                verified = next((item for item in revision.page_content.regions if item.region_id == block.block_id), None)
+                if block.bbox is not None and block.review_status == "usable" and verified and verified.cleanliness_verified:
+                    missing_figures.append(block)
+            if existing_layout is None or missing_figures:
+                self._update(context, page_id, stage="layout", state="running")
+                missing_ids = {block.block_id for block in missing_figures}
+                assets = [asset for asset in assets if asset.region_id not in missing_ids]
+                for block in missing_figures:
+                    try:
+                        asset = await asyncio.to_thread(persist_source_region, context.book_dir, image_path, metadata,
+                            block.bbox, block.block_id, "固定排版中的印刷图形", purpose="figure")
+                    except (OSError, ValueError, fitz.FileDataError) as exc:
+                        self._error_v2(context, page_id, "layout", "layout", "图形裁切不可用：" + _safe_error(exc),
+                                       phase="output", block_id=block.block_id, bbox=block.bbox)
+                        continue
+                    assets.append(asset.model_copy(update={"source_layer": "printed", "cleanliness_verified": True}))
+                if existing_layout is None or assets != existing_layout.source_assets:
+                    layout = PageLayout(recognition_scope="printed_fixed_layout", layout_revision_id=str(uuid4()),
+                        content_revision_id=revision.page_content.content_revision_id, page_id=page_id,
+                        source_version=task.source_version, source=metadata, source_assets=assets,
+                        conclusion="approximate")
+                    revision = self._save_layout_v2(context, page_id, layout, revision)
+                self._update(context, page_id, completed_stage="layout")
+            rendered = await self._compile_v2(context, page_id, revision)
+            if rendered.error or rendered.pdf_path is None:
+                self._error_v2(context, page_id, "render", "render", rendered.error or "固定排版 PDF 未生成", phase="output")
+            for diagnostic in rendered.diagnostics:
+                if diagnostic.severity == "error":
+                    self._error_v2(context, page_id, "render", "render", diagnostic.message,
+                                   phase="output", block_id=diagnostic.block_id)
+            self._update(context, page_id, completed_stage="render", stage_data={"v2_render_done": True})
+        except _Paused:
+            raise
+        except (_SourceUnavailable, OSError, ValueError, KeyError, TypeError, fitz.FileDataError) as exc:
+            self._error_v2(context, page_id, "render", "render", _safe_error(exc), phase="output")
+            revision = self._revision(self._task(context, page_id).candidate_revision_id)
+        usable_output = bool(rendered and rendered.pdf_path and not rendered.error
+                             and not any(item.severity == "error" for item in rendered.diagnostics))
+        self.storage.save_page_outcome(context.run.run_id, page_id, PageOutcome(
+            recognition_scope="printed_fixed_layout", page_id=page_id, source_version=task.source_version,
+            content=content_conclusion(revision.page_content, blank_reviewed=task.stage_data.get("blank_reviewed", False)),
+            layout="approximate" if usable_output else "unavailable", source_disposition="transcribed",
+            content_revision_id=revision.page_content.content_revision_id,
+            layout_revision_id=revision.page_layout.layout_revision_id if revision.page_layout else None,
+            errors=self._task(context, page_id).errors), adopt=bool(revision.page_content.blocks or revision.page_content.blank))
+
     async def _finish_page_v2(self, context: _RunContext, page_id: str) -> None:
         self._checkpoint(context, source_only=True)
         task = self._task(context, page_id)
@@ -1284,6 +1369,9 @@ class BookProcessor:
                 recognition_scope=task.stage_data.get("recognition_scope", "legacy_all_visible"), page_id=page_id, source_version=task.source_version,
                 content=content_conclusion(revision.page_content, blank_reviewed=task.stage_data.get("blank_reviewed", False)),
                 layout="unavailable", source_readable=False, errors=self._task(context, page_id).errors), adopt=False)
+            return
+        if revision.page_content.recognition_scope == "printed_fixed_layout":
+            await self._finish_fixed_page_v2(context, page_id, revision)
             return
         try:
             if task.stage_data.get("v2_analysis_unavailable"):

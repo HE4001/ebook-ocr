@@ -14,7 +14,7 @@ import pymupdf as fitz
 from PIL import Image, ImageOps
 
 from .importers import IMAGE_LOCK, original_source_image
-from .content_contract import ContentIssue, EquationBlock, FigureBlock, PageContent, TableBlock, TextBlock
+from .content_contract import ContentIssue, EquationBlock, FigureBlock, LatexBlock, PageContent, TableBlock, TextBlock
 from .layout_contract import (
     BBox, CoarseRegion, CropMapping, PageSourceMetadata, RecognitionInput, SourceFidelityLayout, SourceRegionAsset,
     equation_alignment_index, inverse_transform, transform_point,
@@ -659,6 +659,8 @@ def _content_key(block) -> str:
         value = {"type": block.type, "role": block.role, "rows": block.rows, "columns": block.columns,
                  "cells": [{**cell.model_dump(exclude={"cell_id", "bbox", "lines"}),
                             "lines": [line_key(line) for line in cell.lines]} for cell in block.cells]}
+    elif isinstance(block, LatexBlock):
+        value = {"type": block.type, "category": block.category, "latex": block.latex}
     else:
         value = {"type": block.type, "role": block.role, "description": block.description}
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
@@ -696,6 +698,8 @@ def _same_source_item(a, b) -> bool:
 
 def source_reading_order(content: PageContent, analysis: SourceAnalysis) -> list[str]:
     """Return source-supported block order; unlocated blocks retain their slots."""
+    if content.recognition_scope == "printed_fixed_layout":
+        return [block.block_id for block in content.blocks]
     if (content.page_id, content.source_version) != (analysis.page_id, analysis.source_version):
         raise ValueError("阅读顺序与来源版本不一致")
     known = []

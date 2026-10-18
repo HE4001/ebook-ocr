@@ -13,11 +13,14 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from .layout_contract import BBox, CropMapping, FontFamily, transform_point
+from .fixed_layout import FIXED_LAYOUT_VERSION, validate_fixed_fragment
 
-RecognitionScope = Literal["printed_original_only", "legacy_all_visible"]
+RecognitionScope = Literal["printed_fixed_layout", "printed_original_only", "legacy_all_visible"]
+LatexCategory = Literal["title", "heading", "subheading", "paragraph", "equation", "table", "list",
+                        "caption", "footnote", "header", "footer", "page_number", "code", "quote"]
 SourceLayer = Literal["printed", "annotation", "mixed", "decoration", "noise", "unknown"]
 ScopeDisposition = Literal["pending", "mapped_printed", "confirmed_printed_missing", "annotation_excluded", "decoration", "noise", "unknown"]
-
+import
 ContentConclusion = Literal["usable", "uncertain", "unavailable", "unverified"]
 LayoutConclusion = Literal["faithful", "approximate", "unavailable", "unverified"]
 ContentRole = Literal["body", "header", "footer", "title", "footnote", "caption", "page_number", "other"]
@@ -52,7 +55,7 @@ class CoverageObservation(ContentModel):
 
 
 class UnresolvedSpan(ContentModel):
-    region_id: str = Field(min_length=1, max_length=128)
+    region_id: str | None = Field(default=None, min_length=1, max_length=128)
     source_bbox: BBox | None = None
     reason: str = Field(min_length=1, max_length=2_000)
 
@@ -206,7 +209,20 @@ class FigureBlock(BlockBase):
     caption_block_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
-ContentBlock = Annotated[TextBlock | EquationBlock | TableBlock | FigureBlock, Field(discriminator="type")]
+class LatexBlock(BlockBase):
+    type: Literal["latex"]
+    category: LatexCategory
+    latex: str = Field(min_length=1, max_length=100_000)
+
+    @model_validator(mode="after")
+    def validate_fragment(self) -> "LatexBlock":
+        if not self.latex.strip():
+            raise ValueError("分类 LaTeX 内容不能为空")
+        validate_fixed_fragment(self.latex)
+        return self
+
+
+ContentBlock = Annotated[TextBlock | EquationBlock | TableBlock | FigureBlock | LatexBlock, Field(discriminator="type")]
 _BLOCK_ADAPTER = TypeAdapter(ContentBlock)
 _BBOX_ADAPTER = TypeAdapter(BBox)
 
@@ -264,7 +280,14 @@ class WireFigureBlock(WireBlockBase):
     description: str | None = Field(default=None, max_length=2_000)
 
 
+class WireLatexBlock(WireBlockBase):
+    type: Literal["latex"]
+    category: LatexCategory
+    latex: str = Field(min_length=1, max_length=100_000)
+
+
 WireContentBlock = Annotated[WireTextBlock | WireEquationBlock | WireTableBlock | WireFigureBlock, Field(discriminator="type")]
+FixedWireContentBlock = Annotated[WireLatexBlock | WireFigureBlock, Field(discriminator="type")]
 
 
 class RecognitionEnvelope(ContentModel):
@@ -275,14 +298,25 @@ class RecognitionEnvelope(ContentModel):
     unresolved_spans: list[UnresolvedSpan] = Field(default_factory=list, max_length=2_000)
 
 
-def recognition_json_schema() -> dict:
+class FixedRecognitionEnvelope(ContentModel):
+    schema_version: Literal[2] = 2
+    fixed_layout_version: Literal[1] = FIXED_LAYOUT_VERSION
+    page_kind: Literal["content", "front_cover", "back_cover", "contents", "blank", "other"] = "content"
+    blank: bool = False
+    blocks: list[FixedWireContentBlock] = Field(max_length=2_000)
+    unresolved_spans: list[UnresolvedSpan] = Field(default_factory=list, max_length=2_000)
+
+
+def recognition_json_schema(recognition_scope: RecognitionScope = "legacy_all_visible") -> dict:
     """The single wire-schema source for both provider adapters."""
-    return RecognitionEnvelope.model_json_schema()
+    model = FixedRecognitionEnvelope if recognition_scope == "printed_fixed_layout" else RecognitionEnvelope
+    return model.model_json_schema()
 
 
 class PageContent(ContentModel):
     schema_version: Literal[2] = 2
     recognition_scope: RecognitionScope = "legacy_all_visible"
+    fixed_layout_version: Literal[1] | None = None
     coverage_reviewed: bool = False
     regions: list[PageRegion] = Field(default_factory=list, max_length=2_000)
     coverage_observations: list[CoverageObservation] = Field(default_factory=list, max_length=2_000)
@@ -299,6 +333,13 @@ class PageContent(ContentModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> "PageContent":
+        if self.recognition_scope == "printed_fixed_layout":
+            if self.fixed_layout_version != FIXED_LAYOUT_VERSION:
+                raise ValueError("固定排版正文必须声明当前固定模板版本")
+            if any(not isinstance(block, (LatexBlock, FigureBlock)) for block in self.blocks):
+                raise ValueError("固定排版正文只接受模型 LaTeX 分类块和图形块")
+        elif self.fixed_layout_version is not None or any(isinstance(block, LatexBlock) for block in self.blocks):
+            raise ValueError("历史识别范围不能使用固定排版正文")
         region_map = {region.region_id: region for region in self.regions}
         if len(region_map) != len(self.regions) or any(region.source_version != self.source_version for region in self.regions):
             raise ValueError("区域计划必须具有唯一身份且关联当前来源版本")
@@ -384,7 +425,11 @@ def parse_content_response(
         return ContentParseResult(json_complete=True, failures=[BlockParseFailure(
             field_path="$", reason="响应必须含 schema_version=2 和 blocks 数组",
         )])
-    if set(value) - {"schema_version", "page_kind", "blank", "blocks", "unresolved_spans"} or (
+    fixed = recognition_scope == "printed_fixed_layout"
+    allowed_fields = {"schema_version", "page_kind", "blank", "blocks", "unresolved_spans"}
+    if fixed:
+        allowed_fields.add("fixed_layout_version")
+    if (fixed and value.get("fixed_layout_version") != FIXED_LAYOUT_VERSION) or set(value) - allowed_fields or (
         "blank" in value and not isinstance(value["blank"], bool)
     ) or value.get("page_kind", "content") not in {"content", "front_cover", "back_cover", "contents", "blank", "other"}:
         return ContentParseResult(json_complete=True, failures=[BlockParseFailure(
@@ -443,16 +488,29 @@ def parse_content_response(
                             normalize_box(line, f"{path}.cells[{cell_index}].lines[{line_index}].bbox")
         try:
             block = _BLOCK_ADAPTER.validate_python(item)
+            if fixed and not isinstance(block, (LatexBlock, FigureBlock)):
+                raise ValueError("固定排版响应必须直接返回分类 LaTeX 或图形块")
+            if not fixed and isinstance(block, LatexBlock):
+                raise ValueError("历史响应不接受固定排版块")
         except ValidationError as error:
             detail = error.errors(include_input=False)[0]
             field_path = path + "." + ".".join(str(part) for part in detail["loc"])
             failures.append(BlockParseFailure(response_index=index, field_path=field_path[:300],
                                                reason=detail["msg"][:500], source_bbox=item.get("bbox")))
             continue
+        except ValueError as error:
+            failures.append(BlockParseFailure(response_index=index, field_path=path,
+                                               reason=str(error), source_bbox=item.get("bbox")))
+            continue
         if recognition_scope == "printed_original_only" and isinstance(block, TableBlock) and any(cell.preserved for cell in block.cells):
             failures.append(BlockParseFailure(response_index=index, field_path=f"{path}.cells", reason="印刷成品不能用未经清洁核验的源表格单元格兜底", source_bbox=block.bbox))
             continue
         block.block_id = str(uuid4())
+        if fixed and isinstance(block, FigureBlock) and block.bbox is None:
+            local_issues.append(ContentIssue(category="missing_content", reason="图形缺少可裁切的来源框，固定排版将明确保留未决占位",
+                                             source_bbox=(0., 0., 1., 1.), response_id=response_id,
+                                             response_index=index, field_path=f"{path}.bbox", repairable=True,
+                                             origin="parse"))
         block_length = len(_block_plain_text(block))
         block_line_count = len(getattr(block, "lines", [])) + sum(len(cell.lines) for cell in getattr(block, "cells", []))
         if content_length + block_length + 2 * len(blocks) > 1_000_000 or line_count + block_line_count > 10_000:
@@ -467,6 +525,8 @@ def parse_content_response(
         if region_id in region_map:
             block.source_region_id = region_id
             block.source_layer = region_map[region_id].layer
+        elif fixed:
+            block.source_layer = "printed" if not block.uncertainty else "unknown"
         block.recognition_status = "uncertain" if block.uncertainty else "unverified"
         block.unresolved_reasons = list(block.uncertainty)
         for line in getattr(block, "lines", []):
@@ -491,7 +551,7 @@ def parse_content_response(
     for index, raw_span in enumerate(raw_spans):
         try:
             span = UnresolvedSpan.model_validate(raw_span)
-            if span.region_id not in region_map:
+            if not fixed and span.region_id not in region_map:
                 raise ValueError("未决片段不属于本次目标区域")
             if recognition_scope == "printed_original_only" and region_map[span.region_id].layer not in {"printed", "mixed", "unknown"}:
                 raise ValueError("范围外区域不能作为未决印刷片段")
@@ -535,11 +595,14 @@ def parse_content_response(
     return ContentParseResult(json_complete=True, failures=failures, content=PageContent(
         content_revision_id=revision_id, book_id=book_id, page_id=page_id, source_version=source_version,
         recognition_scope=recognition_scope, regions=list(target_regions), unresolved_spans=unresolved_spans,
+        fixed_layout_version=FIXED_LAYOUT_VERSION if fixed else None,
         page_kind=kind, blank=blank, blocks=blocks, issues=issues, response_ids=[response_id],
     ))
 
 
 def _block_plain_text(block: ContentBlock) -> str:
+    if isinstance(block, LatexBlock):
+        return block.latex
     if isinstance(block, TextBlock):
         return "\n".join("".join(span.text for span in line.spans) for line in block.lines)
     if isinstance(block, EquationBlock):

@@ -98,6 +98,7 @@ class GeminiConfig:
 
 
 class GeminiClient(ContentClientV2):
+    """Use the shared image-to-classified-LaTeX request for fixed-layout scope."""
     def __init__(self, config: GeminiConfig):
         self.config = config
 

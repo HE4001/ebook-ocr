@@ -338,6 +338,9 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         async with compile_locks.setdefault(detail.book.id, asyncio.Lock()):
             current_sources = []
             for page in detail.pages:
+                if page.recognition_scope == "printed_fixed_layout" and page.source_metadata is not None:
+                    current_sources.append(page.source_metadata)
+                    continue
                 record = storage.get_page_record(detail.book.id, page.number)
                 try:
                     _, _, _, metadata = await asyncio.to_thread(
@@ -363,6 +366,8 @@ def create_app(data_root: Path | None = None) -> FastAPI:
 
     async def calibrated_page(book_id: str, number: int, update: LayoutCalibrationUpdate) -> Page:
         page = editable_page(book_id, number)
+        if page.recognition_scope == "printed_fixed_layout":
+            raise HTTPException(status_code=422, detail="固定排版稿使用内容分类和统一规则；请通过页面源码编辑")
         if update.render_strategy != "source_fidelity":
             raise HTTPException(status_code=422, detail="布局校准使用原书还原策略；其他策略请通过页面或项目设置选择")
         if page.page_kind != "content":
@@ -1002,6 +1007,9 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         record = storage.get_page_record(book_id, number)
         if record is None or not record["selected"]:
             raise HTTPException(status_code=404, detail="页面不存在")
+        page = next(item for item in storage.get_pages(book_id) if item.number == number)
+        if page.recognition_scope == "printed_fixed_layout" and update.render_strategy == "source_fidelity":
+            raise HTTPException(status_code=422, detail="固定排版稿没有原书位置布局；请保留可编辑 LaTeX 策略")
         active = is_running(book_id)
         try:
             storage.save_manual_text(
@@ -1121,6 +1129,8 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         page = next((page for page in detail.pages if page.number == number), None)
         if page is None:
             raise HTTPException(status_code=404, detail="页面不存在")
+        if page.recognition_scope == "printed_fixed_layout" and update.render_strategy == "source_fidelity":
+            raise HTTPException(status_code=422, detail="固定排版稿没有原书位置布局；请使用可编辑 LaTeX 策略")
         if ((update.expected_content_revision is not None and update.expected_content_revision != page.content_revision)
                 or (update.expected_layout_revision is not None and update.expected_layout_revision != page.layout_revision)):
             raise HTTPException(status_code=409, detail="页面已更新，请加载最新版本后再编译草稿")

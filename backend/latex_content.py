@@ -50,5 +50,6 @@ def source_resource_name(name: str) -> str:
 
 def latex_image_resources(source: str) -> tuple[str, ...]:
     """Collect explicit relative image references without rewriting custom source."""
-    names = re.findall(r"\\includegraphics\s*(?:\[[^\]]*\])?\s*\{([^{}]+)\}", source)
-    return tuple(dict.fromkeys(source_resource_name(name.strip()) for name in names))
+    matches = re.findall(r"\\includegraphics\s*(?:\[[^\]]*\])?\s*\{"
+                         r"(?:\\detokenize\{([^{}]+)\}|([^{}]+))\}", source)
+    return tuple(dict.fromkeys(source_resource_name((quoted or plain).strip()) for quoted, plain in matches))

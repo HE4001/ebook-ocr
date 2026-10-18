@@ -653,13 +653,17 @@ class Storage:
                     (book_id, previous["render_strategy"], render_strategy),
                 ).fetchall()
                 for page in changed_pages:
+                    current = self._revision(connection, page["current_revision_id"])
+                    scope = (current.page_content.recognition_scope if current and current.page_content else
+                             current.recognition_scope if current else "legacy_all_visible")
+                    if scope == "printed_fixed_layout":
+                        continue
                     self._archive_page(connection, page)
                     connection.execute(
                         "UPDATE pages SET render_strategy = ?,layout_revision = layout_revision + 1 WHERE page_id = ?",
                         (render_strategy, page["page_id"]),
                     )
                     updated = connection.execute("SELECT * FROM pages WHERE page_id = ?", (page["page_id"],)).fetchone()
-                    current = self._revision(connection, page["current_revision_id"])
                     self._persist_current_revision(connection, updated, origin=current.origin if current else "legacy")
                 connection.execute(
                     "UPDATE books SET render_strategy = ? WHERE id = ?", (render_strategy, book_id),
@@ -1186,7 +1190,14 @@ class Storage:
         status = row["status"]
         if status in {"extracting", "classifying"}:
             status = "interrupted"
+        revision = cls._revision(connection, row["current_revision_id"]) if row["current_revision_id"] else None
+        recognition_scope = (revision.page_content.recognition_scope if revision and revision.page_content else
+                             revision.layout_source.recognition_scope if revision and revision.layout_source else
+                             revision.recognition_scope if revision else "legacy_all_visible")
+        fixed_layout_version = (revision.page_content.fixed_layout_version if revision and revision.page_content else
+                                revision.fixed_layout_version if revision else None)
         return Page(
+            recognition_scope=recognition_scope, fixed_layout_version=fixed_layout_version,
             number=row["number"], status=status, error=row["error"],
             page_id=row["page_id"], source_version=row["source_version"],
             current_revision_id=row["current_revision_id"], result_status=row["result_status"],
@@ -1245,7 +1256,13 @@ class Storage:
             layout = layout.model_copy(update={"source": metadata})
         if layout is not None and layout.content_revision == page["content_revision"]:
             layout = layout.model_copy(update={"layout_revision": page["layout_revision"]})
+        parent = self._revision(connection, page["current_revision_id"]) if page["current_revision_id"] else None
+        recognition_scope = (parent.page_content.recognition_scope if parent and parent.page_content else
+                             parent.recognition_scope if parent else layout.recognition_scope if layout else "legacy_all_visible")
+        fixed_layout_version = (parent.page_content.fixed_layout_version if parent and parent.page_content else
+                                parent.fixed_layout_version if parent else None)
         revision = Revision(
+            recognition_scope=recognition_scope, fixed_layout_version=fixed_layout_version,
             revision_id=str(uuid4()), parent_revision_id=page["current_revision_id"],
             book_id=page["book_id"], page_id=page["page_id"], page_number=page["number"],
             source_version=page["source_version"], content_revision=page["content_revision"],
@@ -1420,10 +1437,16 @@ class Storage:
             if not set(request.policy.replace_page_ids) <= set(page_ids):
                 raise ValueError("人工稿替换范围必须属于本轮处理范围")
             safe_settings = {key: settings.get(key, default) for key, default in DEFAULT_SETTINGS.items()}
-            safe_settings["recognition_scope"] = "printed_original_only" if workflow_version == 2 else "legacy_all_visible"
+            safe_settings["recognition_scope"] = (old_frozen.get("recognition_scope", "legacy_all_visible")
+                                                  if continuation is not None else "printed_fixed_layout")
+            if safe_settings["recognition_scope"] == "printed_fixed_layout":
+                safe_settings["fixed_layout_version"] = 1
             safe_settings.update(paper_size=book["paper_size"], layout=json.loads(book["layout_json"]),
                                  render_strategy=book["render_strategy"], output_settings_version=book["output_settings_version"],
                                  title=book["title"], filename=book["filename"])
+            if continuation is not None and safe_settings["recognition_scope"] == "printed_fixed_layout":
+                for key in ("paper_size", "layout", "render_strategy", "output_settings_version", "title", "filename"):
+                    safe_settings[key] = old_frozen["settings"][key]
             source_fields = ("page_id", "number", "source_id", "source_page", "source_version", "width", "height",
                              "image_name", "source_filename", "source_kind", "source_directory", "source_page_count")
             run_id, now = str(uuid4()), self._now()
@@ -1455,7 +1478,7 @@ class Storage:
                     if continuation is not None:
                         self._inherit_v2_candidate(connection, task, continuation[row["page_id"]], book_id)
                         old_task = continuation[row["page_id"]]
-                        same_output_settings = old_frozen["settings"]["output_settings_version"] == book["output_settings_version"]
+                        same_output_settings = old_frozen["settings"]["output_settings_version"] == safe_settings["output_settings_version"]
                         if not same_output_settings and task.candidate_revision_id is not None:
                             inherited = self._revision(connection, task.candidate_revision_id)
                             if inherited:
@@ -1470,8 +1493,14 @@ class Storage:
                                 task.stage = "layout" if task.stage_data.get("basic_review_complete") else "review"
                         if (same_output_settings and task.candidate_revision_id is not None
                             and old_task.outcome is not None and old_task.outcome.content == "usable"
-                            and old_task.outcome.layout == "faithful" and old_task.source_version == row["source_version"]):
-                            task.outcome = old_task.outcome
+                            and (old_task.outcome.layout == "faithful" or
+                                 safe_settings["recognition_scope"] == "printed_fixed_layout" and old_task.outcome.layout == "approximate")
+                            and old_task.source_version == row["source_version"]):
+                            task.outcome = old_task.outcome.model_copy(update={
+                                "adopted_revision_id": row["current_revision_id"],
+                                "protected_existing": task.stage_data["protected_existing"] or
+                                                      row["current_revision_id"] != old_task.outcome.adopted_revision_id,
+                            })
                             task.state, task.stage = "finished", "export"
                             task.stage_data["reused_complete_result"] = True
                 elif row["manual_protected"] and row["page_id"] not in request.policy.replace_page_ids:
@@ -1926,7 +1955,7 @@ class Storage:
                 order = [page_id for page_id in order if page_id in scope]
             if not order:
                 raise ValueError("导出范围不能为空")
-            entries, issues = [], []
+            entries, issues, recognition_scopes = [], [], []
             for position, page_id in enumerate(order):
                 task = tasks.get(page_id)
                 source = task.stage_data.get("final_source", sources[page_id]) if task else sources[page_id]
@@ -1934,6 +1963,7 @@ class Storage:
                 revision = self._revision(connection, revision_id)
                 if revision is None:
                     raise ValueError("输出页面缺少已保存修订")
+                recognition_scopes.append(revision.page_content.recognition_scope if revision.page_content else revision.recognition_scope)
                 if run_id is None and ((revision.page_content and revision.page_content.recognition_scope == "printed_original_only")
                     or (revision.layout_source and revision.layout_source.recognition_scope == "printed_original_only")):
                     settings["recognition_scope"] = "printed_original_only"
@@ -1974,6 +2004,8 @@ class Storage:
                     source_filename=source["source_filename"], image_name=source["image_name"], result_status=status,
                     assessment=assessment,
                 ))
+            if run_id is None and all(scope == "printed_fixed_layout" for scope in recognition_scopes):
+                settings.update(recognition_scope="printed_fixed_layout", fixed_layout_version=1)
             manifest = ExportManifest(
                 recognition_scope=settings.get("recognition_scope", "legacy_all_visible"), manifest_id=str(uuid4()), book_id=book_id, run_id=run_id, arrangement_revision=arrangement_revision,
                 output_settings_version=settings["output_settings_version"], settings_snapshot=settings,
@@ -2504,6 +2536,8 @@ class Storage:
             task = self._task(connection, run_id, page_id)
             if (content.book_id, content.page_id, content.source_version) != (run["book_id"], page_id, task.source_version):
                 raise ValueError("内容与本轮冻结来源不一致")
+            if content.recognition_scope != task.stage_data.get("recognition_scope", "legacy_all_visible"):
+                raise ValueError("内容识别契约与本轮冻结规则不一致")
             if task.candidate_revision_id != expected_candidate_revision_id:
                 previous = self._revision(connection, task.candidate_revision_id) if task.candidate_revision_id else None
                 if previous and previous.page_content and previous.page_content.content_revision_id == content.content_revision_id and previous.page_content == content:
@@ -2524,13 +2558,24 @@ class Storage:
                     raise ValueError("内容响应正文未保存，或响应属于不同来源版本")
             parent = self._revision(connection, task.candidate_revision_id) if task.candidate_revision_id else None
             metadata = parent.source_metadata if parent else None
+            if metadata is None and task.stage_data.get("prepared", {}).get("metadata"):
+                metadata = PageSourceMetadata.model_validate(task.stage_data["prepared"]["metadata"])
             content_revision = max(task.base_content_revision, parent.content_revision if parent else 0) + 1
+            frozen = json.loads(run["snapshot_json"])
+            fixed = content.recognition_scope == "printed_fixed_layout"
+            if fixed:
+                from .latex_export import fixed_content_latex
+                text = fixed_content_latex(content, paper_size=frozen["settings"]["paper_size"])
+            else:
+                text = content_plain_text(content)
             revision = Revision(revision_id=str(uuid4()), parent_revision_id=task.candidate_revision_id or task.base_revision_id,
                                 book_id=run["book_id"], page_id=page_id, page_number=task.page_number, source_version=task.source_version,
                                 content_revision=content_revision, layout_revision=task.base_layout_revision,
-                                origin="automatic", run_id=run_id, text=content_plain_text(content), render_strategy="source_fidelity",
+                                origin="automatic", run_id=run_id, text=text, render_strategy="custom_latex" if fixed else "source_fidelity",
                                 source_metadata=metadata, created_at=self._now(), workflow_version=2, page_content=content,
-                                generator_version=json.loads(run["snapshot_json"])["generator_version"])
+                                recognition_scope=content.recognition_scope, fixed_layout_version=content.fixed_layout_version,
+                                generated_content_revision=content_revision if fixed else None,
+                                generator_version=frozen["generator_version"])
             self._insert_revision(connection, revision)
             task.candidate_revision_id = revision.revision_id
             task.stage_data["basic_recognition_complete"] = bool(content.blocks or content.blank or (content.recognition_scope == "printed_original_only" and task.stage_data.get("initial_batches_finished")))
@@ -2574,7 +2619,7 @@ class Storage:
                                                  "page_layout": layout, "layout_source": render_layout,
                                                  "source_metadata": layout.source, "layout_revision": layout_revision,
                                                  "text": generated_text if generated_text is not None else parent.text,
-                                                 "generated_content_revision": parent.content_revision if render_layout else None,
+                                                 "generated_content_revision": parent.content_revision if render_layout or parent.page_content.recognition_scope == "printed_fixed_layout" else None,
                                                  "created_at": self._now()})
             self._insert_revision(connection, revision)
             task.candidate_revision_id = revision.revision_id
@@ -2621,12 +2666,15 @@ class Storage:
             adopted = already_adopted or bool(adopt and authorized and matches and revision and revision.page_content)
             if adopted and not already_adopted:
                 self._archive_page(connection, page)
-                connection.execute("UPDATE pages SET current_revision_id=?,content_revision=?,layout_revision=?,text=?,render_strategy=?,source_metadata_json=?,layout_source_json=?,layout_schema_version=?,generated_content_revision=?,status='ready',error=NULL,result_status=NULL,manual_protected=0 WHERE page_id=?",
+                connection.execute("UPDATE pages SET current_revision_id=?,content_revision=?,layout_revision=?,text=?,render_strategy=?,source_metadata_json=?,layout_source_json=?,layout_schema_version=?,generated_content_revision=?,page_kind=?,page_side=?,cover_fields_json=?,header_segments_json=?,footer_segments_json=?,status='ready',error=NULL,result_status=NULL,manual_protected=0 WHERE page_id=?",
                                    (revision.revision_id, revision.content_revision, revision.layout_revision, revision.text, revision.render_strategy,
                                     revision.source_metadata.model_dump_json() if revision.source_metadata else None,
                                     revision.layout_source.model_dump_json() if revision.layout_source else None,
                                     revision.layout_source.schema_version if revision.layout_source else None,
-                                    revision.generated_content_revision, page_id))
+                                    revision.generated_content_revision, revision.page_kind, revision.page_side,
+                                    json.dumps([item.model_dump() for item in revision.cover_fields], ensure_ascii=False),
+                                    json.dumps([item.model_dump() for item in revision.header_segments], ensure_ascii=False),
+                                    json.dumps([item.model_dump() for item in revision.footer_segments], ensure_ascii=False), page_id))
             outcome = outcome.model_copy(update={"adopted_revision_id": revision.revision_id if adopted else page["current_revision_id"],
                                                  "protected_existing": not adopted and bool(page["manual_protected"] or not matches)})
             for error in task.errors:
@@ -2641,7 +2689,9 @@ class Storage:
 
     def get_run_outcomes(self, run_id: str, offset: int = 0, limit: int = 100) -> list[PageOutcomeSummary]:
         with self._connect() as connection:
-            return [PageOutcomeSummary(page_id=task.page_id, page_number=task.page_number, position=task.position,
+            return [PageOutcomeSummary(category="protected_existing" if task.outcome and task.outcome.protected_existing else
+                                       self._outcome_category(task.outcome) or "no_result",
+                                       page_id=task.page_id, page_number=task.page_number, position=task.position,
                                        stage=task.stage, state=task.state, outcome=task.outcome)
                     for task in self._tasks(connection, run_id)[offset:offset + min(limit, 500)]]
 

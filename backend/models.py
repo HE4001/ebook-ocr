@@ -81,6 +81,8 @@ class CoverField(BaseModel):
 
 
 class Page(BaseModel):
+    recognition_scope: RecognitionScope = "legacy_all_visible"
+    fixed_layout_version: Literal[1] | None = None
     number: int
     page_id: str = ""
     source_version: int = Field(default=1, ge=1)
@@ -763,6 +765,8 @@ class Revision(BaseModel):
     generator_version: str | None = None
     created_at: str
     workflow_version: Literal[1, 2] = 1
+    recognition_scope: RecognitionScope = "legacy_all_visible"
+    fixed_layout_version: Literal[1] | None = None
     page_content: PageContent | None = None
     page_layout: PageLayout | None = None
 

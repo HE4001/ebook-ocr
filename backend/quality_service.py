@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from .compile_service import CandidateRenderResult
-from .content_contract import CoverageObservation, ContentIssue, EquationBlock, PageContent, TableBlock, TextBlock
+from .content_contract import CoverageObservation, ContentIssue, EquationBlock, PageContent, PageRegion, TableBlock, TextBlock
 from .layout_contract import BBox, SourceFidelityLayout
 from .models import Assessment, Issue, Revision, StructuredPageResult
 from .source_analysis import SourceAnalysis, merge_region_content
@@ -37,6 +37,10 @@ def content_block_bbox(block) -> BBox | None:
 
 def source_coverage_content(content: PageContent, analysis: SourceAnalysis) -> PageContent:
     """Observe the entire source, including areas outside candidate/coarse boxes."""
+    if content.recognition_scope == "printed_fixed_layout":
+        # Independent source review decides printed coverage; ink positions and
+        # excluded handwriting cannot make a fixed-layout omission verdict.
+        return content
     if content.recognition_scope == "printed_original_only":
         result = renew_content(content)
         known = {item.observation_id for item in result.coverage_observations}
@@ -122,6 +126,8 @@ def reviewed_content(content: PageContent, review: ContentReview | None, *, reas
         return PageContent.model_validate(result.model_dump())
     reliable = bool(review and review.full_page_reviewed)
     passed_all = bool(reliable and review.content == "usable" and review.coverage == "passed" and not review.issues)
+    if content.recognition_scope == "printed_fixed_layout":
+        result.coverage_reviewed = reliable
     def overlaps(left, right):
         return (left is not None and right is not None and max(left[0], right[0]) < min(left[2], right[2])
                 and max(left[1], right[1]) < min(left[3], right[3]))
@@ -131,7 +137,8 @@ def reviewed_content(content: PageContent, review: ContentReview | None, *, reas
             # Local ink is a review hint, not a ground truth veto. The full-page
             # visual review can settle it without claiming an accuracy proof.
             checked = any(
-                (target.get("block_id") is not None and target["block_id"] == previous.block_id)
+                (content.recognition_scope == "printed_fixed_layout" and target.get("id") == "fixed-page")
+                or (target.get("block_id") is not None and target["block_id"] == previous.block_id)
                 or (previous.source_bbox is not None and target.get("bbox") is not None
                     and target["bbox"][0] <= previous.source_bbox[0] and target["bbox"][1] <= previous.source_bbox[1]
                     and target["bbox"][2] >= previous.source_bbox[2] and target["bbox"][3] >= previous.source_bbox[3])
@@ -163,9 +170,14 @@ def reviewed_content(content: PageContent, review: ContentReview | None, *, reas
     for block in result.blocks:
         problems = [problem for problem in result.issues if not problem.resolved
                     and (problem.block_id == block.block_id or (problem.block_id is None
-                         and overlaps(content_block_bbox(block), problem.source_bbox)))
+                         and (_fixed_area_affects(block, problem.source_bbox)
+                              if content.recognition_scope == "printed_fixed_layout"
+                              else overlaps(content_block_bbox(block), problem.source_bbox))))
                     and problem.category not in {"layout", "render"}]
-        if passed_all:
+        if content.recognition_scope == "printed_fixed_layout" and block.uncertainty:
+            block.review_status = "uncertain"
+            block.unresolved_reasons = list(dict.fromkeys([*block.uncertainty, *(problem.reason for problem in problems)]))[:100]
+        elif passed_all:
             block.recognition_status = block.review_status = "usable"
             block.unresolved_reasons = []
         elif reliable and not problems and review.content != "unavailable":
@@ -177,11 +189,34 @@ def reviewed_content(content: PageContent, review: ContentReview | None, *, reas
         elif block.review_status != "usable":
             block.review_status = "unverified"
     result.issues = result.issues[:2_000]
+    if content.recognition_scope == "printed_fixed_layout":
+        for block in result.blocks:
+            if block.type != "figure":
+                continue
+            verdict = next((item for item in review.region_verdicts
+                if item.region_id == block.block_id and item.candidate_id == content.content_revision_id
+                and item.region_id in review.checked_region_ids), None) if reliable else None
+            clean = bool(block.bbox is not None and verdict and verdict.cleanliness_verified and verdict.content == "usable"
+                         and verdict.coverage == "passed")
+            result.regions = [item for item in result.regions if item.region_id != block.block_id]
+            if block.bbox is not None:
+                result.regions.append(PageRegion(region_id=block.block_id, source_version=result.source_version,
+                    layer="printed", kind="figure", bbox=block.bbox, reading_order=result.blocks.index(block),
+                    boundary_status="observed", cleanliness_verified=clean))
+            if not clean:
+                block.review_status = "uncertain"
+                if not any(item.block_id == block.block_id and not item.resolved for item in result.issues):
+                    result.issues.append(ContentIssue(category="unreadable_source", block_id=block.block_id,
+                        source_bbox=block.bbox, reason="印刷图形未确认无手写污染，未裁切纳入固定排版",
+                        origin="model_review"))
     return PageContent.model_validate(result.model_dump())
 
 
 def content_conclusion(content: PageContent, *, blank_reviewed: bool = False) -> str:
     active = [issue for issue in content.issues if not issue.resolved and issue.category not in {"layout", "render"}]
+    if content.recognition_scope == "printed_fixed_layout" and (not content.coverage_reviewed or content.unresolved_spans
+                                                               or any(block.uncertainty for block in content.blocks)):
+        return "uncertain" if content.blocks else "unverified" if content.blank else "unavailable"
     if content.recognition_scope == "printed_original_only":
         required = {region.region_id for region in content.regions if region.layer in {"printed", "mixed", "unknown"}}
         covered = {block.source_region_id for block in content.blocks if block.review_status == "usable"}
@@ -196,6 +231,16 @@ def content_conclusion(content: PageContent, *, blank_reviewed: bool = False) ->
 
 def recovery_targets(content: PageContent, analysis: SourceAnalysis) -> list[dict]:
     """Finite located content responsibilities, separate from font/render errors."""
+    if content.recognition_scope == "printed_fixed_layout":
+        recoverable = {"small_text", "reading_order", "truncated_response", "invalid_structure",
+                       "missing_content", "equation", "table"}
+        problem = next((item for item in content.issues if not item.resolved and item.category in recoverable
+                        and (item.origin != "model_review" or item.repairable)), None)
+        if problem is None and not content.unresolved_spans and not any(block.uncertainty for block in content.blocks):
+            return []
+        return [{"id": "fixed-page", "block_id": None, "bbox": (0., 0., 1., 1.),
+                 "category": "invalid_structure" if problem and problem.category == "reading_order" else
+                             problem.category if problem else "missing_content", "kind": "text"}]
     blocks = {block.block_id: block for block in content.blocks}
     targets, used = [], set()
     for problem in sorted(content.issues, key=lambda item: (item.category != "missing_content", item.category not in {"equation", "table"})):
@@ -243,6 +288,38 @@ def local_content_candidate(base: PageContent, local: PageContent, target: dict,
     """Only an explicitly bound source target can be replaced before review."""
     selected = local.model_copy(deep=True)
     box = target["bbox"]
+    if base.recognition_scope == "printed_fixed_layout":
+        if local.recognition_scope != base.recognition_scope or not (selected.blocks or selected.blank):
+            raise ValueError("整页重读未取得同一固定排版契约的有效内容")
+        selected = renew_content(selected)
+        available = list(base.blocks)
+        matches = {}
+        # Match all unchanged values before assigning changed slots. Otherwise
+        # a newly inserted block can steal the ID of a later unchanged block.
+        for index, block in enumerate(selected.blocks):
+            previous = next((item for item in available if _fixed_block_value(item) == _fixed_block_value(block)), None)
+            if previous is not None:
+                available.remove(previous)
+                matches[index] = previous
+        for index in range(len(selected.blocks)):
+            if index not in matches and index < len(base.blocks) and base.blocks[index] in available:
+                previous = base.blocks[index]
+                available.remove(previous)
+                matches[index] = previous
+        remap = {}
+        for index, block in enumerate(selected.blocks):
+            previous = matches.get(index)
+            if previous is not None:
+                remap[block.block_id] = previous.block_id
+                block.block_id = previous.block_id
+        for block in selected.blocks:
+            if block.type == "figure":
+                block.caption_block_ids = [remap.get(identity, identity) for identity in block.caption_block_ids]
+        for problem in selected.issues:
+            problem.block_id = remap.get(problem.block_id, problem.block_id)
+        selected.issues = [*base.issues, *selected.issues]
+        selected.response_ids = list(dict.fromkeys([*base.response_ids, *selected.response_ids]))
+        return PageContent.model_validate(selected.model_dump())
     if base.recognition_scope == "printed_original_only":
         region_id = target.get("source_region_id")
         region = next((item for item in base.regions if item.region_id == region_id), None)
@@ -315,6 +392,23 @@ def content_improves(previous: PageContent, candidate: PageContent, *, blank_rev
     if any(severity[item.severity] > old_severity.get(key(item, candidate), -1)
            for item in candidate.issues if not item.resolved and item.category not in {"layout", "render"}):
         return False
+    if previous.recognition_scope == "printed_fixed_layout":
+        before = {block.block_id: block for block in previous.blocks}
+        after = {block.block_id: block for block in candidate.blocks}
+        for identity, block in before.items():
+            protected = block.review_status == "usable" and not any(
+                not item.resolved and item.category not in {"layout", "render"}
+                and (item.block_id == identity or item.block_id is None and _fixed_area_affects(block, item.source_bbox))
+                for item in previous.issues) and not any(
+                    _fixed_area_affects(block, item.source_bbox) for item in previous.unresolved_spans)
+            if protected and (identity not in after or _fixed_block_value(block) != _fixed_block_value(after[identity])):
+                return False
+        rank = {"usable": 0, "uncertain": 1, "unverified": 2, "unavailable": 3}
+        return (len(new) < len(old) or len(candidate.unresolved_spans) < len(previous.unresolved_spans)
+                or any(block.review_status == "usable" and (identity not in before or before[identity].review_status != "usable")
+                       for identity, block in after.items())
+                or rank[content_conclusion(candidate, blank_reviewed=blank_reviewed)]
+                < rank[content_conclusion(previous, blank_reviewed=blank_reviewed)])
     if previous.recognition_scope == "printed_original_only":
         fields = {"content_revision_id", "recognition_status", "review_status", "unresolved_reasons"}
         old_regions = {block.source_region_id for block in previous.blocks}
@@ -348,6 +442,19 @@ def content_improves(previous: PageContent, candidate: PageContent, *, blank_rev
     return (gained or target_improved or len(new) < len(old)
             or rank[content_conclusion(candidate, blank_reviewed=blank_reviewed)]
             < rank[content_conclusion(previous, blank_reviewed=blank_reviewed)])
+
+
+def _fixed_block_value(block) -> tuple:
+    if block.type == "latex":
+        return block.type, block.category, block.latex
+    return block.type, block.description, block.bbox
+
+
+def _fixed_area_affects(block, bbox: BBox | None) -> bool:
+    position = content_block_bbox(block)
+    return (bbox is None or position is None
+            or max(position[0], bbox[0]) < min(position[2], bbox[2])
+            and max(position[1], bbox[1]) < min(position[3], bbox[3]))
 
 
 _PROGRAM_COMMAND = re.compile(

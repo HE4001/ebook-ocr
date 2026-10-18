@@ -3,6 +3,19 @@
 .workflow-v2 p { line-height: 1.7; overflow-wrap: anywhere; }
 .workflow-ready,.workflow-summary,.workflow-legacy,.workflow-outputs,.workflow-content,.workflow-source { margin-top: 1.25rem; padding: 1.4rem; background: var(--paper); border: 1px solid var(--line); border-radius: 10px; }
 .workflow-ready > p { color: var(--muted); }
+.fixed-workflow-steps { display: flex; flex-wrap: wrap; gap: .55rem; list-style: none; margin: 1rem 0; padding: 0; counter-reset: workflow-step; }
+.fixed-workflow-steps li { counter-increment: workflow-step; padding: .55rem .7rem; border: 1px solid var(--line); border-radius: 6px; font-size: .8rem; background: var(--paper); }
+.fixed-workflow-steps li::before { content: counter(workflow-step) ' · '; color: var(--muted); }
+.workflow-scope { color: var(--muted); font-size: .85rem; }
+.fixed-layout-rules { margin: 1.2rem 0; padding: 1rem; border: 1px solid #c7d6cf; border-radius: 8px; background: #f3f7f3; }
+.fixed-layout-rules h3 { margin: 0 0 .6rem; font-size: .98rem; }
+.fixed-layout-rules p { margin: .6rem 0; font-size: .83rem; line-height: 1.7; }
+.fixed-layout-rules dl { display: grid; grid-template-columns: 135px minmax(0, 1fr); gap: .65rem 1rem; margin: 1rem 0; font-size: .82rem; line-height: 1.7; }
+.fixed-layout-rules dt { font-weight: 650; }
+.fixed-layout-rules dd { margin: 0; }
+.content-block-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .6rem; }
+.content-category { padding: .2rem .55rem; border-radius: 4px; color: #38574a; background: #e5eee8; font-size: .8rem; font-weight: 650; }
+.classified-latex { white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; margin: .8rem 0; padding: .85rem; border: 1px solid var(--line); border-radius: 5px; background: #f7f6f1; font: .82rem/1.75 Consolas, 'Courier New', monospace; }
 .workflow-advanced { margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: .9rem; }
 .workflow-advanced fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .workflow-v2 summary { width: fit-content; min-height: 40px; padding-block: .5rem; cursor: pointer; font-size: .9rem; }
@@ -67,6 +80,8 @@
 .workflow-history li { margin-bottom: .5rem; }
 .workflow-history button { text-align: left; max-width: 100%; font-size: .82rem; overflow-wrap: anywhere; }
 @media (max-width: 650px) {
+  .fixed-layout-rules dl { grid-template-columns: 1fr; gap: .2rem; }
+  .fixed-layout-rules dd { margin-bottom: .6rem; }
   .workflow-ready,.workflow-summary,.workflow-legacy,.workflow-outputs,.workflow-content,.workflow-source { padding: 1rem; }
   .workflow-result-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .workflow-downloads { grid-template-columns: 1fr; }

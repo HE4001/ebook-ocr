@@ -133,13 +133,13 @@ export function SourceComparison({ bookId, page, result, loading, focus }: {
     ? outputBoxToNormalized(focus.output_bbox_bp, mapping)
     : sourceHighlight && registered ? sourceBoxToOutput(sourceHighlight, mapping!) : null
 
-  return <section ref={comparisonRegion} className={`source-comparison showing-${side}`} aria-label="原图与输出同页对照">
+  return <section ref={comparisonRegion} className={`source-comparison showing-${side}`} aria-label="原图与当前稿输出对照">
     <div className="comparison-toolbar">
       <div className="comparison-side-switch" role="group" aria-label="窄窗显示页面"><button aria-pressed={side === 'source'} onClick={() => setSide('source')}>原图</button><button aria-pressed={side === 'output'} onClick={() => setSide('output')}>输出</button></div>
       <div className="comparison-zoom" role="group" aria-label="同步缩放"><button aria-pressed={fit === 'page' && zoom === 1} onClick={() => { setFit('page'); setZoom(1) }}>适合整页</button><button aria-pressed={fit === 'width' && zoom === 1} onClick={() => { setFit('width'); setZoom(1) }}>适合宽度</button><button aria-label="缩小对照" disabled={zoom <= 0.25} onClick={() => setZoom((value) => Math.max(0.25, value / 1.25))}>−</button><span>{Math.round(zoom * 100)}%</span><button aria-label="放大对照" disabled={zoom >= 6} onClick={() => setZoom((value) => Math.min(6, value * 1.25))}>＋</button></div>
       {mapping && <label className="output-page-picker">输出页 <select value={outputPage} onChange={(event) => setOutputPage(Number(event.target.value))}>{Array.from({ length: end - start + 1 }, (_, index) => start + index).map((number) => <option key={number} value={number}>{number}</option>)}</select></label>}
     </div>
-    <p className="comparison-note">{registered ? '两侧按源页坐标同步位置与缩放。' : '源页与输出尚无单页配准映射，位置独立保留；两侧可同步缩放。'}{mapping && ` 源文件第 ${page.source_page} 页 → 输出第 ${start}${end > start ? `—${end}` : ''} 页。`}</p>
+    <p className="comparison-note">{page.recognition_scope === 'printed_fixed_layout' ? '当前稿按内容重新折行与分页，原图与输出位置分别浏览；两侧可同步缩放。' : registered ? '两侧按源页坐标同步位置与缩放。' : '源页与输出尚无单页配准映射，位置独立保留；两侧可同步缩放。'}{mapping && ` 源文件第 ${page.source_page} 页 → 输出第 ${start}${end > start ? `—${end}` : ''} 页。`}</p>
     <div className="comparison-grid">
       <section className="comparison-pane source-pane"><h3>原图 · {page.source_filename} 第 {page.source_page} 页</h3>
         <div className="comparison-viewport" ref={sourceViewport} onScroll={() => scroll('source')} tabIndex={0} aria-label="原图页内浏览">

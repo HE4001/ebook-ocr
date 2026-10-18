@@ -84,7 +84,7 @@ function Get-MissingLatexDependencies {
 
     # Package names are TeX Live names; tools and amsfonts each provide several files.
     $dependencies = @(
-        @{ Packages = @('ctex'); Files = @('ctexbook.cls') },
+        @{ Packages = @('ctex'); Files = @('ctexbook.cls', 'ctexart.cls') },
         @{ Packages = @('geometry'); Files = @('geometry.sty') },
         @{ Packages = @('amsmath'); Files = @('amsmath.sty') },
         @{ Packages = @('amsfonts'); Files = @('amssymb.sty') },
@@ -93,7 +93,11 @@ function Get-MissingLatexDependencies {
             'rsfs5.tfm', 'rsfs7.tfm', 'rsfs10.tfm',
             'rsfs5.pfb', 'rsfs7.pfb', 'rsfs10.pfb', 'rsfs.map'
         ) },
-        @{ Packages = @('tools'); Files = @('longtable.sty', 'array.sty') },
+        @{ Packages = @('tools'); Files = @('longtable.sty', 'array.sty', 'tabularx.sty', 'bm.sty') },
+        @{ Packages = @('booktabs'); Files = @('booktabs.sty') },
+        @{ Packages = @('multirow'); Files = @('multirow.sty') },
+        @{ Packages = @('enumitem'); Files = @('enumitem.sty') },
+        @{ Packages = @('needspace'); Files = @('needspace.sty') },
         @{ Packages = @('fancyhdr'); Files = @('fancyhdr.sty') },
         @{ Packages = @('ulem'); Files = @('ulem.sty') },
         @{ Packages = @('hyperref'); Files = @('hyperref.sty') },
