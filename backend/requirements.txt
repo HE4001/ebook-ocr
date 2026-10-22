@@ -1,9 +1,30 @@
-fastapi>=0.115,<1
-uvicorn[standard]>=0.30,<1
-httpx>=0.27,<1
-pydantic>=2.9,<3
-python-multipart>=0.0.12,<1
-PyMuPDF>=1.24,<2
-Pillow>=10.4,<13
-mistune>=3,<4
+# Direct runtime dependencies.
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+httpx==0.28.1
+pydantic==2.13.5
+python-multipart==0.0.32
+PyMuPDF==1.28.2
+Pillow==12.3.0
+mistune==3.3.4
 
+# Windows runtime dependencies recorded from local .venv dist-info/METADATA.
+# Development tools and installer tooling are intentionally excluded.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+click==8.5.0
+colorama==0.4.6
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+idna==3.20
+pydantic-core==2.46.5
+python-dotenv==1.2.3
+PyYAML==6.0.3
+starlette==1.6.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+watchfiles==1.2.0
+websockets==17.1

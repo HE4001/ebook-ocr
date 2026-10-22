@@ -20,7 +20,6 @@ LatexCategory = Literal["title", "heading", "subheading", "paragraph", "equation
                         "caption", "footnote", "header", "footer", "page_number", "code", "quote"]
 SourceLayer = Literal["printed", "annotation", "mixed", "decoration", "noise", "unknown"]
 ScopeDisposition = Literal["pending", "mapped_printed", "confirmed_printed_missing", "annotation_excluded", "decoration", "noise", "unknown"]
-import
 ContentConclusion = Literal["usable", "uncertain", "unavailable", "unverified"]
 LayoutConclusion = Literal["faithful", "approximate", "unavailable", "unverified"]
 ContentRole = Literal["body", "header", "footer", "title", "footnote", "caption", "page_number", "other"]

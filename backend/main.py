@@ -772,12 +772,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     @app.get("/api/books/{book_id}/runs/summaries", response_model=list[RunSummary])
     async def list_run_summaries(book_id: str) -> list[RunSummary]:
         ensure_book(book_id)
-        summaries = []
-        for run in storage.list_runs(book_id):
-            summary = storage.get_run_summary(book_id, run.run_id)
-            if summary is not None:
-                summaries.append(summary)
-        return summaries
+        return storage.list_run_summaries(book_id)
 
     @app.get("/api/books/{book_id}/runs/{run_id}", response_model=Run)
     async def get_run(book_id: str, run_id: str) -> Run:
@@ -785,7 +780,6 @@ def create_app(data_root: Path | None = None) -> FastAPI:
 
     @app.get("/api/books/{book_id}/runs/{run_id}/summary", response_model=RunSummary)
     async def get_run_summary(book_id: str, run_id: str) -> RunSummary:
-        ensure_run(book_id, run_id)
         summary = storage.get_run_summary(book_id, run_id)
         if summary is None:
             raise HTTPException(status_code=404, detail="任务不存在")
@@ -796,7 +790,8 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         book_id: str, run_id: str, offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=500),
     ) -> list[PageOutcomeSummary]:
-        ensure_run(book_id, run_id)
+        if not storage.run_exists(book_id, run_id):
+            raise HTTPException(status_code=404, detail="任务不存在")
         return storage.get_run_outcomes(run_id, offset, limit)
 
     @app.get("/api/books/{book_id}/runs/{run_id}/pages/{page_id}/content", response_model=PageContent | None)
